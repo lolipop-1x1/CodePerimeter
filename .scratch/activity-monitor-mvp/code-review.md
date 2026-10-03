@@ -4,7 +4,7 @@
 Status: resolved
 Type: task
 
-固定比较点：`a8ecdf3e92aac93fca88734ac61c14ce8c9ac2a6`。审查HEAD：`725a263167d1fd9f65c93f4977477f17f032a82f`。以下保留原审查两轴的独立计数及修复证据。修复候选 `0c9a1c9442dc6d25339f01d2e1587aa30d0a9cca` 已通过两轴定点复核并合入 `a08bcc2f6269937e053392ca658bb4e6aa99d3a1`；两者tree均为 `bc683f579403766f5d4a80d7055ca0b90987ef2d`。本票仅关闭源码审查，06仍claimed，实际系统验收、PR ready与worktree清理仍待完成。
+固定比较点：`a8ecdf3e92aac93fca88734ac61c14ce8c9ac2a6`。审查HEAD：`725a263167d1fd9f65c93f4977477f17f032a82f`。以下保留原审查两轴的独立计数及修复证据。修复候选 `0c9a1c9442dc6d25339f01d2e1587aa30d0a9cca` 已通过两轴定点复核并合入 `a08bcc2f6269937e053392ca658bb4e6aa99d3a1`；两者tree均为 `bc683f579403766f5d4a80d7055ca0b90987ef2d`。本票仅关闭源码审查，PR此前已Ready；06仍claimed，实际系统验收待重跑，旧实现worktree归档受App保护，修复worktree暂保留。
 
 ## Standards
 
@@ -55,3 +55,12 @@ README和后台验收步骤补齐install后的显式service start；install只�
 先前CI pin head `2e18ef6` 的远端push／PR两条checks已SUCCESS（run `37144069732`／`37144066116`）；启动补修新head CI待跑。十个旧实现worktree的归档被App的pinned task/workspace保护拒绝，保留workspace；没有手工删除或修改固定状态，不报告清理全部完成。06仍claimed，修复版真实root/FDA、九类、3秒、通知到屏／后台与性能仍待用户终端重跑。
 
 本次启动补修定点检查（普通用户uid501）：fmt --check、全部target check／严格clippy、git diff --check通过；Rust service_collector 11＋end_to_end 2通过；Python判定器／启动／安全替换17通过。3个validate脚本AST、两个入口help、固定系统Python root全链／ACL与 -I -B -S标准库可用性通过。root发布门禁测试仅在普通用户匿名目录替身中验证拒绝及原子替换，不代表管理员准备或ES系统通过。源码范围仅service固定路径；没有重复此前全套69项Rust，也没有执行sudo／FDA／安装／真实历史。
+
+
+## 启动补修定点复核完成
+
+2026-10-04候选 `54bbb0d2a9b29d82cbb795b3203367b0e3402fa5` 已完成两轴独立定点复核；来源父提交 `2e18ef6ce75ded164ee84489e93fce0c2a79a023`，候选tree为 `08c1bb432a447cc44cc56162e604d1b610ebe94f`。Standards：hard0／heuristic0；Spec：可证缺陷0，独立新增8个反例均通过。此结论限定在启动补修候选，不覆盖实际系统运行，原固定点Standards2／Spec4统计保持。
+
+主agent已对该候选成功offline release构建，产物 `/private/tmp/codeperimeter-integration-release/release/codeperimeter` 的SHA256为 `987018ac8168f6ad6170d520637a574a8dc470eb49e3c3bdaafc43b33b44e17a`；service plan回读确认三角色使用同一新collector socket。此时尚未复制集成target，root副本 `/Library/CodePerimeter/501/codeperimeter` 仍为旧SHA256 `6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13`，未执行替换或新源采集。新head远端CI、root／FDA、九类、3秒、到屏和后台仍待，06保持claimed。
+
+PR此前已Ready，不再列为未完成项。十个旧实现worktree归档均被App的pinned task/workspace保护拒绝，未手工删除或修改固定状态；当前修复worktree暂保留供后续实测问题处理，后续清理仍按App正常归档流程，不报告全部清理完成。本次收尾仅更新本记录与06，diff检查通过，不修改源码／脚本／测试，也不重复组件测试。
