@@ -437,7 +437,7 @@ fn sqlite_directory_event_alert_notification_and_retention_apis_are_atomic() {
     let root_alias = temp.path().join("project");
     let database = temp.path().join("monitor.sqlite");
     let mut storage = Storage::open(&database).unwrap();
-    assert_eq!(storage.schema_version().unwrap(), 1);
+    assert_eq!(storage.schema_version().unwrap(), 2);
     assert!(storage.add_directory(&root, "manual", 100).unwrap());
     assert!(!storage.add_directory(&root_alias, "manual", 101).unwrap());
     assert!(!storage.add_directory(&root_alias, "codex", 102).unwrap());
@@ -660,4 +660,265 @@ fn sqlite_writer_lock_returns_before_the_alert_latency_budget() {
         elapsed < Duration::from_secs(1),
         "SQLite busy wait: {elapsed:?}"
     );
+}
+
+#[test]
+fn notification_sequence_snapshot_confirms_large_backlog_without_new_clock_values() {
+    let temp = fixture();
+    let root = protected_root(&temp, "project");
+    let mut storage = Storage::open(":memory:").unwrap();
+    // 超过详情查询上限的历史积压，必须通过数据库批量确认。
+    let backlog = 10_001;
+    for index in 0..backlog {
+        storage
+            .record_alert_at(&sample_alert(&format!("old-{index}"), &root, 90, 100), 100)
+            .unwrap();
+    }
+    let summary = storage.pending_notification_summary().unwrap();
+    assert_eq!(summary.count, backlog as u64);
+    assert_eq!(summary.by_rule[0].count, backlog as u64);
+    let cutoff = summary.latest_sequence.unwrap();
+    // 摘要返回以后入队，时间既可以相同，也可以因墙钟回拨而更早。
+    storage
+        .record_alert_at(&sample_alert("new-same-time", &root, 91, 100), 100)
+        .unwrap();
+    storage
+        .record_alert_at(&sample_alert("new-earlier-time", &root, 92, 100), 0)
+        .unwrap();
+    assert_eq!(
+        storage
+            .acknowledge_pending_notifications_through(cutoff, 500)
+            .unwrap(),
+        backlog
+    );
+    let pending = storage.pending_notifications(10).unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].alert.id, "new-earlier-time");
+    assert_eq!(pending[1].alert.id, "new-same-time");
+    assert!(
+        storage
+            .pending_notification_summary()
+            .unwrap()
+            .latest_sequence
+            .unwrap()
+            > cutoff
+    );
+    let stats = storage.cumulative_stats().unwrap();
+    assert_eq!(stats.notifications_acknowledged, backlog as u64);
+    assert_eq!(
+        storage
+            .recent_stats(0, 1_000)
+            .unwrap()
+            .notifications_acknowledged,
+        backlog as u64
+    );
+    assert_eq!(
+        storage
+            .acknowledge_pending_notifications_through(cutoff, 501)
+            .unwrap(),
+        0
+    );
+    assert_eq!(storage.cumulative_stats().unwrap(), stats);
+    assert_eq!(
+        storage
+            .recent_stats(0, 1_000)
+            .unwrap()
+            .notifications_acknowledged,
+        backlog as u64
+    );
+
+    // 详情全部清理后仍不能复用序号，使旧摘要确认保持安全。
+    storage.prune_expired(31 * 24 * 60 * 60 * 1_000).unwrap();
+    assert_eq!(
+        storage
+            .pending_notification_summary()
+            .unwrap()
+            .latest_sequence,
+        None
+    );
+    storage
+        .record_alert_at(&sample_alert("after-prune", &root, 93, 100), 100)
+        .unwrap();
+    assert!(
+        storage
+            .pending_notification_summary()
+            .unwrap()
+            .latest_sequence
+            .unwrap()
+            > cutoff
+    );
+    assert_eq!(
+        storage
+            .acknowledge_pending_notifications_through(cutoff, 502)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn notification_snapshot_acknowledgement_rolls_back_all_feedback_and_statistics() {
+    let temp = fixture();
+    let root = protected_root(&temp, "project");
+    let database = temp.path().join("monitor.sqlite");
+    let mut storage = Storage::open(&database).unwrap();
+    for id in ["one", "two"] {
+        storage
+            .record_alert_at(&sample_alert(id, &root, 94, 100), 100)
+            .unwrap();
+    }
+    let summary = storage.pending_notification_summary().unwrap();
+    let before = storage.cumulative_stats().unwrap();
+    let external = Connection::open(&database).unwrap();
+    external
+        .execute_batch(
+            "CREATE TRIGGER reject_second_acknowledgement
+             BEFORE UPDATE ON notification_outbox
+             WHEN NEW.alert_id = 'two' AND NEW.acknowledged_timestamp_ms IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, '合成通知反馈故障'); END;",
+        )
+        .unwrap();
+    assert!(
+        storage
+            .acknowledge_pending_notifications_through(summary.latest_sequence.unwrap(), 500)
+            .is_err()
+    );
+    assert_eq!(storage.pending_notification_summary().unwrap().count, 2);
+    assert!(
+        storage
+            .query_notifications(&NotificationFilter::default())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(storage.cumulative_stats().unwrap(), before);
+}
+
+#[test]
+fn schema_v1_migration_preserves_evidence_feedback_and_pending_outbox() {
+    let temp = fixture();
+    let root = protected_root(&temp, "project");
+    let database = temp.path().join("monitor.sqlite");
+    let mut storage = Storage::open(&database).unwrap();
+    storage.add_directory(&root, "manual", 100).unwrap();
+    let observed = read_event(root.join("file.rs"), 100, 110, 95, Some(1));
+    storage
+        .record_event(&observed, std::slice::from_ref(&root))
+        .unwrap();
+    storage
+        .record_health(&HealthRecord {
+            observed_timestamp_ms: 110,
+            component: "synthetic".into(),
+            code: "fixture".into(),
+            state: "ready".into(),
+            detail: None,
+        })
+        .unwrap();
+    storage
+        .record_alert_at(&sample_alert("pending-v1", &root, 95, 100), 110)
+        .unwrap();
+    storage
+        .record_alert_at(&sample_alert("sent-v1", &root, 96, 101), 111)
+        .unwrap();
+    storage
+        .record_notification(&NotificationRecord {
+            alert_id: "sent-v1".into(),
+            observed_timestamp_ms: 112,
+            outcome: NotificationOutcome::Sent,
+            detail: None,
+        })
+        .unwrap();
+    let directories = storage.list_directories().unwrap();
+    let events = storage.query_events(&EventFilter::default()).unwrap();
+    let alerts = storage.query_alerts(&AlertFilter::default()).unwrap();
+    let health = storage.query_health(&HealthFilter::default()).unwrap();
+    let feedback = storage
+        .query_notifications(&NotificationFilter::default())
+        .unwrap();
+    let cumulative = storage.cumulative_stats().unwrap();
+    drop(storage);
+
+    // 其余 v1 表未变；按原 v1 定义重建唯一发生演进的 outbox，形成旧库夹具。
+    let legacy = Connection::open(&database).unwrap();
+    legacy
+        .execute_batch(
+            "BEGIN;
+         CREATE TABLE notification_outbox_v1 (
+             alert_id TEXT PRIMARY KEY NOT NULL,
+             created_timestamp_ms INTEGER NOT NULL,
+             acknowledged_timestamp_ms INTEGER,
+             FOREIGN KEY (alert_id) REFERENCES alerts(id) ON DELETE CASCADE
+         );
+         INSERT INTO notification_outbox_v1
+         SELECT alert_id, created_timestamp_ms, acknowledged_timestamp_ms
+         FROM notification_outbox ORDER BY sequence;
+         DROP TABLE notification_outbox;
+         ALTER TABLE notification_outbox_v1 RENAME TO notification_outbox;
+         CREATE INDEX notification_outbox_pending
+             ON notification_outbox (acknowledged_timestamp_ms, created_timestamp_ms);
+         PRAGMA user_version = 1;
+         COMMIT;",
+        )
+        .unwrap();
+    assert_eq!(
+        legacy
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(legacy);
+
+    let mut migrated = Storage::open(&database).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 2);
+    assert_eq!(migrated.list_directories().unwrap(), directories);
+    assert_eq!(
+        migrated.query_events(&EventFilter::default()).unwrap(),
+        events
+    );
+    assert_eq!(
+        migrated.query_alerts(&AlertFilter::default()).unwrap(),
+        alerts
+    );
+    assert_eq!(
+        migrated.query_health(&HealthFilter::default()).unwrap(),
+        health
+    );
+    assert_eq!(
+        migrated
+            .query_notifications(&NotificationFilter::default())
+            .unwrap(),
+        feedback
+    );
+    assert_eq!(migrated.cumulative_stats().unwrap(), cumulative);
+    let summary = migrated.pending_notification_summary().unwrap();
+    assert_eq!(summary.count, 1);
+    assert_eq!(summary.oldest_created_timestamp_ms, Some(110));
+    assert_eq!(
+        migrated.pending_notifications(10).unwrap()[0].alert.id,
+        "pending-v1"
+    );
+    migrated
+        .record_alert_at(&sample_alert("new-v2", &root, 97, 99), 99)
+        .unwrap();
+    assert_eq!(
+        migrated
+            .acknowledge_pending_notifications_through(summary.latest_sequence.unwrap(), 120)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        migrated.pending_notifications(10).unwrap()[0].alert.id,
+        "new-v2"
+    );
+    assert_eq!(
+        migrated
+            .query_notifications(&NotificationFilter {
+                alert_id: Some("sent-v1".into()),
+                ..NotificationFilter::default()
+            })
+            .unwrap(),
+        feedback
+    );
+    drop(migrated);
+    let reopened = Storage::open(database).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 2);
+    assert_eq!(reopened.pending_notification_summary().unwrap().count, 1);
 }

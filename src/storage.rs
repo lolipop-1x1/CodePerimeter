@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const DEFAULT_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 100;
 const MAX_QUERY_LIMIT: usize = 10_000;
@@ -67,13 +67,14 @@ CREATE TABLE alerts (
 CREATE INDEX alerts_last_time ON alerts (last_timestamp_ms DESC);
 CREATE INDEX alerts_process_time ON alerts (pid, pid_version, last_timestamp_ms DESC);
 CREATE TABLE notification_outbox (
-    alert_id TEXT PRIMARY KEY NOT NULL,
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id TEXT UNIQUE NOT NULL,
     created_timestamp_ms INTEGER NOT NULL,
     acknowledged_timestamp_ms INTEGER,
     FOREIGN KEY (alert_id) REFERENCES alerts(id) ON DELETE CASCADE
 );
 CREATE INDEX notification_outbox_pending
-    ON notification_outbox (acknowledged_timestamp_ms, created_timestamp_ms);
+    ON notification_outbox (acknowledged_timestamp_ms, sequence);
 CREATE TABLE alert_directories (
     alert_id TEXT NOT NULL,
     directory_path TEXT NOT NULL,
@@ -104,6 +105,25 @@ CREATE TABLE cumulative_statistics (
     key TEXT PRIMARY KEY NOT NULL,
     value INTEGER NOT NULL
 );
+";
+
+const MIGRATE_SCHEMA_V1: &str = "
+CREATE TABLE notification_outbox_v2 (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id TEXT UNIQUE NOT NULL,
+    created_timestamp_ms INTEGER NOT NULL,
+    acknowledged_timestamp_ms INTEGER,
+    FOREIGN KEY (alert_id) REFERENCES alerts(id) ON DELETE CASCADE
+);
+INSERT INTO notification_outbox_v2 (
+    alert_id, created_timestamp_ms, acknowledged_timestamp_ms
+)
+SELECT alert_id, created_timestamp_ms, acknowledged_timestamp_ms
+FROM notification_outbox ORDER BY rowid;
+DROP TABLE notification_outbox;
+ALTER TABLE notification_outbox_v2 RENAME TO notification_outbox;
+CREATE INDEX notification_outbox_pending
+    ON notification_outbox (acknowledged_timestamp_ms, sequence);
 ";
 
 #[derive(Debug)]
@@ -315,6 +335,7 @@ pub struct NotificationRuleCount {
 pub struct PendingNotificationSummary {
     pub count: u64,
     pub oldest_created_timestamp_ms: Option<i64>,
+    pub latest_sequence: Option<i64>,
     pub by_rule: Vec<NotificationRuleCount>,
 }
 
@@ -647,15 +668,18 @@ impl Storage {
     }
 
     pub fn pending_notification_summary(&self) -> Result<PendingNotificationSummary> {
-        let (count, oldest): (i64, Option<i64>) = self.connection.query_row(
-            "SELECT COUNT(*), MIN(created_timestamp_ms)
+        // 所有摘要字段来自同一读快照，避免并发入队改变汇总成员。
+        let transaction = self.connection.unchecked_transaction()?;
+        let (count, oldest, latest_sequence): (i64, Option<i64>, Option<i64>) = transaction
+            .query_row(
+                "SELECT COUNT(*), MIN(created_timestamp_ms), MAX(sequence)
              FROM notification_outbox
              WHERE acknowledged_timestamp_ms IS NULL",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         let grouped = {
-            let mut statement = self.connection.prepare(
+            let mut statement = transaction.prepare(
                 "SELECT a.rule, COUNT(*)
                  FROM notification_outbox o
                  JOIN alerts a ON a.id = o.alert_id
@@ -676,11 +700,46 @@ impl Storage {
                 count: nonnegative_u64(count),
             });
         }
+        transaction.commit()?;
         Ok(PendingNotificationSummary {
             count: nonnegative_u64(count),
             oldest_created_timestamp_ms: oldest,
+            latest_sequence,
             by_rule,
         })
+    }
+
+    /// 只确认摘要快照的队列序号；同毫秒或回拨后的新告警仍待处理。
+    pub fn acknowledge_pending_notifications_through(
+        &mut self,
+        sequence: i64,
+        observed_timestamp_ms: i64,
+    ) -> Result<usize> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO notification_feedback (
+                alert_id, observed_timestamp_ms, outcome, detail
+             )
+             SELECT alert_id, ?2, 'acknowledged', NULL
+             FROM notification_outbox
+             WHERE sequence <= ?1 AND acknowledged_timestamp_ms IS NULL",
+            params![sequence, observed_timestamp_ms],
+        )?;
+        let acknowledged = transaction.execute(
+            "UPDATE notification_outbox
+             SET acknowledged_timestamp_ms = ?2
+             WHERE sequence <= ?1 AND acknowledged_timestamp_ms IS NULL",
+            params![sequence, observed_timestamp_ms],
+        )?;
+        if acknowledged > 0 {
+            increment_stat(
+                &transaction,
+                "notifications.acknowledged",
+                i64::try_from(acknowledged)?,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(acknowledged)
     }
 
     pub fn acknowledge_notifications(
@@ -989,21 +1048,21 @@ impl Storage {
 
     fn initialize_schema(connection: &mut Connection) -> Result<()> {
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match version {
-            0 => {
-                let transaction = connection.transaction()?;
-                transaction.execute_batch(SCHEMA)?;
-                transaction.execute_batch("PRAGMA user_version = 1;")?;
-                transaction.commit()?;
-            }
-            value if value == i64::from(SCHEMA_VERSION) => {}
+        let sql = match version {
+            0 => SCHEMA,
+            1 => MIGRATE_SCHEMA_V1,
+            value if value == i64::from(SCHEMA_VERSION) => return Ok(()),
             _ => {
                 return Err(Box::new(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("不支持的 SQLite schema 版本：{version}"),
                 )));
             }
-        }
+        };
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(sql)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
         Ok(())
     }
 

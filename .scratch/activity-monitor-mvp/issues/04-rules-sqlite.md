@@ -34,7 +34,7 @@ API 由本任务明确并写在 Answer，供运行宿主接入。[spec](../spec.
 
 ### SQLite 宿主接口
 
-`Storage::open(path) -> Result<Storage>` 建立 schema 版本 1，SQLite busy timeout 为 100ms，避免锁等待占用实时告警预算。所有修改方法都需要 `&mut self`；运行宿主由普通用户后台进程持有唯一 `Storage` 实例，CLI 与通知会话通过宿主请求查询或提交，不直接打开第二条写入路径。SQLite 写入失败原样返回给宿主，由宿主标记保存缺口；规则输出在写入前生成。公开查询 DTO、filter、通知结果和统计类型支持 Serde JSON IPC。
+`Storage::open(path) -> Result<Storage>` 建立 schema 版本 2，原子迁移 v1 通知队列并保留既有证据；SQLite busy timeout 为 100ms，避免锁等待占用实时告警预算。所有修改方法都需要 `&mut self`；运行宿主由普通用户后台进程持有唯一 `Storage` 实例，CLI 与通知会话通过宿主请求查询或提交，不直接打开第二条写入路径。SQLite 写入失败原样返回给宿主，由宿主标记保存缺口；规则输出在写入前生成。公开查询 DTO、filter、通知结果和统计类型支持 Serde JSON IPC。
 
 - 目录配置：`add_directory(&Path, &str, i64) -> Result<bool>`、`remove_directory(&Path) -> Result<bool>`、`list_directories() -> Result<Vec<DirectoryConfig>>`、`active_directory_paths() -> Result<Vec<PathBuf>>`。路径幂等，来源按目录去重；移除配置不删除历史事件。
 - 事件：`record_event(&ActivityEvent, &[PathBuf]) -> Result<bool>`；具有源序号时按采集运行实例和序号幂等，无序号事件不伪造去重键。`query_events(&EventFilter) -> Result<Vec<StoredEvent>>` 支持目录、PID、类型、规范化精确文件／目的路径和接收时间范围。
@@ -42,11 +42,14 @@ API 由本任务明确并写在 Answer，供运行宿主接入。[spec](../spec.
 - 健康：`record_health(&HealthRecord) -> Result<i64>` 与 `query_health(&HealthFilter) -> Result<Vec<StoredHealthRecord>>`；规则侧 `RuleHealth` 由宿主映射为 `component = "rules"` 的记录。健康行与累计计数在单个事务内写入。
 - 通知：`pending_notifications(limit) -> Result<Vec<PendingNotification>>` 按排队时间读取详情；`pending_notification_summary() -> Result<PendingNotificationSummary>` 返回未确认数、最早排队时间和按规则汇总。宿主可在桌面会话不可用期间积累记录，恢复后汇总发送。
 - 通知反馈：`record_notification(&NotificationRecord) -> Result<i64>` 原子保存反馈和累计统计；`Sent` 表示系统通知 API 接受请求并确认该告警队列项，不证明已到屏；`Failed`、`Deferred` 保持待处理。`acknowledge_notifications(&[String], i64) -> Result<usize>` 对仍待处理项幂等确认并保存 acknowledged 反馈。`query_notifications(&NotificationFilter) -> Result<Vec<StoredNotificationRecord>>` 回查尝试及确认记录。
+- 积压摘要快照：`PendingNotificationSummary.latest_sequence: Option<i64>` 是同一 SQLite 读快照中未确认成员的最大队列序号，无 pending 时为 `None`。`acknowledge_pending_notifications_through(sequence: i64, observed_timestamp_ms: i64) -> Result<usize>` 用 SQL 在一个事务插入截止序号及以前仍待处理成员的 acknowledged 反馈、更新队列和累计统计，不将全部 ID 拉入内存。第一次桌面恢复可先汇总发送，再用快照序号确认；同毫秒或墙钟回拨以后新入队的成员仍有更大序号，不会被旧摘要确认。重试返回 0，不增加反馈或统计。
+- outbox 的 `sequence INTEGER PRIMARY KEY AUTOINCREMENT` 在详情清理后不复用；v1 升级按原队列 rowid 顺序分配序号并保留排队／确认时间。所有其他证据表不变，迁移与 schema 版本提升在同一事务内。
 - 统计与保留：`recent_stats(i64, i64) -> Result<RecentStats>` 返回接收／反馈时间区间统计；`cumulative_stats() -> Result<CumulativeStats>` 返回跨明细清理累计值；`prune_expired(i64) -> Result<PruneSummary>` 删除 30 天以前的事件、告警、健康、通知反馈与待通知明细，不删除累计值；`clear_cumulative_stats() -> Result<()>` 显式清零累计统计。
 
 ### 验证
 
 - 2026-10-03：`rustfmt --check --edition 2024 src/rules.rs src/storage.rs` 通过；`cargo test --locked` 通过（10 个集成测试）；`cargo clippy --locked --all-targets -- -D warnings` 通过。
+- 2026-10-03：补充 outbox 单调快照确认，13 项 rules/storage 测试通过：10,001 条 pending 批量确认，摘要后同毫秒／更早时间新告警保留，幂等重试、详情清理不复用序号、更新故障回滚反馈／队列／统计，以及 v1 迁移保留全部既有证据与 pending。
 
 ### 宿主处理顺序
 
