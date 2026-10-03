@@ -61,7 +61,7 @@ python3 -B scripts/validate-prepare-collector.py --binary target/release/codeper
 python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
 ```
 
-准备入口仅复制本账户的 root-owned 二进制，已有目标即拒绝覆盖；它不安装 launchd、不改变 FDA。完整入口保存本地 `summary.json` 路径，真实采集失败会退出并记录原因，不回退 fixture。执行现有服务停止、替换版本和 FDA 授权前，按验证文档检查当前状态。
+准备入口仅复制本账户的 root-owned 二进制，默认拒绝已有目标；无 launchd 安装且没有活动端点／进程的验收副本可按文档用 `--replace-sha256 <明确旧hash>` 安全替换。它不安装 launchd、不改变 FDA。完整入口保存本地 `summary.json` 路径，真实采集失败会退出并记录原因，不回退 fixture。执行现有服务停止、替换版本和 FDA 授权前，按验证文档检查当前状态。
 
 ## 项目文档
 

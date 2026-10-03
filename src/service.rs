@@ -330,19 +330,22 @@ fn bind_collector(socket_path: &Path, allowed_uid: u32) -> io::Result<UnixListen
             "采集接收账户必须为普通用户且 socket 路径必须绝对",
         ));
     }
-    let expected = PathBuf::from(format!(
-        "/var/run/codeperimeter-{allowed_uid}/collector.sock"
-    ));
+    let expected = collector_socket_path(allowed_uid);
     if socket_path != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "root 采集 socket 必须使用固定服务目录",
         ));
     }
-    checked_root_path(&fs::canonicalize("/var/run")?)?;
     let parent = socket_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket 缺少父目录"))?;
+    // 先核验既有安装目录；不修改系统 /var/run 的权限。
+    checked_root_path(
+        parent
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket 缺少安装目录"))?,
+    )?;
     checked_directory(parent, 0, account.gid, 0o750)?;
     if let Ok(metadata) = fs::symlink_metadata(socket_path) {
         if !metadata.file_type().is_socket() || metadata.uid() != 0 {
@@ -702,6 +705,10 @@ pub struct OperationReport {
     pub data_preserved: bool,
 }
 
+pub fn collector_socket_path(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/Library/CodePerimeter/{uid}/run/collector.sock"))
+}
+
 impl ServicePlan {
     pub fn new(username: &str, source_binary: &Path) -> Result<Self> {
         let account = lookup_account(username)?;
@@ -719,10 +726,7 @@ impl ServicePlan {
         let data_dir = account
             .home
             .join("Library/Application Support/CodePerimeter");
-        let collector_socket = PathBuf::from(format!(
-            "/var/run/codeperimeter-{}/collector.sock",
-            account.uid
-        ));
+        let collector_socket = collector_socket_path(account.uid);
         let control_socket = data_dir.join("host.sock");
         let db_path = data_dir.join("events.sqlite");
         let binary = installed_binary.to_string_lossy().into_owned();

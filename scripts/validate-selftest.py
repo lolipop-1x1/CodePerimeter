@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """验收判定器的匿名自测；不启动采集，不能作为真实 ES 或通知验收。"""
+import hashlib
 import importlib.util
+import io
+import os
 from pathlib import Path
+import stat
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("validation", Path(__file__).with_name("validate-mvp.py"))
 validation = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(validation)
+prepare_spec = importlib.util.spec_from_file_location("prepare", Path(__file__).with_name("validate-prepare-collector.py"))
+prepare = importlib.util.module_from_spec(prepare_spec)
+prepare_spec.loader.exec_module(prepare)
 PROJECT = Path("/private/tmp/anonymous-validation/project")
 PROCESS = {"pid": 100, "pid_version": 4}
 
@@ -122,6 +132,116 @@ class ValidationArchiveOutputTests(unittest.TestCase):
         missing = self.case("tar", "inside", declared=False)
         self.assertFalse(missing["passed"])
         self.assertIn("发送器未声明预期归档输出", missing["missing_evidence"])
+
+
+class ValidationStartupTests(unittest.TestCase):
+    def test_startup_diagnostics_are_bounded_static_and_never_echo_raw(self):
+        stream = io.BytesIO(("执行失败：root 服务文件或父目录可被普通用户修改\n"
+                             + "anonymous-secret=/unknown/private/path " * 10000 + "\n"
+                             + "sudo: a password is required\n").encode())
+        codes = []
+        validation.startup_diagnostics(stream, codes)
+        self.assertEqual(codes, ["unsafe_root_path", "unclassified_stderr", "sudo_authorization_required"])
+        self.assertTrue(stream.closed)
+        self.assertLessEqual(len(codes), 8)
+        self.assertNotIn("anonymous-secret", str(codes))
+        self.assertNotIn("/unknown/private/path", str(codes))
+
+    def test_exited_collector_fails_before_timeout_without_control_request(self):
+        with patch.object(validation, "control") as control:
+            with self.assertRaisesRegex(validation.CollectorStartupError, "退出码 7"):
+                validation.wait_for_bridge(Path("/anonymous.sock"), SimpleNamespace(poll=lambda: 7), Path("/anonymous"))
+            control.assert_not_called()
+
+
+class ProtectedReplacementTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.namespace = {"__name__": "test_only"}
+        exec(prepare.ROOT_REPLACE_CODE, self.namespace)
+        self.namespace["INSTALL_ROOT"] = self.root / "CodePerimeter"
+        self.uid = os.getuid()
+        self.directory = self.namespace["INSTALL_ROOT"] / str(self.uid)
+        self.directory.mkdir(parents=True)
+        self.destination = self.directory / "codeperimeter"
+        self.staged = self.directory / (".codeperimeter-prepare-" + "a" * 32)
+        self.destination.write_bytes(b"anonymous-old")
+        self.staged.write_bytes(b"anonymous-new")
+        self.old = hashlib.sha256(self.destination.read_bytes()).hexdigest()
+        self.new = hashlib.sha256(self.staged.read_bytes()).hexdigest()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def replace(self, old=None, staged=None):
+        # 测试只写普通用户匿名目录；root路径/身份的替身不代表实际管理员发布。
+        with patch.dict(self.namespace, {"check_chain": lambda path: None, "ensure_quiet": lambda uid, directory: None}), patch.object(os, "geteuid", return_value=0):
+            self.namespace["replace"](self.destination, staged or self.staged, old or self.old, self.new, self.uid)
+
+    def test_exact_old_hash_allows_atomic_replacement_but_mismatch_preserves_old(self):
+        with self.assertRaisesRegex(RuntimeError, "SHA256"):
+            self.replace(old="b" * 64)
+        self.assertEqual(self.destination.read_bytes(), b"anonymous-old")
+        self.assertTrue(self.staged.exists())
+        self.replace()
+        self.assertEqual(self.destination.read_bytes(), b"anonymous-new")
+        self.assertFalse(self.staged.exists())
+
+    def test_root_publication_rechecks_trust_and_quiet_before_replacing(self):
+        for gate, message in (("check_chain", "root链拒绝"), ("ensure_quiet", "活动端点拒绝")):
+            def rejected(*args):
+                raise RuntimeError(message)
+            with patch.dict(self.namespace, {"check_chain": lambda path: None, "ensure_quiet": lambda uid, directory: None,
+                                             gate: rejected}), patch.object(os, "geteuid", return_value=0):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.namespace["replace"](self.destination, self.staged, self.old, self.new, self.uid)
+            self.assertEqual(self.destination.read_bytes(), b"anonymous-old")
+            self.assertTrue(self.staged.exists())
+
+    def test_unknown_staging_and_symlink_target_are_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "固定路径"):
+            self.replace(staged=self.directory / "unknown-file")
+        other = self.directory / "unknown-data"
+        other.write_bytes(b"anonymous-old")
+        self.destination.unlink()
+        self.destination.symlink_to(other)
+        with self.assertRaisesRegex(RuntimeError, "SHA256"):
+            self.replace()
+        self.assertEqual(other.read_bytes(), b"anonymous-old")
+
+    def quiet(self, comm="", loaded=False):
+        def command(args, **kwargs):
+            return SimpleNamespace(returncode=0 if loaded and args[0] == "/bin/launchctl" else 1,
+                                   stdout=comm if args[0] == "/bin/ps" else "")
+        with patch.object(self.namespace["pwd"], "getpwuid", return_value=SimpleNamespace(pw_dir=str(self.root / "home"))), patch.object(self.namespace["subprocess"], "run", side_effect=command):
+            self.namespace["ensure_quiet"](self.uid, self.directory)
+
+    def test_new_legacy_and_control_endpoints_refuse_replacement_without_cleanup(self):
+        for path in (self.directory / "run/collector.sock", Path(f"/var/run/codeperimeter-{self.uid}/collector.sock"),
+                     self.root / "home/Library/Application Support/CodePerimeter/host.sock"):
+            with self.subTest(endpoint=path), patch.object(os.path, "lexists", side_effect=lambda candidate: candidate == path):
+                with self.assertRaisesRegex(RuntimeError, "端点"):
+                    self.quiet()
+        self.assertEqual(self.destination.read_bytes(), b"anonymous-old")
+
+    def test_installed_or_loaded_jobs_and_any_active_codeperimeter_are_rejected(self):
+        with patch.object(os.path, "lexists", side_effect=lambda candidate: str(candidate).endswith(f"com.codeperimeter.collector.{self.uid}.plist")):
+            with self.assertRaisesRegex(RuntimeError, "已安装或加载"):
+                self.quiet()
+        with self.assertRaisesRegex(RuntimeError, "已安装或加载"):
+            self.quiet(loaded=True)
+        with self.assertRaisesRegex(RuntimeError, "进程"):
+            self.quiet(comm="/anonymous/bin/codeperimeter\n")
+        self.quiet(comm="/usr/bin/unrelated\n")
+
+    def test_root_guard_rechecks_mode_and_write_acl(self):
+        with patch.object(Path, "lstat", return_value=SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o775)):
+            with self.assertRaisesRegex(RuntimeError, "不可写"):
+                self.namespace["check_chain"](Path("/private/var/run"))
+        with patch.object(Path, "lstat", return_value=SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)), patch.object(self.namespace["subprocess"], "run", return_value=SimpleNamespace(stdout="anonymous\n 0: group:staff allow add_file\n")):
+            with self.assertRaisesRegex(RuntimeError, "写ACL"):
+                self.namespace["check_chain"](Path("/Library/CodePerimeter"))
 
 
 if __name__ == "__main__":

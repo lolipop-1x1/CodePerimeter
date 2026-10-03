@@ -47,6 +47,40 @@ def control(path, operation, payload=None):
     return response["data"]
 
 
+class CollectorStartupError(RuntimeError):
+    pass
+
+
+def startup_diagnostics(stream, codes):
+    # 只保存白名单静态分类，原 stderr 持续有界排空，不保存原文或全系统事件。
+    patterns = (("root 服务文件或父目录可被普通用户修改", "unsafe_root_path"),
+                ("服务目录不是受信任的私有目录", "unsafe_run_directory"),
+                ("拒绝替换非本服务的 socket", "untrusted_endpoint"),
+                ("采集服务已运行", "endpoint_in_use"),
+                ("password is required", "sudo_authorization_required"),
+                ("a password is required", "sudo_authorization_required"),
+                ("No such file or directory", "missing_install_path"),
+                ("Permission denied", "permission_denied"))
+    while True:
+        chunk = stream.readline(4096)
+        if not chunk:
+            break
+        line = chunk.decode("utf-8", errors="replace")
+        code = next((code for text, code in patterns if text in line), "unclassified_stderr")
+        if code not in codes and len(codes) < 8:
+            codes.append(code)
+    stream.close()
+
+
+def wait_for_bridge(control_socket, launcher, collector):
+    def ready():
+        code = launcher.poll()
+        if code is not None:
+            raise CollectorStartupError(f"root collector 在连接前退出，退出码 {code}；见 root_startup 静态诊断")
+        return bridge_identity(control(control_socket, "status"), launcher, collector)
+    return wait_for(ready)
+
+
 def wait_for(callback, timeout=15):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -54,6 +88,8 @@ def wait_for(callback, timeout=15):
             result = callback()
             if result:
                 return result
+        except CollectorStartupError:
+            raise
         except (OSError, ValueError, RuntimeError):
             pass
         time.sleep(0.1)
@@ -411,7 +447,7 @@ def start_preloaded(workspace):
 def run(args, report, summary):
     binary = args.binary.resolve()
     collector = args.collector_binary or Path(f"/Library/CodePerimeter/{os.getuid()}/codeperimeter")
-    collector_socket = Path(f"/var/run/codeperimeter-{os.getuid()}/collector.sock")
+    collector_socket = Path(f"/Library/CodePerimeter/{os.getuid()}/run/collector.sock")
     summary["environment"] = preflight(binary, collector, collector_socket)
     if args.preflight_only:
         summary["result"] = "preflight_passed_real_run_not_started"
@@ -426,6 +462,7 @@ def run(args, report, summary):
     bridge = None
     stop_sampling, samples = threading.Event(), []
     operations = []
+    startup_codes, startup_reader = [], None
     try:
         daemon = subprocess.Popen([str(binary), "daemon", "--socket", str(collector_socket), "--control-socket", str(control_socket), "--db", str(database)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         wait_for(lambda: control(control_socket, "status"))
@@ -433,12 +470,14 @@ def run(args, report, summary):
         configured = control(control_socket, "list_directories")
         if len(configured) != 1 or Path(configured[0]["path"]) != project:
             raise RuntimeError("匿名监控配置不是唯一合成项目，拒绝继续")
-        root_process = subprocess.Popen(["/usr/bin/sudo", "-n", str(collector), "collector", "--socket", str(collector_socket), "--allowed-uid", str(os.getuid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        root_process = subprocess.Popen(["/usr/bin/sudo", "-n", str(collector), "collector", "--socket", str(collector_socket), "--allowed-uid", str(os.getuid())], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        startup_reader = threading.Thread(target=startup_diagnostics, args=(root_process.stderr, startup_codes), daemon=True)
+        startup_reader.start()
         notifier = subprocess.Popen([str(binary), "notify", "--control-socket", str(control_socket)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         monitor = threading.Thread(target=performance, args=([root_process, daemon, notifier], stop_sampling, samples), daemon=True)
         monitor.start()
         # 桥接 connected 不等于实际 ES 可读；先要求真实合成文件事件。
-        bridge = wait_for(lambda: bridge_identity(control(control_socket, "status"), root_process, collector))
+        bridge = wait_for_bridge(control_socket, root_process, collector)
         initial = control(control_socket, "status")
         operations.append({"scenario": "read", "scope": "inside", "metadata": sender(workspace, "read")})
         read_pids = {row["pid"] for row in operations[0]["metadata"] if row.get("pid")}
@@ -512,6 +551,12 @@ def run(args, report, summary):
                     process.kill()
                     process.wait()
         summary["root_cleanup_complete"] = stop_root(bridge, root_process)
+        if startup_reader:
+            startup_reader.join(timeout=3)
+        summary["root_startup"] = {"exit_code": root_process.poll() if root_process else None,
+                                   "diagnostic_codes": list(startup_codes),
+                                   "stderr_complete": startup_reader is not None and not startup_reader.is_alive(),
+                                   "method": "最多8种白名单静态分类；原stderr不落盘"}
         summary["artifacts_retained"] = "保留匿名证据与合成项目供回查；未删除用户数据或修改服务配置"
 
 
