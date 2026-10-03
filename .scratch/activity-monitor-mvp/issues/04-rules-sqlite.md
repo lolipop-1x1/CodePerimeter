@@ -34,7 +34,7 @@ API 由本任务明确并写在 Answer，供运行宿主接入。[spec](../spec.
 
 ### SQLite 宿主接口
 
-`Storage::open(path) -> Result<Storage>` 建立 schema 版本 2，原子迁移 v1 通知队列并保留既有证据；SQLite busy timeout 为 100ms，避免锁等待占用实时告警预算。所有修改方法都需要 `&mut self`；运行宿主由普通用户后台进程持有唯一 `Storage` 实例，CLI 与通知会话通过宿主请求查询或提交，不直接打开第二条写入路径。SQLite 写入失败原样返回给宿主，由宿主标记保存缺口；规则输出在写入前生成。公开查询 DTO、filter、通知结果和统计类型支持 Serde JSON IPC。
+`Storage::open(path) -> Result<Storage>` 建立 schema 版本 3，原子迁移 v1 通知队列与 v2 健康来源字段并保留既有证据；SQLite busy timeout 为 100ms，避免锁等待占用实时告警预算。所有修改方法都需要 `&mut self`；运行宿主由普通用户后台进程持有唯一 `Storage` 实例，CLI 与通知会话通过宿主请求查询或提交，不直接打开第二条写入路径。SQLite 写入失败原样返回给宿主，由宿主标记保存缺口；规则输出在写入前生成。公开查询 DTO、filter、通知结果和统计类型支持 Serde JSON IPC。
 
 - 目录配置：`add_directory(&Path, &str, i64) -> Result<bool>`、`remove_directory(&Path) -> Result<bool>`、`list_directories() -> Result<Vec<DirectoryConfig>>`、`active_directory_paths() -> Result<Vec<PathBuf>>`。路径幂等，来源按目录去重；移除配置不删除历史事件。
 - 事件：`record_event(&ActivityEvent, &[PathBuf]) -> Result<bool>`；具有源序号时按采集运行实例和序号幂等，无序号事件不伪造去重键。`query_events(&EventFilter) -> Result<Vec<StoredEvent>>` 支持目录、PID、类型、规范化精确文件／目的路径和接收时间范围。
@@ -57,4 +57,6 @@ API 由本任务明确并写在 Answer，供运行宿主接入。[spec](../spec.
 2. 对每条告警调用 `record_alert_at(alert, now_ms())`。新告警在 SQLite 事务中进入待通知队列，通知工作循环立即读取并发送；桌面会话恢复时读取同一队列并按规则汇总。数据库短暂失败后的写重试由宿主节流，避免每条后续事件都等待 SQLite 锁。
 3. 通知 API 接受请求后记录 `NotificationOutcome::Sent`；发送失败或无桌面会话时分别记录 `Failed`／`Deferred`，待处理项保留供后续重试或汇总。通知调用与 SQLite 确认不能形成跨系统事务；若进程在系统接受通知后、保存 Sent 前退出，恢复时可能重复发送。
 
-详细回查使用各自 filter：`EventFilter`、`AlertFilter`、`HealthFilter`、`NotificationFilter`；通知反馈及队列状态均是观察结果，不表示用户已看到通知或策略已拦截操作。
+详细回查使用各自 filter：`EventFilter`、`AlertFilter`、`HealthFilter`、`NotificationFilter`；健康查询支持 `source_run_id`，source保留版本、缺失字段与丢事件数；通知反馈及队列状态均是观察结果，不表示用户已看到通知或策略已拦截操作。
+
+- 2026-10-04审查补修：来源版本／结构化缺口与v3迁移、控制连接错误隔离、宿主启动及每小时明细清理、故障合并告警的持久通知恢复和已发送去重均已补齐；针对性组件证据见 [双轴审查](../code-review.md)。系统root／FDA与后台验收仍由06记录。

@@ -11,8 +11,10 @@ use rusqlite::Connection;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Write;
+use std::net::Shutdown;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -568,5 +570,321 @@ fn database_lock_does_not_stop_analysis_or_ephemeral_notification() {
     assert_eq!(notifications.len(), 1);
 
     source.stop();
+    stop_host(&control_socket, host);
+}
+
+#[test]
+fn disconnected_and_slow_control_clients_do_not_stop_host() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = fixture();
+    let runtime = options(temp.path());
+    let control_socket = runtime.control_socket.clone();
+    let host = start_host(runtime);
+    wait_for_socket(&control_socket);
+    for request in [b"{\"operation\":\"status\"}\n".as_slice(), b"invalid\n"] {
+        let mut stream = UnixStream::connect(&control_socket).unwrap();
+        stream.write_all(request).unwrap();
+        stream.shutdown(Shutdown::Both).unwrap();
+        drop(stream);
+        thread::sleep(Duration::from_millis(40));
+        assert!(!host.is_finished(), "关闭响应端只影响单个连接");
+        let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+        assert_eq!(status.state, "running");
+    }
+    let mut slow = UnixStream::connect(&control_socket).unwrap();
+    slow.write_all(b"{\"operation\":").unwrap();
+    thread::sleep(Duration::from_millis(1200));
+    assert!(!host.is_finished(), "请求读超时只影响单个连接");
+    drop(slow);
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.state, "running");
+    stop_host(&control_socket, host);
+}
+
+#[test]
+fn host_prunes_at_start_and_periodically_preserves_statistics_and_reports_failure() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = fixture();
+    let runtime = options(temp.path());
+    let control_socket = runtime.control_socket.clone();
+    let database = runtime.database_path.clone();
+    let mut storage = codeperimeter::storage::Storage::open(&database).unwrap();
+    storage
+        .record_health(&codeperimeter::storage::HealthRecord {
+            observed_timestamp_ms: 1,
+            component: "anonymous".into(),
+            code: "expired".into(),
+            state: "observed".into(),
+            detail: None,
+            source: None,
+        })
+        .unwrap();
+    let before = storage.cumulative_stats().unwrap().health_records;
+    drop(storage);
+    let host = start_host(runtime);
+    wait_for_socket(&control_socket);
+    let health: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryHealth {
+            filter: HealthFilter {
+                component: Some("anonymous".into()),
+                ..HealthFilter::default()
+            },
+        },
+    );
+    assert!(health.is_empty(), "启动时应清理旧明细");
+    let stats: Value = query(
+        &control_socket,
+        ControlRequest::Stats {
+            since_ms: Some(0),
+            until_ms: None,
+        },
+    );
+    assert!(stats["cumulative"]["health_records"].as_u64().unwrap() >= before);
+    let external = Connection::open(&database).unwrap();
+    external.execute_batch("INSERT INTO health_records(observed_timestamp_ms,component,code,state) VALUES(1,'anonymous','periodic','observed');
+        CREATE TRIGGER reject_prune BEFORE DELETE ON health_records BEGIN SELECT RAISE(ABORT,'匿名保留清理故障'); END;").unwrap();
+    wait_until(
+        || {
+            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+            status.retention_state == "failed" && status.database_state == "degraded"
+        },
+        "定期清理故障应在状态中可见",
+    );
+    external.execute_batch("DROP TRIGGER reject_prune").unwrap();
+    wait_until(
+        || {
+            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+            let health: Vec<Value> = query(
+                &control_socket,
+                ControlRequest::QueryHealth {
+                    filter: HealthFilter {
+                        component: Some("anonymous".into()),
+                        ..HealthFilter::default()
+                    },
+                },
+            );
+            status.retention_state == "ready" && health.is_empty()
+        },
+        "恢复后应完成定期清理",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert!(status.retention_last_run_ms.is_some());
+    stop_host(&control_socket, host);
+}
+
+#[test]
+fn merged_alert_recovers_outbox_across_restart_and_sent_alert_does_not_repeat() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for sent_during_failure in [false, true] {
+        let temp = fixture();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let files = create_files(&project, "recover");
+        let mut runtime = options(temp.path());
+        runtime.bulk_file_threshold = 2;
+        let control_socket = runtime.control_socket.clone();
+        let database = runtime.database_path.clone();
+        let collector_socket = runtime.collector_socket.clone();
+        let host = start_host(runtime.clone());
+        wait_for_socket(&control_socket);
+        let _: Vec<Value> = query(
+            &control_socket,
+            ControlRequest::AddDirectories {
+                entries: vec![DirectoryImport {
+                    path: project,
+                    sources: vec!["manual".into()],
+                }],
+            },
+        );
+        let source = SyntheticSource::start(&collector_socket);
+        source.wait_connected();
+        let lock = Connection::open(&database).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for (sequence, file) in files[..3].iter().enumerate() {
+            source.send(open_frame(file, 880, 14, sequence as u64));
+        }
+        wait_until(
+            || {
+                let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+                status.observed_events_by_kind["open"] == 3
+                    && status.memory_pending_notifications == 1
+            },
+            "首次告警与合并均应在写锁期间分析",
+        );
+        let mut sender = RecordingSender {
+            messages: Vec::new(),
+        };
+        if sent_during_failure {
+            assert!(
+                notify_once_with_sender(&control_socket, "failure-session", &mut sender).unwrap()
+            );
+            assert_eq!(sender.messages.len(), 1);
+        }
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        wait_until(
+            || {
+                let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+                status.database_state == "ready" && status.memory_pending_notifications == 0
+            },
+            "恢复应将未发送告警交由持久化队列投递",
+        );
+        let pending: Vec<Value> = query(
+            &control_socket,
+            ControlRequest::PendingNotifications { limit: 10 },
+        );
+        assert_eq!(pending.len(), usize::from(!sent_during_failure));
+        let alerts: Vec<Value> = query(
+            &control_socket,
+            ControlRequest::QueryAlerts {
+                filter: AlertFilter::default(),
+            },
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0]["unique_files"], 3);
+        source.stop();
+        stop_host(&control_socket, host);
+        let host = start_host(runtime);
+        wait_for_socket(&control_socket);
+        let did_send =
+            notify_once_with_sender(&control_socket, "after-restart", &mut sender).unwrap();
+        assert_eq!(did_send, !sent_during_failure);
+        assert_eq!(sender.messages.len(), 1);
+        assert!(!notify_once_with_sender(&control_socket, "after-restart", &mut sender).unwrap());
+        stop_host(&control_socket, host);
+    }
+}
+
+#[test]
+fn source_versions_and_structured_gaps_are_queryable_by_run_after_restart() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = fixture();
+    let project = temp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let files = create_files(&project, "versions");
+    let runtime = options(temp.path());
+    let control_socket = runtime.control_socket.clone();
+    let collector_socket = runtime.collector_socket.clone();
+    let host = start_host(runtime.clone());
+    wait_for_socket(&control_socket);
+    let _: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::AddDirectories {
+            entries: vec![DirectoryImport {
+                path: project,
+                sources: vec!["manual".into()],
+            }],
+        },
+    );
+    let source = SyntheticSource::start(&collector_socket);
+    source.wait_connected();
+    source.send(open_frame(&files[0], 890, 15, 1));
+    if let CollectorFrame::Line {
+        run_id,
+        line,
+        received_timestamp_ms,
+    } = open_frame(&files[1], 890, 15, 4)
+    {
+        let mut value: Value = serde_json::from_str(&line).unwrap();
+        value["version"] = json!(10);
+        value["event"]["open"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fflag");
+        source.send(CollectorFrame::Line {
+            run_id,
+            line: value.to_string(),
+            received_timestamp_ms,
+        });
+    }
+    for sequence in [5, 6] {
+        if let CollectorFrame::Line {
+            run_id,
+            line,
+            received_timestamp_ms,
+        } = open_frame(&files[2], 890, 15, sequence)
+        {
+            let mut value: Value = serde_json::from_str(&line).unwrap();
+            value["schema_version"] = json!(2);
+            value["version"] = json!(11);
+            source.send(CollectorFrame::Line {
+                run_id,
+                line: value.to_string(),
+                received_timestamp_ms,
+            });
+        }
+    }
+    wait_until(
+        || {
+            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+            let unsupported: Vec<Value> = query(
+                &control_socket,
+                ControlRequest::QueryHealth {
+                    filter: HealthFilter {
+                        code: Some("unsupported_schema".into()),
+                        ..HealthFilter::default()
+                    },
+                },
+            );
+            status.observed_events_by_kind["open"] == 2
+                && status.collector_schema_version == Some(2)
+                && unsupported.len() == 2
+        },
+        "支持和不支持的版本均应记录实际来源，重复版本不新增版本记录",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.collector_schema_version, Some(2));
+    assert_eq!(status.collector_message_version, Some(11));
+    source.stop();
+    stop_host(&control_socket, host);
+    let host = start_host(runtime);
+    wait_for_socket(&control_socket);
+    let health: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryHealth {
+            filter: HealthFilter {
+                source_run_id: Some("synthetic-run-01".into()),
+                limit: 100,
+                ..HealthFilter::default()
+            },
+        },
+    );
+    let versions: Vec<_> = health
+        .iter()
+        .filter(|row| row["record"]["code"] == "source_version_observed")
+        .map(|row| row["record"]["source"]["message_version"].as_u64().unwrap())
+        .collect();
+    assert_eq!(versions, vec![11, 10, 9]);
+    assert!(
+        health
+            .iter()
+            .any(|row| row["record"]["source"]["field"] == "event.open.fflag")
+    );
+    let gaps: Vec<_> = health
+        .iter()
+        .filter(|row| row["record"]["code"] == "sequence_gap")
+        .collect();
+    assert_eq!(gaps.len(), 2);
+    assert!(
+        gaps.iter()
+            .all(|row| row["record"]["source"]["missing_events"] == 2)
+    );
+    let events: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryEvents {
+            filter: EventFilter::default(),
+        },
+    );
+    assert_eq!(events[0]["event"]["source_schema_version"], 1);
+    assert_eq!(events[0]["event"]["source_message_version"], 10);
     stop_host(&control_socket, host);
 }

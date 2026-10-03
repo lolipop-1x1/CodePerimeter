@@ -69,5 +69,60 @@ class ValidationTimingTests(unittest.TestCase):
         self.assertFalse(validation.latency_summary([3001], 0)["within_3000_ms"])
 
 
+class ValidationArchiveOutputTests(unittest.TestCase):
+    def case(self, scenario, scope, output_event=True, associated=True, declared=True, source_generation=4, project_root=PROJECT, output_before_read=False, command_output=True):
+        output = str(PROJECT / "result.zip" if scope == "inside" else Path("/private/tmp/anonymous-output/result.zip"))
+        events = [event(1000 + index, index=index, process=PROCESS | {"pid_version": source_generation}) for index in range(55)]
+        events.append(event(900, "exec", file=None, archive={"tool": scenario, "output_path": output if command_output else None}))
+        if output_event:
+            events.append(event(950 if output_before_read else 1100, "write", file=event(1100)["file"] | {"path": output, "readable": None}))
+        alerts = [{"id": rule, "rule": rule, "process": PROCESS,
+                   "first_timestamp_ms": 900, "last_timestamp_ms": 1200,
+                   "roots": [str(project_root)], "evidence_paths": []}
+                  for rule in ("bulk_file_access", "archive_command")]
+        if associated:
+            alerts.append(alerts[0] | {"id": "output", "rule": "archive_output"})
+        value = {"events": events, "alerts": alerts, "outbox": {}, "notifications": []}
+        operation = {"scenario": scenario, "scope": scope,
+                     "metadata": [{"pid": PROCESS["pid"]} | ({"output_path": output} if declared else {})]}
+        status = {"observed_events_by_kind": {kind: 0 for kind in validation.KINDS}}
+        return validation.analyze(value, [operation], PROJECT, status, status)["cases"][0]
+
+    def test_tar_and_zip_require_actual_output_in_both_locations(self):
+        for scenario in ("tar", "zip"):
+            for scope in ("inside", "temporary"):
+                with self.subTest(scenario=scenario, scope=scope):
+                    self.assertTrue(self.case(scenario, scope)["passed"])
+                    missing = self.case(scenario, scope, output_event=False)
+                    self.assertFalse(missing["passed"])
+                    self.assertTrue(missing["missing_evidence"])
+
+    def test_output_without_project_association_cannot_pass(self):
+        missing = self.case("zip", "temporary", associated=False, command_output=False)
+        self.assertFalse(missing["passed"])
+        self.assertTrue(missing["observed_output_paths"])
+        self.assertFalse(missing["project_associated_output_paths"])
+
+    def test_output_before_read_uses_actual_command_project_association(self):
+        for scenario in ("tar", "zip"):
+            self.assertTrue(self.case(scenario, "temporary", associated=False, output_before_read=True)["passed"])
+            self.assertFalse(self.case(scenario, "temporary", associated=False, output_before_read=True,
+                                       command_output=False)["passed"])
+
+    def test_project_or_process_generation_mismatch_cannot_pass(self):
+        self.assertFalse(self.case("tar", "temporary", source_generation=8)["passed"])
+        self.assertFalse(self.case("zip", "inside", project_root=PROJECT.parent / "another-project")["passed"])
+
+    def test_limited_alert_path_sample_does_not_replace_actual_output(self):
+        # case的告警路径样本均为空，仍以真实输出与项目读取／告警验证。
+        self.assertTrue(self.case("zip", "temporary", command_output=False)["passed"])
+        self.assertFalse(self.case("zip", "temporary", output_event=False, command_output=False)["passed"])
+
+    def test_undeclared_output_cannot_pass(self):
+        missing = self.case("tar", "inside", declared=False)
+        self.assertFalse(missing["passed"])
+        self.assertIn("发送器未声明预期归档输出", missing["missing_evidence"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

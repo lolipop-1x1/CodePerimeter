@@ -33,3 +33,5 @@ Blocked by: 02, 03, 04, 07
 
 - `tests/runtime_host.rs` 使用本机 Unix socket、合成 collector 与临时 SQLite，覆盖目录控制、50 文件批量告警、60 秒合并、历史 outbox 摘要和实时通知、三条告警突发连续发送、事件范围过滤、采集器重连／代际状态、心跳保留权限诊断，以及 SQLite 写锁期间继续分析和内存通知、解锁后的恢复写入。
 - 2026-10-04 验证：`cargo fmt --all -- --check`、`cargo test --locked --all-targets`（50 项）及 `cargo clippy --locked --all-targets -- -D warnings` 通过；本次测试以 uid 501 运行，runtime_host 三项均实际执行。测试在进程为 root 时会主动跳过；本机 root／FDA 后台采集链、真实通知到屏和 3 秒端到端时延仍由 06 的真实运行验收给结论。发送器替身只证明宿主投递／反馈路径，不证明 macOS 展示通知。
+
+- 2026-10-04审查补修：来源版本／结构化缺口与v3迁移、控制连接错误隔离、宿主启动及每小时明细清理、故障合并告警的持久通知恢复和已发送去重均已补齐；针对性组件证据见 [双轴审查](../code-review.md)。系统root／FDA与后台验收仍由06记录。

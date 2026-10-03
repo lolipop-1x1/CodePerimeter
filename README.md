@@ -20,15 +20,17 @@ cargo build --release --locked
 ./target/release/codeperimeter service plan --user "$(id -un)"
 ```
 
-服务计划显示三角色、安装路径和数据位置。核对后可以显式安装；安装返回成功仍须检查实际采集授权和运行状态：
+服务计划显示三角色、安装路径和数据位置。核对后显式安装并启动；install 只写入安装文件，start 才启用并加载服务，随后检查实际采集授权和运行状态：
 
 ```sh
 sudo ./target/release/codeperimeter service install --user "$(id -un)"
+sudo ./target/release/codeperimeter service start --user "$(id -un)"
 ./target/release/codeperimeter status
 ./target/release/codeperimeter watch add /absolute/path/project-a /absolute/path/project-b
 ./target/release/codeperimeter events --limit 50
 ./target/release/codeperimeter alerts --limit 50
 ./target/release/codeperimeter health --limit 100
+./target/release/codeperimeter health --source-run-id "实际run_id" --limit 100
 ```
 
 首次历史导入先生成快照，再选其中的目录。Codex 与 Claude Code 的元信息分别适配，新会话不会自动扩大范围：

@@ -190,6 +190,8 @@ fn alert_health_notification_and_stats_queries_serialize_filters() {
         &socket,
         &[
             "health".into(),
+            "--source-run-id".into(),
+            "anonymous-run".into(),
             "--component".into(),
             "collector".into(),
             "--code".into(),
@@ -203,6 +205,10 @@ fn alert_health_notification_and_stats_queries_serialize_filters() {
     );
     let health = requests.recv().unwrap();
     assert_eq!(health["operation"], "query_health");
+    assert_eq!(
+        health["payload"]["filter"]["source_run_id"],
+        "anonymous-run"
+    );
     assert_eq!(health["payload"]["filter"]["component"], "collector");
     assert_eq!(health["payload"]["filter"]["code"], "disconnected");
 

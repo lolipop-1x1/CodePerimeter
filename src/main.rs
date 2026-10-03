@@ -139,6 +139,8 @@ struct AlertQuery {
 #[derive(Debug, Args)]
 struct HealthQuery {
     #[arg(long)]
+    source_run_id: Option<String>,
+    #[arg(long)]
     component: Option<String>,
     #[arg(long)]
     code: Option<String>,
@@ -363,6 +365,7 @@ fn run(cli: Cli) -> CliResult<()> {
         }
         Command::Health(query) => {
             let filter = HealthFilter {
+                source_run_id: query.source_run_id,
                 component: query.component,
                 code: query.code,
                 since_ms: query.since_ms,

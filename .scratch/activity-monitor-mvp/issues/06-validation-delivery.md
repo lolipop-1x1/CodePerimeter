@@ -37,3 +37,5 @@ Blocked by: none (实现依赖已接入；真实授权运行与最终审查待 r
 交付必要补修：恢复 01 初始化误覆盖的原 `.gitignore` 五行（`.DS_Store`、`.env`、`.env.*`、`!.env.example`、`*.log`），保留新 target／SQLite 四行。root 准备副本采用私有 UUID 暂存＋校验＋系统 `/bin/link` 原子非覆盖发布，finally 只删除本轮暂存链接。已用匿名普通用户目录验证该系统工具拒绝已有文件／目录、不写入已有内容，新目标与暂存同 inode；未把此工具测试当作 root 准备已执行。
 
 最终 manifest：`.github/workflows/ci.yml`、本票、`.gitignore`、`README.md`、`docs/validation/activity-monitor-mvp.md`、`scripts/validate-mvp.py`、`scripts/validate-prepare-collector.py`、`scripts/validate-selftest.py`、`tests/end_to_end.rs`。07 生命周期修复另列其既有提交所有权。
+
+- 2026-10-04审查补修：双轴固定点审查发现Standards 2项、Spec 4项，已逐项修复并添加组件回归；tar／zip两种输出位置现在独立要求实际输出事件和项目关联，读取器锁定schema3；install后明确start；地图同步resolved票据和当前待验口径。完整系统验收、最终复核、PR ready与清理仍未完成，整票保持claimed，详见 [审查记录](../code-review.md)。

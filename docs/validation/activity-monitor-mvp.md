@@ -6,6 +6,8 @@
 
 2026-10-04 集成基线 `5b93bc2`：62 项 Rust 测试通过、1 项信号 worker 由监督用例显式调用；8 项 Python 发送器测试通过，fmt 与严格 clippy 通过。06 验证分支在此基础上运行全部 64 项 Rust 测试通过、fmt／严格 clippy 通过；8 项 Python 发送器与 3 项验收计时判定器自测通过。新增两个实际 CLI→普通用户宿主→SQLite 用户流程／采集权限拒绝测试。它们刻意没有可用采集源，验证手动目录、固定历史快照导入、配置不随新历史扩张、宿主重启回查和权限边界。
 
+2026-10-04固定点审查补修：Rust全部目标69 passed／1 ignored监督helper、Python发送器8 passed、判定器9 passed；fmt、check与严格clippy通过。新增连接断开／读超时、宿主启动与定期保留故障、锁恢复后重启通知、来源版本／缺口回查与v1／v2迁移回归。以上是组件证据，完整系统待验项保持不变，详见 [审查记录](../../.scratch/activity-monitor-mvp/code-review.md)。
+
 | 层次 | 当前证据 | 结论边界 |
 | --- | --- | --- |
 | Adapter／规则／SQLite／IPC／CLI | 匿名 fixtures、真实本地 IPC、持久化回查、故障注入、信号子进程 | 组件契约通过；替身不代表 root ES |
@@ -14,7 +16,7 @@
 | 3 秒生成／通知发送 | 实际标准事件、outbox、通知反馈的独立时间 | 待真实运行裁决 |
 | 通知到屏、后台 FDA、登录补发和重启 | 下文独立步骤 | 尚未验收 |
 
-原生输入参考 macOS 15.6.1 的 eslogger schema 1／message 9 和 Apple SDK 字段；实际脚本会报告本机 OS、Python、二进制版本及 SHA256。SQLite 读取器锁定 schema 2，发现不兼容立即失败。
+原生输入参考 macOS 15.6.1 的 eslogger schema 1／message 9 和 Apple SDK 字段；实际脚本会报告本机 OS、Python、二进制版本及 SHA256。SQLite 读取器锁定 schema 3，发现不兼容立即失败。宿主状态回显当前 run_id 的实际 schema／message 版本；标准事件保存对应版本，健康查询的 source 保留 run_id、版本、field 和 missing_events。每个采集运行首次实见或版本变更才新增版本健康记录；用 `health --source-run-id <run_id>` 回查版本变化和缺口。旧 v1／v2 数据原子迁移，旧事件缺版本时保持未知。
 
 ## 真实运行前
 
@@ -62,7 +64,7 @@ python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
 ## 时间和结果
 
 - 批量触发取同进程代际、实际可读 OPEN／MMAP 中滚动 10 秒内第 50 个不同文件的来源时间，按 dev／ino 或路径去重。
-- 归档命令取对应真实 EXEC 的来源时间；归档输出取已有项目读取关联后的第一条实际输出事件。最终合并告警的 last_timestamp_ms 不能当作首条触发时间。
+- 归档命令取对应真实 EXEC 的来源时间；归档输出取已有项目读取关联后的第一条实际输出事件。tar／zip 的项目内和临时输出均必须匹配发送器声明的预期输出路径、实际 create／write／rename 事件及项目关联（同run/PID代际的实际项目读配合ArchiveOutput，或先创建输出时的实际EXEC输出参数与项目ArchiveCommand）；仅归档命令告警不能通过。最终合并告警的 last_timestamp_ms 不能当作首条触发时间。
 - 生成时间取宿主实际保存的 outbox.created_timestamp_ms；通知取 NotificationRecord.observed_timestamp_ms 且 outcome=sent。三者独立报告，摘要包含 sample_count、missing_count、max 和 p95。
 - 缺失、负时延、超过 3000ms、字段／序号缺口、桥接／宿主丢弃、数据库缺口或不完整清理明确判失败／部分通过。无真实源不会回退 fixture。
 - sent 只表示通知命令接受，不等于用户看到弹窗。脚本结束仍将桌面展示和系统后台验收列为待验。
@@ -75,14 +77,17 @@ python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
 
 ## 后台和故障的独立验收
 
-完整入口是短时前台编排，不能证明 launchd 生命周期。先预览安装计划，再由用户明确安装：
+完整入口是短时前台编排，不能证明 launchd 生命周期。先预览安装计划，再由用户明确安装并启动；install 本身不加载 job：
 
 ```sh
 ./target/release/codeperimeter service plan --user "$(id -un)"
 sudo ./target/release/codeperimeter service install --user "$(id -un)"
+sudo ./target/release/codeperimeter service start --user "$(id -un)"
 ./target/release/codeperimeter status
 ```
 
 核对 system collector 为 root，system daemon 为指定普通用户，notify 为该用户 Aqua 会话，检查独立后台 FDA；关闭终端后重新执行匿名操作，回查相同证据。用户明确注销／登录后检查后台分析继续、待通知仅补一条汇总；用户明确重启后核验新 collector run_id、恢复采集与缺口记录。不能把 plist／launchctl 成功当作事件已采集。FileVault 解锁前和进入 macOS 登录窗口后的阶段应分别记录，本项目没有证明解锁前执行能力。
+
+宿主启动时及每小时清理30天以前明细，累计统计保留；`retention_state`／`retention_last_run_ms` 回显执行与失败，明细过期健康记录表示追溯缺口。清理失败时显示数据库降级，恢复后重试。
 
 源断开在真实入口中受控验证；数据库写入失败、超长／错误 schema、序号缺口、通知失败和大批补发已有独立组件故障注入。真运行遇到这些故障要保留实际状态，不把组件注入当成本机故障通过。公开报告只使用匿名场景和摘要。
