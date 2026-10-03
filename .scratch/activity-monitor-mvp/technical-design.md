@@ -175,7 +175,7 @@ SQLite 先使用必要的运行／健康、监控目录、观察事件、告警�
 4. 目录发现：分别验证 Codex 初始／每轮目录与 Claude Code 元字段、活动／归档及受支持压缩格式、去重、失效路径、版本缺口、重复导入与手动目录。
 5. 完整 MVP：从批量导入目录到后台真实采集、告警、通知与 SQLite 回查；覆盖外部 tar／zip、同进程落盘／内存压缩、正常搜索／索引／构建、断流与故障。
 
-2026-10-03 用户调用 `implement-spec` 后已进入实现，Cargo 基础构建通过；任务图见 [实现约定](implementation-contract.md)。用户运行短时合成采集探针时，eslogger 因责任进程缺少完全磁盘访问返回 `ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED`；尚未取得真实事件。完成条件仍包含可复现运行证据，不能把权限错误时的零事件解释为无文件活动。
+2026-10-03 用户调用 `implement-spec` 后已进入实现，Cargo 基础构建通过；任务图见 [实现约定](implementation-contract.md)。用户完成完全磁盘访问授权后，短时探针取得真实合成目录事件，字段与覆盖缺口见 [本机探针](real-probe.md)。完成条件仍包含完整链路运行证据，不能把字段探针视为整个 MVP 已通过。
 
 依赖依据：[serde_json](https://docs.rs/serde_json/latest/serde_json/)、[rusqlite 与 bundled](https://github.com/rusqlite/rusqlite#usage)、[clap](https://docs.rs/clap/latest/clap/)。实际实现版本固定在根目录 `Cargo.lock`。
 
