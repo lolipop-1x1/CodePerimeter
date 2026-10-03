@@ -547,10 +547,10 @@ impl RuleEngine {
         if roots.is_empty() {
             return None;
         }
-        if let Some(output) = resolved_output {
-            if self.matching_roots(&output).len() > 0 || is_temporary_path(&output) {
-                evidence_paths.push(output);
-            }
+        if let Some(output) = resolved_output
+            && (!self.matching_roots(&output).is_empty() || is_temporary_path(&output))
+        {
+            evidence_paths.push(output);
         }
         sort_dedup_paths(&mut evidence_paths);
         evidence_paths.truncate(self.config.max_evidence_paths);
@@ -570,7 +570,7 @@ impl RuleEngine {
                 sort_dedup_paths(&mut resolved_inputs);
                 resolved_inputs
                     .iter()
-                    .filter(|path| self.matching_roots(path).len() > 0)
+                    .filter(|path| !self.matching_roots(path).is_empty())
                     .count()
             },
             activity_count: 1,
