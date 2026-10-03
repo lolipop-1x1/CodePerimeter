@@ -1,6 +1,6 @@
 # 完整合成验收、说明与交付
 
-Status: in-progress
+Status: claimed
 Type: task
 Blocked by: none (实现依赖已接入；真实授权运行与最终审查待 root 统一协调)
 
@@ -32,3 +32,8 @@ Blocked by: none (实现依赖已接入；真实授权运行与最终审查待 r
 验证（2026-10-04）：fmt、严格 clippy、全部 Rust **64 passed／1 ignored helper（由监督用例显式调用）**；Python 发送器 **8 passed**；验收计时判定器 **3 passed**；全部 validate 脚本 AST、两个入口 `--help` 通过。`--preflight-only` 在无受保护副本的本机准确返回 2，私有 summary 为 `real_source_confirmed=false`／`failed_no_fixture_fallback`；未运行 root 准备或真实采集。
 
 依赖为 05 `ac46fe6`、10 `dcda4db`／`0449640`，与集成 `5b93bc2` 的模块基线一致；07 生命周期修复另提交 `4fc976d`，已合入。真实 API／手动执行入口见 `docs/validation/activity-monitor-mvp.md`。真实探针字段参考 `real-probe.md` 与本机研究 handoff，仅作为字段来源，不用短时探针代表本票验收通过。
+
+
+交付必要补修：恢复 01 初始化误覆盖的原 `.gitignore` 五行（`.DS_Store`、`.env`、`.env.*`、`!.env.example`、`*.log`），保留新 target／SQLite 四行。root 准备副本采用私有 UUID 暂存＋校验＋系统 `/bin/link` 原子非覆盖发布，finally 只删除本轮暂存链接。已用匿名普通用户目录验证该系统工具拒绝已有文件／目录、不写入已有内容，新目标与暂存同 inode；未把此工具测试当作 root 准备已执行。
+
+最终 manifest：`.github/workflows/ci.yml`、本票、`.gitignore`、`README.md`、`docs/validation/activity-monitor-mvp.md`、`scripts/validate-mvp.py`、`scripts/validate-prepare-collector.py`、`scripts/validate-selftest.py`、`tests/end_to_end.rs`。07 生命周期修复另列其既有提交所有权。

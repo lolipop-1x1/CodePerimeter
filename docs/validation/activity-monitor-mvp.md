@@ -34,7 +34,7 @@ sudo -v
 python3 -B scripts/validate-prepare-collector.py --binary target/release/codeperimeter
 ```
 
-准备入口检查来源普通文件和权限，检查 root 父路径／ACL，复制到 `/Library/CodePerimeter/<uid>/codeperimeter`，清除新创建自有目录／文件的继承 ACL，并核对 SHA256。已有目标一律拒绝覆盖；已有安装应先按服务管理流程核对版本，不能为了验收覆盖使用中的 root 二进制。此入口只准备副本，不创建 job、不运行 collector、不变更 FDA。
+准备入口检查来源普通文件和权限，检查 root 父路径／ACL，先复制到 root 私有暂存文件，清除新创建自有目录／文件的继承 ACL 并核对 SHA256，再用系统 link 原子发布为 `/Library/CodePerimeter/<uid>/codeperimeter`；发布也拒绝已有目标，包括并发创建。已有目标一律拒绝覆盖；已有安装应先按服务管理流程核对版本，不能为了验收覆盖使用中的 root 二进制。此入口只准备副本，不创建 job、不运行 collector、不变更 FDA。
 
 这条观察路线使用系统 eslogger 的已有 ES 授权，不需要为本项目申请自有 ES 开发者签名。责任进程仍需要 FDA：终端／eslogger 探针成功不推导包装二进制或 launchd 已授权。实际错误包含 `permission_denied` 时，到系统设置检查责任进程；必要时给上述受保护 codeperimeter 副本和 eslogger 授予完全磁盘访问，再重试。不改 TCC 数据库、SIP、AMFI 或 sudoers。
 
