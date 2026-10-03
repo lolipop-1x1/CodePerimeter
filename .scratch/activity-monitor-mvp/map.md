@@ -7,6 +7,7 @@ Type: grilling
 ## Notes
 
 - 2026-10-03：用户显式调用 `implement-spec`，进入实现；后续任务与完成证据见 [实现任务图](implementation-contract.md)，早期等待确认记录作为讨论历史保留。
+- 2026-10-03 实现进展：[工程基础](issues/01-foundation.md)、[ES 适配器](issues/02-eslogger-adapter.md) 与 [历史目录](issues/03-history-directories.md) 已完成并合入；[本机字段探针](real-probe.md) 已取得真实合成事件，其余任务与完整验收继续推进。
 - 本轮按 `grill-with-docs`，结合 `grilling` 与 `domain-modeling` 讨论最小 MVP。
 - 用户明确要求先聚焦文件读取监控、压缩监控与及时发现。
 - 已有项目上下文仍保留未经批准外传控制的完整产品目标；本轮讨论第一阶段的观察与发现交付。
