@@ -44,6 +44,10 @@ API 由本任务明确并写在 Answer，供运行宿主接入。[spec](../spec.
 - 通知反馈：`record_notification(&NotificationRecord) -> Result<i64>` 原子保存反馈和累计统计；`Sent` 表示系统通知 API 接受请求并确认该告警队列项，不证明已到屏；`Failed`、`Deferred` 保持待处理。`acknowledge_notifications(&[String], i64) -> Result<usize>` 对仍待处理项幂等确认并保存 acknowledged 反馈。`query_notifications(&NotificationFilter) -> Result<Vec<StoredNotificationRecord>>` 回查尝试及确认记录。
 - 统计与保留：`recent_stats(i64, i64) -> Result<RecentStats>` 返回接收／反馈时间区间统计；`cumulative_stats() -> Result<CumulativeStats>` 返回跨明细清理累计值；`prune_expired(i64) -> Result<PruneSummary>` 删除 30 天以前的事件、告警、健康、通知反馈与待通知明细，不删除累计值；`clear_cumulative_stats() -> Result<()>` 显式清零累计统计。
 
+### 验证
+
+- 2026-10-03：`rustfmt --check --edition 2024 src/rules.rs src/storage.rs` 通过；`cargo test --locked` 通过（10 个集成测试）；`cargo clippy --locked --all-targets -- -D warnings` 通过。
+
 ### 宿主处理顺序
 
 1. 先调用 `RuleEngine::process`，将 `RuleOutput.matched_directories` 与事件一起传给 `record_event`；逐项持久化规则健康状态。写入失败由宿主记录保存缺口，不能丢弃已生成的实时告警；待通知写入失败时，宿主仍对内存中的新告警尝试即时通知，但该条不能在重启后从 outbox 恢复。

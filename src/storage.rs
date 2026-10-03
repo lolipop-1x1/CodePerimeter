@@ -321,12 +321,11 @@ pub struct PendingNotificationSummary {
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if path != Path::new(":memory:") {
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                fs::create_dir_all(parent)?;
-            }
+        if path != Path::new(":memory:")
+            && let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
 
         let mut connection = Connection::open(path)?;
@@ -487,7 +486,7 @@ impl Storage {
                 )?;
             }
             increment_stat(&transaction, "events", 1)?;
-            increment_stat(&transaction, &format!("events.{}", kind), 1)?;
+            increment_stat(&transaction, &format!("events.{kind}"), 1)?;
         }
         transaction.commit()?;
         Ok(inserted > 0)
