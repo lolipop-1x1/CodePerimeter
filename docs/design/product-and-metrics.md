@@ -55,14 +55,6 @@ AUTH 与 NOTIFY 事件不能直接相加为成功打开次数。工具错误需�
 
 累计统计与必要分析结果按产品保留规则保存，原始导入文件由用户管理。重复导入、追加记录、历史与实时重叠、记录格式变化都需验证去重；明细过期后累计统计不代表仍能逐事件回放。
 
-## 已保留的概念图
-
-下图为此前生成的概念设计，旧品牌文字保留用于来源追溯。图内日期、数据、能力与“已暂停”等状态均为演示，不能作为新项目实现截图或保护证据。
-
-![此前产品概念图，仅作设计参考](product-concept-v1.png)
-
-保留 [原图](product-concept-v1.png) 与 [原始生成提示词](product-concept-v1-prompt.md)。后续真实界面应使用 CodePerimeter 品牌，并按实际证据调整文案。当前没有重绘或实现界面。
-
 ## 核查依据
 
 此前指标核查参考 [open 事件](https://developer.apple.com/documentation/endpointsecurity/es_event_open_t)、[mmap 事件](https://developer.apple.com/documentation/endpointsecurity/es_event_mmap_t)、[write 事件](https://developer.apple.com/documentation/endpointsecurity/es_event_write_t)、[close 事件](https://developer.apple.com/documentation/endpointsecurity/es_event_close_t) 及 [Claude Code Hooks](https://code.claude.com/docs/en/hooks)。本次沉淀没有采集真实会话或确认任何客户端当前格式兼容性。
