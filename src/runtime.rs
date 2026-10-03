@@ -31,6 +31,7 @@ const COLLECTOR_QUEUE_CAPACITY: usize = 64;
 const DEDUP_CAPACITY: usize = 8_192;
 const MEMORY_ALERT_CAPACITY: usize = 256;
 const MAX_QUERY_LIMIT: usize = 100;
+const MAX_NOTIFY_BURST: usize = 8;
 const DB_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 const NOTIFY_SESSION_TIMEOUT_MS: i64 = 30_000;
 const NOTIFY_RETRY_COOLDOWN_MS: i64 = 5_000;
@@ -203,19 +204,10 @@ impl Default for RuntimeCounters {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Deduper {
     keys: HashSet<String>,
     order: VecDeque<String>,
-}
-
-impl Default for Deduper {
-    fn default() -> Self {
-        Self {
-            keys: HashSet::new(),
-            order: VecDeque::new(),
-        }
-    }
 }
 
 impl Deduper {
@@ -250,6 +242,7 @@ struct DaemonState {
     adapter: Option<EsloggerAdapter>,
     adapter_run_id: Option<String>,
     source_state: String,
+    source_diagnostic_state: Option<String>,
     database_state: String,
     database_error: Option<String>,
     database_retry_at: Instant,
@@ -510,6 +503,7 @@ fn run_daemon_inner(
         adapter: None,
         adapter_run_id: None,
         source_state: "connecting".into(),
+        source_diagnostic_state: None,
         database_state: "ready".into(),
         database_error: None,
         database_retry_at: Instant::now(),
@@ -626,6 +620,7 @@ fn accept_control(listener: &UnixListener, state: &mut DaemonState) -> Result<bo
             if verify_peer_uid(&stream, state.uid).is_err() {
                 return Ok(false);
             }
+            stream.set_nonblocking(false)?;
             stream.set_read_timeout(Some(Duration::from_secs(1)))?;
             stream.set_write_timeout(Some(Duration::from_secs(1)))?;
             let mut reader = BufReader::new(stream.try_clone()?);
@@ -821,7 +816,7 @@ impl DaemonState {
             }
         }
         self.refresh_roots()?;
-        self.storage.list_directories().map_err(Into::into)
+        self.storage.list_directories()
     }
 
     fn remove_directory(&mut self, path: &Path) -> Result<bool> {
@@ -862,7 +857,9 @@ impl DaemonState {
     fn handle_reader_message(&mut self, message: ReaderMessage) {
         match message {
             ReaderMessage::State { state, code } => {
-                self.source_state = state.clone();
+                if state != "connected" || self.source_diagnostic_state.is_none() {
+                    self.source_state = state.clone();
+                }
                 self.write_health(
                     "collector",
                     &code,
@@ -934,7 +931,9 @@ impl DaemonState {
                     );
                     self.last_collector_drop_count = dropped_lines;
                 }
-                self.source_state = "connected".into();
+                if self.source_diagnostic_state.is_none() {
+                    self.source_state = "connected".into();
+                }
             }
             CollectorFrame::Status {
                 run_id,
@@ -955,6 +954,11 @@ impl DaemonState {
                 self.collector_dropped_lines = self.collector_dropped_lines.max(dropped_lines);
                 let state: String = state.chars().take(32).collect();
                 self.source_state = state.clone();
+                self.source_diagnostic_state = if state == "connected" {
+                    None
+                } else {
+                    Some(state.clone())
+                };
                 self.write_health(
                     "collector",
                     &format!("collector_{state}"),
@@ -973,6 +977,7 @@ impl DaemonState {
         self.adapter_run_id = Some(run_id.to_owned());
         self.adapter = Some(EsloggerAdapter::new(run_id));
         self.source_state = "connected".into();
+        self.source_diagnostic_state = None;
         if changed {
             self.deduper = Deduper::default();
             self.last_collector_drop_count = 0;
@@ -1487,6 +1492,25 @@ pub fn notify_once_with_sender(
     }
 }
 
+/// 连续发送有限数量的待处理通知，生产helper用它降低告警突发时的排队延迟。
+#[doc(hidden)]
+pub fn notify_burst_with_sender(
+    control_socket: &Path,
+    session_id: &str,
+    sender: &mut impl NotificationSender,
+    maximum: usize,
+) -> Result<usize> {
+    let maximum = maximum.clamp(1, MAX_NOTIFY_BURST);
+    let mut sent = 0;
+    for _ in 0..maximum {
+        if !notify_once_with_sender(control_socket, session_id, sender)? {
+            break;
+        }
+        sent += 1;
+    }
+    Ok(sent)
+}
+
 fn notify_send_result(control_socket: &Path, request: ControlRequest) -> Result<()> {
     let response = request_control(control_socket, request)?;
     if !response.ok {
@@ -1519,10 +1543,14 @@ pub fn run_notify(control_socket: &Path) -> Result<()> {
     let session_id = format!("notify-{}-{}", std::process::id(), now_ms());
     let mut sender = OsascriptSender;
     loop {
-        if notify_once_with_sender(control_socket, &session_id, &mut sender).is_err() {
-            eprintln!("CodePerimeter 通知宿主暂不可用，将重试。");
+        match notify_burst_with_sender(control_socket, &session_id, &mut sender, MAX_NOTIFY_BURST) {
+            Ok(sent) if sent > 0 => continue,
+            Ok(_) => thread::sleep(Duration::from_millis(250)),
+            Err(_) => {
+                eprintln!("CodePerimeter 通知宿主暂不可用，将重试。");
+                thread::sleep(Duration::from_secs(1));
+            }
         }
-        thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -1540,9 +1568,10 @@ impl NotificationSender for OsascriptSender {
                 .arg(title)
                 .status()?;
             if status.success() {
-                return Ok(());
+                Ok(())
+            } else {
+                Err(io::Error::other("系统通知发送失败").into())
             }
-            return Err(io::Error::other("系统通知发送失败").into());
         }
         #[cfg(not(target_os = "macos"))]
         {
