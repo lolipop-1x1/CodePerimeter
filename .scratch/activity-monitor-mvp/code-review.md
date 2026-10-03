@@ -1,14 +1,14 @@
 # 文件活动监控 MVP：固定点双轴审查与修复
 
 日期：2026-10-04
-Status: claimed
+Status: resolved
 Type: task
 
-固定比较点：`a8ecdf3e92aac93fca88734ac61c14ce8c9ac2a6`。审查HEAD：`725a263167d1fd9f65c93f4977477f17f032a82f`。以下保留独立审查返回的两轴计数及可证缺陷，修复候选在 `codex/activity-monitor-mvp-review-fixes`。主agent仍需对候选定点复核、合并、PR ready和清理；06保持claimed。
+固定比较点：`a8ecdf3e92aac93fca88734ac61c14ce8c9ac2a6`。审查HEAD：`725a263167d1fd9f65c93f4977477f17f032a82f`。以下保留原审查两轴的独立计数及修复证据。修复候选 `0c9a1c9442dc6d25339f01d2e1587aa30d0a9cca` 已通过两轴定点复核并合入 `a08bcc2f6269937e053392ca658bb4e6aa99d3a1`；两者tree均为 `bc683f579403766f5d4a80d7055ca0b90987ef2d`。本票仅关闭源码审查，06仍claimed，实际系统验收、PR ready与worktree清理仍待完成。
 
 ## Standards
 
-原审查：2项硬性违规，0项heuristic；最严重项为S1 [P2]。不与Spec轴合并计数。
+原审查：2项硬性违规，0项heuristic；最严重项为S1 [P2]。不与Spec轴合并计数。修复候选独立定点复核：S1／S2均通过，剩余硬性违规0、heuristic0，当前无最严重项。
 
 | finding | 审查证据及要求 | 修复与针对性证据 |
 | --- | --- | --- |
@@ -17,7 +17,7 @@ Type: task
 
 ## Spec
 
-原审查：4项可证缺陷，0项scope creep；最严重项为P1 [P1]。
+原审查：4项可证缺陷，0项scope creep；最严重项为P1 [P1]。修复候选独立定点复核：P1–P4均通过，剩余可证缺陷0、scope creep0，当前无最严重项；复核另跑3项宿主定点测试与9项判定器自测通过。
 
 | finding | 审查证据及规格要求 | 修复与针对性证据 |
 | --- | --- | --- |
@@ -27,6 +27,10 @@ Type: task
 | P4 [P2] tar／zip缺归档输出仍可通过 | spec:50要求输出线索，validate-mvp:252仅检查archive_command。原判定器无任何输出事件仍pass。 | tar／zip项目内与临时输出独立要求发送器声明的预期路径、实际create/write/rename事件、同run/PID代际的实际项目读取及项目告警时间证据；外部命令先创建输出时，由实际EXEC的输出参数与项目ArchiveCommand补充关联；路径别名规范化。告警evidence_paths为有限样本，不代替实际输出事件。判定器新增四变体正例／缺输出反例、无关联、未声明、错误项目和PID代际反例；另验先创建输出正例及无输出路径样本时仍须实际输出的正反例，missing_evidence明确失败原因。 |
 
 README和后台验收步骤补齐install后的显式service start；install只写安装文件，不bootstrap。当前规格和技术状态同步实现与待验边界，原型50／10秒与60秒口径保留。
+
+## Answer
+
+两轴原始2＋4项均已修复，独立定点复核各剩余0项可证缺陷，复核比较的是上述固定来源／候选tree。Standards与Spec结论分别保留，不将其中一轴或组件通过扩展成系统通过。主agent已构建release并复制至集成target/release，二进制SHA256为 `6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13`；已向用户提供真实终端匿名运行步骤，尚无本轮实际运行结果。
 
 ## 验证与未完成事项
 
