@@ -2,11 +2,11 @@
 
 Status: ready-for-agent
 Type: task
-Blocked by: 02, 03, 04
+Blocked by: 02, 03, 04, 07
 
 ## Scope
 
-所有权：`src/main.rs`、`src/runtime.rs`、`src/service.rs`、`scripts/` 中安装管理脚本、`tests/runtime_cli.rs`、`docs/usage.md`。不得修改已完成模块，需 API 调整通过主 agent 协调。
+所有权：`src/main.rs`、`src/runtime.rs`、`tests/runtime_cli.rs`、`docs/usage.md`。采集桥接与安装管理由 07 提供；不得修改已完成模块，需 API 调整通过主 agent 协调。
 
 ## Acceptance
 
