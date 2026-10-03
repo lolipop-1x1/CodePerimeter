@@ -1,0 +1,4 @@
+{"type":"session_meta","payload":{"cwd":"@PROJECT_A@","runtime_workspace_roots":["@PROJECT_A@","@PROJECT_B@"],"cli_version":"0.114.0","id":"synthetic-codex","base_instructions":"PRIVATE_CONTENT_MUST_NOT_APPEAR"}}
+{"type":"response_item","payload":{"type":"message","content":[{"text":"PRIVATE_CONTENT_MUST_NOT_APPEAR /unrelated/body/path"}]}}
+{"type":"turn_context","payload":{"cwd":"@PROJECT_B@","workspace_roots":["@PROJECT_A@"]}}
+{"type":"turn_context","payload":{"cwd":"@PROJECT_B@"}}
