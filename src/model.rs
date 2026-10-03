@@ -59,6 +59,10 @@ pub struct ArchiveCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivityEvent {
     pub source_run_id: String,
+    #[serde(default)]
+    pub source_schema_version: Option<u64>,
+    #[serde(default)]
+    pub source_message_version: Option<u64>,
     pub source_timestamp_ms: Option<i64>,
     pub received_timestamp_ms: i64,
     pub global_seq: Option<u64>,

@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const DEFAULT_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 100;
 const MAX_QUERY_LIMIT: usize = 10_000;
@@ -88,7 +88,8 @@ CREATE TABLE health_records (
     component TEXT NOT NULL,
     code TEXT NOT NULL,
     state TEXT NOT NULL,
-    detail TEXT
+    detail TEXT,
+    source_json TEXT
 );
 CREATE INDEX health_time ON health_records (observed_timestamp_ms DESC);
 CREATE TABLE notification_feedback (
@@ -125,6 +126,8 @@ ALTER TABLE notification_outbox_v2 RENAME TO notification_outbox;
 CREATE INDEX notification_outbox_pending
     ON notification_outbox (acknowledged_timestamp_ms, sequence);
 ";
+
+const MIGRATE_SCHEMA_V2: &str = "ALTER TABLE health_records ADD COLUMN source_json TEXT;";
 
 #[derive(Debug)]
 pub struct Storage {
@@ -199,6 +202,7 @@ impl Default for AlertFilter {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct HealthFilter {
+    pub source_run_id: Option<String>,
     pub component: Option<String>,
     pub code: Option<String>,
     pub since_ms: Option<i64>,
@@ -209,6 +213,7 @@ pub struct HealthFilter {
 impl Default for HealthFilter {
     fn default() -> Self {
         Self {
+            source_run_id: None,
             component: None,
             code: None,
             since_ms: None,
@@ -219,7 +224,18 @@ impl Default for HealthFilter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceContext {
+    pub run_id: String,
+    pub schema_version: Option<u64>,
+    pub message_version: Option<u64>,
+    pub field: Option<String>,
+    pub missing_events: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthRecord {
+    #[serde(default)]
+    pub source: Option<SourceContext>,
     pub observed_timestamp_ms: i64,
     pub component: String,
     pub code: String,
@@ -588,17 +604,23 @@ impl Storage {
 
     pub fn record_health(&mut self, record: &HealthRecord) -> Result<i64> {
         let detail = record.detail.as_deref().map(bounded_detail);
+        let source_json = record
+            .source
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO health_records (
-                observed_timestamp_ms, component, code, state, detail
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                observed_timestamp_ms, component, code, state, detail, source_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 record.observed_timestamp_ms,
                 record.component,
                 record.code,
                 record.state,
                 detail,
+                source_json,
             ],
         )?;
         let id = transaction.last_insert_rowid();
@@ -867,12 +889,13 @@ impl Storage {
     pub fn query_health(&self, filter: &HealthFilter) -> Result<Vec<StoredHealthRecord>> {
         let rows = {
             let mut statement = self.connection.prepare(
-                "SELECT id, observed_timestamp_ms, component, code, state, detail
+                "SELECT id, observed_timestamp_ms, component, code, state, detail, source_json
                  FROM health_records
                  WHERE (?1 IS NULL OR component = ?1)
                    AND (?2 IS NULL OR code = ?2)
                    AND (?3 IS NULL OR observed_timestamp_ms >= ?3)
                    AND (?4 IS NULL OR observed_timestamp_ms < ?4)
+                   AND (?6 IS NULL OR json_extract(source_json, '$.run_id') = ?6)
                  ORDER BY observed_timestamp_ms DESC, id DESC
                  LIMIT ?5",
             )?;
@@ -884,11 +907,24 @@ impl Storage {
                         filter.since_ms,
                         filter.until_ms,
                         query_limit(filter.limit),
+                        filter.source_run_id,
                     ],
                     |row| {
                         Ok(StoredHealthRecord {
                             id: row.get(0)?,
                             record: HealthRecord {
+                                source: row
+                                    .get::<_, Option<String>>(6)?
+                                    .map(|json| {
+                                        serde_json::from_str(&json).map_err(|error| {
+                                            rusqlite::Error::FromSqlConversionFailure(
+                                                6,
+                                                rusqlite::types::Type::Text,
+                                                Box::new(error),
+                                            )
+                                        })
+                                    })
+                                    .transpose()?,
                                 observed_timestamp_ms: row.get(1)?,
                                 component: row.get(2)?,
                                 code: row.get(3)?,
@@ -1051,6 +1087,7 @@ impl Storage {
         let sql = match version {
             0 => SCHEMA,
             1 => MIGRATE_SCHEMA_V1,
+            2 => "",
             value if value == i64::from(SCHEMA_VERSION) => return Ok(()),
             _ => {
                 return Err(Box::new(io::Error::new(
@@ -1061,6 +1098,9 @@ impl Storage {
         };
         let transaction = connection.transaction()?;
         transaction.execute_batch(sql)?;
+        if matches!(version, 1 | 2) {
+            transaction.execute_batch(MIGRATE_SCHEMA_V2)?;
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         Ok(())

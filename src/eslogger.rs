@@ -313,6 +313,8 @@ pub fn parse_line(line: &str, source_run_id: &str, received_timestamp_ms: i64) -
     };
     outcome.event = Some(ActivityEvent {
         source_run_id: source_run_id.into(),
+        source_schema_version: outcome.schema_version,
+        source_message_version: outcome.message_version,
         source_timestamp_ms,
         received_timestamp_ms,
         global_seq,

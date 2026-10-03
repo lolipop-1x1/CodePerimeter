@@ -7,7 +7,7 @@ Type: grilling
 ## Notes
 
 - 2026-10-03：用户显式调用 `implement-spec`，进入实现；后续任务与完成证据见 [实现任务图](implementation-contract.md)，早期等待确认记录作为讨论历史保留。
-- 2026-10-03 实现进展：[工程基础](issues/01-foundation.md)、[ES 适配器](issues/02-eslogger-adapter.md) 与 [历史目录](issues/03-history-directories.md) 已完成并合入；[本机字段探针](real-probe.md) 已取得真实合成事件，其余任务与完整验收继续推进。
+- 2026-10-04 当前进展：01–05、07–10 的实现已接通且组件回归通过；[本机字段探针](real-probe.md) 取得部分真实事件字段证据。[06 完整验收](issues/06-validation-delivery.md) 仍 claimed：完整 root／FDA、3秒目标、桌面展示与后台生命周期待验；审查修复见 [双轴审查](code-review.md)。
 - 本轮按 `grill-with-docs`，结合 `grilling` 与 `domain-modeling` 讨论最小 MVP。
 - 用户明确要求先聚焦文件读取监控、压缩监控与及时发现。
 - 已有项目上下文仍保留未经批准外传控制的完整产品目标；本轮讨论第一阶段的观察与发现交付。
@@ -15,6 +15,11 @@ Type: grilling
 - 术语沿用根目录 `CONTEXT.md`：文件活动、工具读取、疑似打包、未知。文件活动不能直接等同于完整内容读取，疑似打包不能直接等同于外传。
 
 ## Decisions-so-far
+
+- 2026-10-04：[01 工程与标准契约](issues/01-foundation.md) resolved，Rust 模块和最小事件结构已实现；[02 ES 适配](issues/02-eslogger-adapter.md) resolved，九类窄解析、序号与字段缺口可回查，来源版本按实际 run_id 记录；[03 历史目录](issues/03-history-directories.md) resolved，Codex／Claude 的匿名元信息适配、未知与目录去重已实现。
+- 2026-10-04：[04 规则与 SQLite](issues/04-rules-sqlite.md) resolved，50／10秒可调原型、60秒合并、归档关联、v3旧库迁移、30天明细保留与累计统计已实现；[05 运行宿主](issues/05-runtime-cli.md) resolved，普通用户单写、认证 IPC、故障状态、持久通知与恢复已实现。组件证明不代表 root ES 或到屏通过。
+- 2026-10-04：[07 服务采集](issues/07-service-collector.md) resolved，root桥接、三角色 launchd 文件和 install／start／stop／uninstall 已接通，后台 FDA 与生命周期仍待实测；[08 合成发送器](issues/08-synthetic-sender.md) resolved，匿名读／映射／归档／正常操作与清理入口可复现。
+- 2026-10-04：[09 跨模块契约](issues/09-core-pipeline.md) resolved，标准事件→规则→SQLite匿名链路已验证；[10 CLI](issues/10-cli.md) resolved，多目录、历史快照导入、状态／证据与服务入口已接通。[06](issues/06-validation-delivery.md) 保持 claimed，完整系统验证、最终定点复核、PR ready 与清理由主 agent 完成。
 
 - 当前迭代优先围绕文件访问、压缩／归档迹象和及时发现定义最小交付。
 - macOS 首先验证；沿用用户选定目录、本地分析和必要事件记录的既有方向。
@@ -24,10 +29,10 @@ Type: grilling
 - Q5 选 A：采用终端记录与 macOS 系统通知；普通文件活动只记录，批量访问与疑似打包汇总提醒。
 - Q4 补充确认选 A：把同进程读取后内存压缩列入必测，验收访问记录与批量提醒，不宣称确认压缩动作。
 - Q6 选 A：疑似打包触发事件发生或批量门槛达到后 3 秒内生成终端告警并发出系统通知，作为待实测的初版目标。
-- 已将确认范围与候选规则整理到 [最小规格](spec.md)，整体确认前不开始实施。
+- 确认范围与原型规则已整理到 [最小规格](spec.md)；用户显式授权后已实施，完成结论分别见票据与验收记录。
 - 2026-10-03 开始 [技术讨论](technical-design.md)：已确认 Rust CLI 核心、仅采集器 root、SQLite、后台常驻与自动启动、50 文件／10 秒原型值。后台启动时机和采集入口仍在讨论。
 - 技术轮进一步明确系统启动即监控、不依赖终端或桌面会话；优先验证 eslogger，进入桌面后补发未展示告警汇总。新增手动多个目录与历史候选批量导入，集合持久化，新会话不自动扩大范围；历史来源与故障细节见技术讨论。
-- 技术轮 T1–T13 已逐项明确：首批 Codex／Claude Code CLI 分别适配，Codex 包含每轮目录变化，60 秒合并告警；SQLite 失败时继续发现并显示保存缺口。整体技术基线等待确认，未开始实现。
+- 技术轮 T1–T13 已逐项明确：首批 Codex／Claude Code CLI 分别适配，Codex 包含每轮目录变化，60 秒合并告警；SQLite 失败时继续发现并显示保存缺口。用户已显式授权实现，当前实现已接通；系统验收缺口单独记录。
 
 ## 设计树
 
@@ -51,7 +56,7 @@ Type: grilling
 
 ## Fog
 
-- 已核查采集入口与权限的文档要求，尚未安装工具或申请系统授权，本机授权状态未知。
+- eslogger 入口、Rust适配与后台IPC已接通；独立终端短时授权探针取得部分真实字段证据，最终包装／launchd 的 FDA、完整 root 链与持续覆盖仍待验。
 - 批量访问阈值提出 10 秒内 50 个不同文件的可调原型值；尚未通过样本校准，不作为正式默认或压缩识别保证。
 - 用户已显式授权实现；采集完整性、实际通知、性能和误报仍未验证。
 
@@ -60,7 +65,7 @@ Type: grilling
 - Apple 的 [open 事件](https://developer.apple.com/documentation/endpointsecurity/es_event_open_t)记录目标文件和打开标志；[mmap 事件](https://developer.apple.com/documentation/endpointsecurity/es_event_mmap_t)记录映射事实。这些事件不证明实际读取内容或字节量。
 - [ES 事件类型](https://developer.apple.com/documentation/endpointsecurity/event-types)可支持进程执行与文件活动的关联；外部命令执行不证明成功打包，纯内存压缩没有可据此直接确认的通用系统事件。
 - `eslogger` 可作为本机观察验证的候选，需要 root 与完全磁盘访问；其手册不将输出承诺为应用集成接口。Mac Monitor 官方包可作为另一验证候选，需系统扩展与完全磁盘访问授权。
-- 验证入口尚未选定，资料核查不等于本机采集通过。事件完整性、丢失、延迟、性能和正常操作误报仍需实测。
+- 验证入口已选定为系统 eslogger；短时字段探针部分通过，完整 Rust 链、事件完整性、丢失、延迟、性能和正常操作误报仍需实测。
 - 内存压缩前的文件打开／映射若发生在监控期间，可成为访问线索；监控前已读入应用内存、复用已有句柄／映射或发生事件丢失时，不能保证出现新的打开／映射事件。
 - 正常搜索、索引、构建也可能产生批量访问；只有访问证据时提醒应描述该活动，不宣称压缩或泄露已确认。
 

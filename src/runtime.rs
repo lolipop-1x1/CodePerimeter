@@ -8,7 +8,7 @@ use crate::service::{CollectorClient, CollectorFrame, read_bounded_line, verify_
 use crate::storage::{
     AlertFilter, DirectoryConfig, EventFilter, HealthFilter, HealthRecord, NotificationFilter,
     NotificationOutcome, NotificationRecord, PendingNotification, PendingNotificationSummary,
-    Storage,
+    SourceContext, Storage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,6 +33,7 @@ const MEMORY_ALERT_CAPACITY: usize = 256;
 const MAX_QUERY_LIMIT: usize = 100;
 const MAX_NOTIFY_BURST: usize = 8;
 const DB_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NOTIFY_SESSION_TIMEOUT_MS: i64 = 30_000;
 const NOTIFY_RETRY_COOLDOWN_MS: i64 = 5_000;
 const EVENT_KINDS: [&str; 9] = [
@@ -128,11 +129,15 @@ pub struct RuntimeStatus {
     pub bulk_window_ms: i64,
     pub collector_state: String,
     pub collector_run_id: Option<String>,
+    pub collector_schema_version: Option<u64>,
+    pub collector_message_version: Option<u64>,
     pub collector_dropped_lines: u64,
     pub reader_dropped_frames: u64,
     pub database_state: String,
     pub database_gap_events: u64,
     pub database_error: Option<String>,
+    pub retention_state: String,
+    pub retention_last_run_ms: Option<i64>,
     pub last_event_received_ms: Option<i64>,
     pub observed_events_by_kind: BTreeMap<String, u64>,
     pub persisted_events_by_kind: BTreeMap<String, u64>,
@@ -248,6 +253,10 @@ struct DaemonState {
     database_retry_at: Instant,
     database_retry_cooldown: Duration,
     database_gap_events: u64,
+    retention_state: String,
+    retention_last_run_ms: Option<i64>,
+    retention_at: Instant,
+    retention_interval: Duration,
     collector_dropped_lines: u64,
     reader_dropped_frames: Arc<AtomicU64>,
     last_event_received_ms: Option<i64>,
@@ -429,7 +438,7 @@ fn lock_single_host(path: &Path) -> io::Result<File> {
 
 /// 启动生产宿主；root 只运行转发采集器，不执行分析或打开数据库。
 pub fn run_daemon(options: RuntimeOptions) -> Result<()> {
-    run_daemon_inner(options, 0, DB_RETRY_COOLDOWN)
+    run_daemon_inner(options, 0, DB_RETRY_COOLDOWN, RETENTION_INTERVAL)
 }
 
 /// 明确限定于本机合成采集器测试；生产 CLI 不暴露此身份覆盖。
@@ -438,13 +447,19 @@ pub fn run_daemon_with_expected_collector_uid(
     options: RuntimeOptions,
     expected_uid: u32,
 ) -> Result<()> {
-    run_daemon_inner(options, expected_uid, Duration::from_millis(250))
+    run_daemon_inner(
+        options,
+        expected_uid,
+        Duration::from_millis(250),
+        Duration::from_millis(250),
+    )
 }
 
 fn run_daemon_inner(
     options: RuntimeOptions,
     expected_collector_uid: u32,
     retry_cooldown: Duration,
+    retention_interval: Duration,
 ) -> Result<()> {
     let uid = unsafe { libc::geteuid() };
     if uid == 0 {
@@ -509,6 +524,10 @@ fn run_daemon_inner(
         database_retry_at: Instant::now(),
         database_retry_cooldown: retry_cooldown,
         database_gap_events: 0,
+        retention_state: "pending".into(),
+        retention_last_run_ms: None,
+        retention_at: Instant::now(),
+        retention_interval,
         collector_dropped_lines: 0,
         reader_dropped_frames,
         last_event_received_ms: None,
@@ -529,6 +548,7 @@ fn run_daemon_inner(
         "ready",
         "普通用户宿主已启动；只分析选定目录内的事件。",
     );
+    state.prune_if_due();
     let mut stopping = false;
     while !stopping {
         stopping = accept_control(&listener, &mut state)?;
@@ -547,6 +567,7 @@ fn run_daemon_inner(
             }
         }
         state.retry_database_if_due();
+        state.prune_if_due();
         if processed == 0 {
             thread::sleep(Duration::from_millis(10));
         }
@@ -620,34 +641,36 @@ fn accept_control(listener: &UnixListener, state: &mut DaemonState) -> Result<bo
             if verify_peer_uid(&stream, state.uid).is_err() {
                 return Ok(false);
             }
-            stream.set_nonblocking(false)?;
-            stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-            stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-            let mut reader = BufReader::new(stream.try_clone()?);
-            let request = match read_bounded_line(&mut reader, CONTROL_LINE_LIMIT) {
-                Ok(Some(bytes)) => serde_json::from_slice::<ControlRequest>(&bytes),
-                Ok(None) | Err(_) => {
-                    let _ = write_control_response(
-                        &mut stream,
-                        &response_error("控制请求为空或超过上限"),
-                    );
-                    return Ok(false);
-                }
-            };
-            match request {
-                Ok(request) => {
-                    let (response, stop) = state.handle_control(request);
-                    write_control_response(&mut stream, &response)?;
-                    Ok(stop)
-                }
-                Err(_) => {
-                    write_control_response(&mut stream, &response_error("控制请求格式不受支持"))?;
-                    Ok(false)
-                }
-            }
+            Ok(handle_control_connection(&mut stream, state).unwrap_or(false))
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
         Err(error) => Err(error.into()),
+    }
+}
+
+fn handle_control_connection(stream: &mut UnixStream, state: &mut DaemonState) -> io::Result<bool> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let request = match read_bounded_line(&mut reader, CONTROL_LINE_LIMIT) {
+        Ok(Some(bytes)) => serde_json::from_slice::<ControlRequest>(&bytes),
+        Ok(None) | Err(_) => {
+            let _ = write_control_response(stream, &response_error("控制请求为空或超过上限"));
+            return Ok(false);
+        }
+    };
+    match request {
+        Ok(request) => {
+            let (response, stop) = state.handle_control(request);
+            // 单个客户端关闭或超时不决定宿主生命周期；合法停止请求仍生效。
+            let _ = write_control_response(stream, &response);
+            Ok(stop)
+        }
+        Err(_) => {
+            let _ = write_control_response(stream, &response_error("控制请求格式不受支持"));
+            Ok(false)
+        }
     }
 }
 
@@ -671,11 +694,21 @@ impl DaemonState {
             bulk_window_ms: self.bulk_window_ms,
             collector_state: self.source_state.clone(),
             collector_run_id: self.adapter_run_id.clone(),
+            collector_schema_version: self
+                .adapter
+                .as_ref()
+                .and_then(|adapter| adapter.health().schema_version),
+            collector_message_version: self
+                .adapter
+                .as_ref()
+                .and_then(|adapter| adapter.health().message_version),
             collector_dropped_lines: self.collector_dropped_lines,
             reader_dropped_frames: self.reader_dropped_frames.load(Ordering::Relaxed),
             database_state: self.database_state.clone(),
             database_gap_events: self.database_gap_events,
             database_error: self.database_error.clone(),
+            retention_state: self.retention_state.clone(),
+            retention_last_run_ms: self.retention_last_run_ms,
             last_event_received_ms: self.last_event_received_ms,
             observed_events_by_kind: self.counters.observed.clone(),
             persisted_events_by_kind: self.counters.persisted.clone(),
@@ -888,6 +921,10 @@ impl DaemonState {
                     return;
                 }
                 self.ensure_adapter(&run_id);
+                let previous_version = self.adapter.as_ref().and_then(|adapter| {
+                    let health = adapter.health();
+                    (health.lines > 0).then_some((health.schema_version, health.message_version))
+                });
                 let outcome = self
                     .adapter
                     .as_mut()
@@ -895,12 +932,31 @@ impl DaemonState {
                 let Some(outcome) = outcome else {
                     return;
                 };
+                let source = SourceContext {
+                    run_id,
+                    schema_version: outcome.schema_version,
+                    message_version: outcome.message_version,
+                    field: None,
+                    missing_events: None,
+                };
+                if previous_version != Some((outcome.schema_version, outcome.message_version)) {
+                    self.write_source_health(
+                        "source_version_observed",
+                        "observed",
+                        "实际来源版本已观察；未知版本保持为空。",
+                        source.clone(),
+                    );
+                }
                 for issue in &outcome.issues {
-                    self.write_health(
-                        "eslogger",
+                    self.write_source_health(
                         &issue.code,
                         "degraded",
-                        "采集事件字段不完整或无法解析；原始行未保存。",
+                        &issue.message,
+                        SourceContext {
+                            field: issue.field.clone(),
+                            missing_events: issue.missing_events,
+                            ..source.clone()
+                        },
                     );
                 }
                 if let Some(event) = outcome.event {
@@ -1059,7 +1115,9 @@ impl DaemonState {
             .pending_alerts_mut()
             .find(|pending| pending.id == alert.id)
         {
+            let is_new = existing.is_new || alert.is_new;
             *existing = alert;
+            existing.is_new = is_new;
         } else if self.pending_alert_count() < MEMORY_ALERT_CAPACITY {
             self.deferred_alerts_mut().push_back(alert);
         } else {
@@ -1093,6 +1151,7 @@ impl DaemonState {
         }
         self.database_retry_at = Instant::now() + self.database_retry_cooldown;
         let recovery = HealthRecord {
+            source: None,
             observed_timestamp_ms: now_ms(),
             component: "runtime".into(),
             code: "database_recovered".into(),
@@ -1113,6 +1172,9 @@ impl DaemonState {
                 return;
             }
             self.deferred_alerts.pop_front();
+            // 恢复成功后由持久化 outbox 接管未发送告警，避免同时从内存再次投递。
+            self.memory_alerts
+                .retain(|pending| pending.alert.id != alert.id);
         }
         while let Some(alert_id) = self.sent_memory_alerts.front().cloned() {
             let feedback = NotificationRecord {
@@ -1126,6 +1188,63 @@ impl DaemonState {
                 return;
             }
             self.sent_memory_alerts.pop_front();
+        }
+    }
+
+    fn prune_if_due(&mut self) {
+        if self.database_state != "ready" || Instant::now() < self.retention_at {
+            return;
+        }
+        let now = now_ms();
+        match self.storage.prune_expired(now) {
+            Ok(pruned) => {
+                self.retention_state = "ready".into();
+                self.retention_last_run_ms = Some(now);
+                self.retention_at = Instant::now() + self.retention_interval;
+                if pruned.events
+                    + pruned.alerts
+                    + pruned.health_records
+                    + pruned.notifications
+                    + pruned.outbox_entries
+                    > 0
+                {
+                    self.write_health(
+                        "storage",
+                        "details_expired",
+                        "gap",
+                        "超过30天的明细已清理，累计统计保留；过期部分无法完整追溯。",
+                    );
+                }
+            }
+            Err(_) => {
+                self.retention_state = "failed".into();
+                self.retention_at = Instant::now() + self.database_retry_cooldown;
+                self.database_write_failed(0);
+            }
+        }
+    }
+
+    fn write_source_health(
+        &mut self,
+        code: &str,
+        state: &str,
+        detail: &str,
+        source: SourceContext,
+    ) {
+        if self.database_state != "ready"
+            || self
+                .storage
+                .record_health(&HealthRecord {
+                    observed_timestamp_ms: now_ms(),
+                    component: "eslogger".into(),
+                    code: code.to_owned(),
+                    state: state.to_owned(),
+                    detail: Some(detail.to_owned()),
+                    source: Some(source),
+                })
+                .is_err()
+        {
+            self.database_write_failed(0);
         }
     }
 
@@ -1154,6 +1273,7 @@ impl DaemonState {
             || self
                 .storage
                 .record_health(&HealthRecord {
+                    source: None,
                     observed_timestamp_ms: now,
                     component: component.to_owned(),
                     code: code.chars().take(64).collect(),

@@ -144,15 +144,16 @@ def load_evidence(database):
     # 仅从本轮匿名数据库读取；唯一写入方仍是普通用户 daemon。
     with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1) as connection:
         schema = connection.execute("PRAGMA user_version").fetchone()[0]
-        if schema != 2:
-            raise RuntimeError("验收读取器只支持已锁定的 SQLite schema 2")
+        if schema != 3:
+            raise RuntimeError("验收读取器只支持已锁定的 SQLite schema 3")
         events = [json.loads(row[0]) for row in connection.execute("SELECT event_json FROM events ORDER BY id")]
         alerts = [json.loads(row[0]) for row in connection.execute("SELECT alert_json FROM alerts ORDER BY rowid")]
         outbox = {row[0]: row[1] for row in connection.execute("SELECT alert_id,created_timestamp_ms FROM notification_outbox")}
         feedback = [{"alert_id": row[0], "observed_timestamp_ms": row[1], "outcome": row[2]}
                     for row in connection.execute("SELECT alert_id,observed_timestamp_ms,outcome FROM notification_feedback ORDER BY id")]
-        health = [{"observed_timestamp_ms": row[0], "component": row[1], "code": row[2], "state": row[3]}
-                  for row in connection.execute("SELECT observed_timestamp_ms,component,code,state FROM health_records ORDER BY id")]
+        health = [{"observed_timestamp_ms": row[0], "component": row[1], "code": row[2], "state": row[3],
+                   "detail": row[4], "source": json.loads(row[5]) if row[5] else None}
+                  for row in connection.execute("SELECT observed_timestamp_ms,component,code,state,detail,source_json FROM health_records ORDER BY id")]
     return {"sqlite_schema": schema, "events": events, "alerts": alerts, "outbox": outbox,
             "notifications": feedback, "health": health}
 
@@ -201,6 +202,11 @@ def triggers(evidence, project):
     return candidates
 
 
+def canonical_path(path):
+    # 合成输出可能经 /var 或 /tmp 别名访问；比较的是同一落盘路径。
+    return str(Path(path).resolve()) if path else None
+
+
 def analyze(evidence, operations, project, initial_status, final_status):
     candidates = triggers(evidence, project)
     generation_delays, notification_delays, timing_rows = [], [], []
@@ -234,12 +240,51 @@ def analyze(evidence, operations, project, initial_status, final_status):
         pids.update(row["child_pid"] for row in rows if row.get("child_pid"))
         events = [event for event in evidence["events"] if event["process"]["pid"] in pids]
         alerts = [alert for alert in evidence["alerts"] if alert["process"]["pid"] in pids]
-        source_reads = {event["file"]["path"] for event in events if event["kind"] in ("open", "mmap")
+        source_reads = {canonical_path(event["file"]["path"]) for event in events if event["kind"] in ("open", "mmap")
                         and event.get("file") and event["file"].get("readable") is True
-                        and Path(event["file"]["path"]).parent == project / "src"}
+                        and Path(canonical_path(event["file"]["path"])).parent == project / "src"}
         scenario = operation["scenario"]
         rules = Counter(alert["rule"] for alert in alerts)
         expected_files = 0 if scenario == "preloaded-memory" else 1 if scenario in ("read", "mmap", "repeat-read") else 55
+        expected_outputs = {canonical_path(row["output_path"]) for row in rows if row.get("output_path")}
+        observed_outputs, associated_outputs = set(), set()
+        for output_event in events:
+            if output_event["kind"] not in ("create", "write", "rename"):
+                continue
+            file = output_event.get("file")
+            paths = {canonical_path(output_event.get("destination"))}
+            if file and not file["path_truncated"]:
+                paths.add(canonical_path(file["path"]))
+            matches = paths & expected_outputs
+            observed_outputs.update(matches)
+            timestamp = output_event["source_timestamp_ms"]
+            if not matches or timestamp is None:
+                continue
+            related_read = any(process_key(read) == process_key(output_event)
+                               and read["kind"] in ("open", "mmap") and read.get("file")
+                               and read["file"].get("readable") is True and not read["file"]["path_truncated"]
+                               and canonical_path(read["file"]["path"]) in source_reads
+                               and read["source_timestamp_ms"] is not None
+                               and abs(timestamp - read["source_timestamp_ms"]) <= 60000 for read in events)
+            related_alert = any(alert["rule"] == "archive_output"
+                                and (alert["process"]["pid"], alert["process"]["pid_version"]) == process_key(output_event)[1:]
+                                and canonical_path(project) in {canonical_path(root) for root in alert.get("roots", [])}
+                                and alert["first_timestamp_ms"] <= timestamp <= alert["last_timestamp_ms"] for alert in alerts)
+            # 外部工具可先创建输出再读源码；实际EXEC的输出参数和项目告警补充关联。
+            related_command = scenario in ("tar", "zip") and any(
+                command["kind"] == "exec" and command.get("archive")
+                and process_key(command) == process_key(output_event)
+                and canonical_path(command["archive"].get("output_path")) in matches
+                and command["source_timestamp_ms"] is not None
+                and 0 <= timestamp - command["source_timestamp_ms"] <= 60000
+                and any(alert["rule"] == "archive_command"
+                        and (alert["process"]["pid"], alert["process"]["pid_version"]) == process_key(command)[1:]
+                        and canonical_path(project) in {canonical_path(root) for root in alert.get("roots", [])}
+                        and alert["first_timestamp_ms"] <= command["source_timestamp_ms"] <= alert["last_timestamp_ms"]
+                        for alert in alerts) for command in events)
+            if related_read and (related_alert or related_command):
+                associated_outputs.update(matches)
+        missing_evidence = []
         if scenario == "nine-events":
             passed = any(event["kind"] == "rename" for event in events)
         else:
@@ -250,13 +295,23 @@ def analyze(evidence, operations, project, initial_status, final_status):
                 passed &= not rules["bulk_file_access"]
             if scenario in ("tar", "zip"):
                 passed &= rules["archive_command"] >= 1
-            if scenario == "disk-archive":
-                passed &= rules["archive_output"] >= 1
+            if scenario in ("tar", "zip", "disk-archive"):
+                if not expected_outputs:
+                    missing_evidence.append("发送器未声明预期归档输出")
+                if expected_outputs - observed_outputs:
+                    missing_evidence.append("缺少预期归档输出的实际 create/write/rename 事件")
+                if expected_outputs - associated_outputs:
+                    missing_evidence.append("缺少归档输出与保护项目的告警关联证据")
+                passed &= bool(expected_outputs) and expected_outputs == associated_outputs
             if scenario == "mmap":
                 passed &= any(event["kind"] == "mmap" and event.get("file", {}).get("readable") is True for event in events)
         cases.append({"scenario": scenario, "output_scope": operation["scope"], "passed": bool(passed),
                       "expected_source_files": expected_files, "observed_source_files": len(source_reads),
                       "standard_event_count": len(events), "alerts_by_rule": dict(rules),
+                      "expected_output_paths": sorted(expected_outputs),
+                      "observed_output_paths": sorted(observed_outputs),
+                      "project_associated_output_paths": sorted(associated_outputs),
+                      "missing_evidence": missing_evidence,
                       "normal_workload": scenario in ("search", "index", "build")})
     delta = {kind: final_status["observed_events_by_kind"][kind] - initial_status["observed_events_by_kind"][kind] for kind in KINDS}
     return {"cases": cases, "nine_event_observed_delta": delta,

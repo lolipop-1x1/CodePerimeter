@@ -4,7 +4,7 @@ use codeperimeter::model::{
 use codeperimeter::rules::{RuleConfig, RuleEngine};
 use codeperimeter::storage::{
     AlertFilter, AlertWrite, CumulativeStats, EventFilter, HealthFilter, HealthRecord,
-    NotificationFilter, NotificationOutcome, NotificationRecord, Storage,
+    NotificationFilter, NotificationOutcome, NotificationRecord, SourceContext, Storage,
 };
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,8 @@ fn event(
 ) -> ActivityEvent {
     ActivityEvent {
         source_run_id: "synthetic-run".into(),
+        source_schema_version: Some(1),
+        source_message_version: Some(9),
         source_timestamp_ms: timestamp_ms,
         received_timestamp_ms,
         global_seq: None,
@@ -437,7 +439,7 @@ fn sqlite_directory_event_alert_notification_and_retention_apis_are_atomic() {
     let root_alias = temp.path().join("project");
     let database = temp.path().join("monitor.sqlite");
     let mut storage = Storage::open(&database).unwrap();
-    assert_eq!(storage.schema_version().unwrap(), 2);
+    assert_eq!(storage.schema_version().unwrap(), 3);
     assert!(storage.add_directory(&root, "manual", 100).unwrap());
     assert!(!storage.add_directory(&root_alias, "manual", 101).unwrap());
     assert!(!storage.add_directory(&root_alias, "codex", 102).unwrap());
@@ -551,6 +553,7 @@ fn sqlite_directory_event_alert_notification_and_retention_apis_are_atomic() {
 
     storage
         .record_health(&HealthRecord {
+            source: None,
             observed_timestamp_ms: 170,
             component: "rules".into(),
             code: "source_timestamp_missing".into(),
@@ -805,6 +808,7 @@ fn schema_v1_migration_preserves_evidence_feedback_and_pending_outbox() {
         .unwrap();
     storage
         .record_health(&HealthRecord {
+            source: None,
             observed_timestamp_ms: 110,
             component: "synthetic".into(),
             code: "fixture".into(),
@@ -854,6 +858,7 @@ fn schema_v1_migration_preserves_evidence_feedback_and_pending_outbox() {
          ALTER TABLE notification_outbox_v1 RENAME TO notification_outbox;
          CREATE INDEX notification_outbox_pending
              ON notification_outbox (acknowledged_timestamp_ms, created_timestamp_ms);
+         ALTER TABLE health_records DROP COLUMN source_json;
          PRAGMA user_version = 1;
          COMMIT;",
         )
@@ -867,7 +872,7 @@ fn schema_v1_migration_preserves_evidence_feedback_and_pending_outbox() {
     drop(legacy);
 
     let mut migrated = Storage::open(&database).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 2);
+    assert_eq!(migrated.schema_version().unwrap(), 3);
     assert_eq!(migrated.list_directories().unwrap(), directories);
     assert_eq!(
         migrated.query_events(&EventFilter::default()).unwrap(),
@@ -919,6 +924,93 @@ fn schema_v1_migration_preserves_evidence_feedback_and_pending_outbox() {
     );
     drop(migrated);
     let reopened = Storage::open(database).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 2);
+    assert_eq!(reopened.schema_version().unwrap(), 3);
     assert_eq!(reopened.pending_notification_summary().unwrap().count, 1);
+}
+
+#[test]
+fn schema_v2_migration_preserves_legacy_rows_statistics_and_new_source_context() {
+    let temp = fixture();
+    let root = protected_root(&temp, "project");
+    let database = temp.path().join("monitor.sqlite");
+    let mut storage = Storage::open(&database).unwrap();
+    storage.add_directory(&root, "manual", 100).unwrap();
+    let mut observed = read_event(root.join("file.rs"), 100, 110, 95, Some(1));
+    observed.source_schema_version = None;
+    observed.source_message_version = None;
+    storage
+        .record_event(&observed, std::slice::from_ref(&root))
+        .unwrap();
+    storage
+        .record_health(&HealthRecord {
+            observed_timestamp_ms: 110,
+            component: "synthetic".into(),
+            code: "legacy".into(),
+            state: "ready".into(),
+            detail: None,
+            source: None,
+        })
+        .unwrap();
+    storage
+        .record_alert_at(&sample_alert("pending-v2", &root, 95, 100), 110)
+        .unwrap();
+    let events = storage.query_events(&EventFilter::default()).unwrap();
+    let health = storage.query_health(&HealthFilter::default()).unwrap();
+    let alerts = storage.query_alerts(&AlertFilter::default()).unwrap();
+    let pending = storage.pending_notifications(10).unwrap();
+    let stats = storage.cumulative_stats().unwrap();
+    drop(storage);
+    let legacy = Connection::open(&database).unwrap();
+    legacy.execute_batch("BEGIN;
+        UPDATE events SET event_json = json_remove(event_json,'$.source_schema_version','$.source_message_version');
+        ALTER TABLE health_records DROP COLUMN source_json;
+        PRAGMA user_version = 2; COMMIT;").unwrap();
+    drop(legacy);
+    let mut migrated = Storage::open(&database).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 3);
+    assert_eq!(
+        migrated.query_events(&EventFilter::default()).unwrap(),
+        events
+    );
+    assert_eq!(
+        migrated.query_health(&HealthFilter::default()).unwrap(),
+        health
+    );
+    assert_eq!(
+        migrated.query_alerts(&AlertFilter::default()).unwrap(),
+        alerts
+    );
+    assert_eq!(migrated.pending_notifications(10).unwrap(), pending);
+    assert_eq!(migrated.cumulative_stats().unwrap(), stats);
+    let source = SourceContext {
+        run_id: "anonymous-run".into(),
+        schema_version: Some(1),
+        message_version: Some(9),
+        field: Some("global_seq_num".into()),
+        missing_events: Some(3),
+    };
+    migrated
+        .record_health(&HealthRecord {
+            observed_timestamp_ms: 120,
+            component: "eslogger".into(),
+            code: "sequence_gap".into(),
+            state: "degraded".into(),
+            detail: Some("观察到事件序号间隙，覆盖存在缺口".into()),
+            source: Some(source.clone()),
+        })
+        .unwrap();
+    drop(migrated);
+    let reopened = Storage::open(&database).unwrap();
+    let rows = reopened
+        .query_health(&HealthFilter {
+            source_run_id: Some("anonymous-run".into()),
+            ..HealthFilter::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].record.source, Some(source));
+    assert_eq!(
+        reopened.cumulative_stats().unwrap().health_records,
+        stats.health_records + 1
+    );
 }
