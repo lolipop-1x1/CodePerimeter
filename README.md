@@ -12,7 +12,7 @@ CLI、窄事件适配、规则、SQLite、历史目录发现、权限分离和 l
 
 ## 构建与运行
 
-需要 macOS、Rust 1.88 或以上；验收脚本另需 Python 3、系统 tar／zip。
+需要 macOS、Rust 1.88 或以上；验收脚本另需 Python 3、系统 tar／zip。CI 固定 Rust 1.88.0，与 Cargo rust-version 和已验证基线一致，保留 fmt、严格 clippy 与测试检查。
 
 ```sh
 cargo build --release --locked

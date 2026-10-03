@@ -41,3 +41,5 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 - 2026-10-04审查补修：双轴固定点审查发现Standards 2项、Spec 4项，已逐项修复并添加组件回归；tar／zip两种输出位置现在独立要求实际输出事件和项目关联，读取器锁定schema3；install后明确start；地图同步resolved票据和当前待验口径。双轴定点复核已通过；完整系统验收、PR ready与清理仍未完成，整票保持claimed，详见 [审查记录](../code-review.md)。
 
 - 2026-10-04定点复核完成：Standards S1／S2与Spec P1–P4均通过，各剩余可证缺陷0；原始2＋4统计保留在审查记录。修复来源`0c9a1c9`已合入`a08bcc2`，tree同为`bc683f579403766f5d4a80d7055ca0b90987ef2d`。release已由主agent构建并复制集成target/release，SHA256 `6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13`；用户已取得真实终端匿名验收步骤，尚无本轮实际结果。源码冻结，本阶段不重复全套；真实root／FDA、3秒、到屏、后台与性能仍待验，PR ready和cleanup尚未报告完成。
+
+- 2026-10-04远端CI基线修正：run `37142828933` 的浮动stable安装Rust1.99.0，新增11条collapsible_if／function-casts-as-integer lint触发严格检查失败；本机验证基线Rust1.88.0。workflow固定1.88.0，fmt／clippy -D warnings／tests保持，源码与release不变。已完成配置解析与diff核对，远端重跑待结果，不报告CI通过；本轮真实root／FDA／3秒／后台等实际结果仍未收到，06保持claimed。
