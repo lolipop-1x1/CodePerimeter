@@ -1,6 +1,6 @@
 # root 采集桥接与 launchd 安装管理
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 01
 
@@ -22,3 +22,18 @@ Blocked by: 01
 提供可供 main 直接调用的 CollectorOptions、ServicePlan／安装操作 API 与客户端读取 frame 的 API，具体签名写 Answer。守护角色建议 CLI 名称为 `collector`、`daemon`、`notify`；05 必须使用生成 plist 中的同一名称／参数。客户端先验证 root 服务身份，原始 JSON 在普通用户宿主中调用 eslogger adapter 后筛选保存。
 
 外部研究笔记见 `/private/tmp/codeperimeter-mvp-research/runtime-notes.md`。真实样本探针已取得 schema1/message9，但完整后台采集仍待验。
+
+## Answer
+
+- `CollectorOptions { socket_path: PathBuf, allowed_uid: u32 }`；`run_collector(options) -> crate::Result<()>` 固定启动 `/usr/bin/eslogger`，root 负责最小内存桥接。
+- `CollectorClient::connect(&Path) -> io::Result<Self>` 验证 root socket／peer；`read_frame(&mut self) -> io::Result<CollectorFrame>` 返回 Line、Heartbeat、Status。原始行只在内存，健康 message 不回显原始 stderr／args。
+- `ServicePlan::new(username: &str, source_binary: &Path) -> crate::Result<Self>` 生成预览；`install/start/stop/uninstall` 提供对应操作。安装二进制在 `/Library/CodePerimeter/<uid>/codeperimeter`，root-owned、0755，根采集 job 不从用户可写 checkout 运行。
+- 角色 argv：`collector --socket <collector.sock> --allowed-uid <uid>`；`daemon --socket <collector.sock> --control-socket <host.sock> --db <events.sqlite>`；`notify --control-socket <host.sock>`。05 与此保持一致。
+- collector socket 父目录 root-owned、0750，socket root-owned、0660、目标账户主组，仍逐连接核验 allowed_uid；分析／控制 socket 和 SQLite 目录由普通用户维护私有权限。无桌面会话时普通用户 system daemon 仍运行，通知 agent 等待对应账户 Aqua 会话。
+- FDA 按最终后台责任进程启动链单独验收；probe 中终端授权成功不推导 launchd 包装链已授权。安装不修改 TCC、SIP、AMFI、sudoers，也不自动重启。
+- 具体返回类型：`ServicePlan` 提供 username／uid／gid、source_binary／installed_binary、data_dir／collector_socket／control_socket／db_path 与 jobs。每个 job 带 label／domain／plist_path／argv／plist；操作返回 `OperationReport { steps: Vec<OperationStep { label, success, message }>, data_preserved: bool }`。宿主必须检查各 step 的 success，不把 launchd 接受启动请求当作真实采集成立。未进入对应桌面时通知代理记录待会话启动，不影响 system job 启动。
+- `CollectorFrame` 为 serde 内部 tag `type` 的 Line `{run_id,line,received_timestamp_ms}`、Heartbeat `{run_id,dropped_lines}`、Status `{run_id,state,message,dropped_lines}`。状态涵盖 connected、permission_denied、coverage_gap、oversized_line、invalid_line、source_error、source_diagnostic、stopped；心跳只表示桥接存活，宿主必须保留源失败／缺口。源 stdout 结束保证发出结束标记，失败状态短暂保留给稍后启动的宿主，再交 launchd 重启，新实例 ID 不冒充连续采集。
+- 同时提供 `read_bounded_line(&mut impl BufRead, maximum: usize) -> io::Result<Option<Vec<u8>>>`、`peer_uid(&UnixStream) -> io::Result<u32>`、`verify_peer_uid(&UnixStream, expected_uid: u32) -> io::Result<()>`。`CollectorClient::connect_expected(path, expected_uid)` 仅用于显式替身测试，生产使用固定 root 身份的 `connect`。Frame 最大 6 MiB＋4096 字节（覆盖 JSON 转义），原始行 1 MiB；队列 32 项，不写 raw 输出。
+- root 采集 socket 固定于 `/var/run/codeperimeter-<uid>/collector.sock`，拒绝任意 root socket 目标；macOS 用 getpeereid 双向验证内核 peer 身份。安装自有 root 文件／目录清除继承 ACL；用户路径的 mkdir／chmod／通知文件复制和卸载通过普通账户运行系统命令，root 不追随用户可改父路径写入。两个 system job 停止时持久禁用，再次启动显式 enable；卸载保留所有 SQLite／目录配置。
+- 验证：3 个 unit＋10 个集成测试通过，包括实际 Unix peer uid、身份拒绝、权限／symlink／可写父目录、替身帧传输与 EOF、超长帧边界恢复、bounded queue 过载、计划篡改、三角色 argv、本机 3 份 plutil 检查与实际扩展 ACL 清除；`cargo fmt --check` 和 clippy `--all-targets -- -D warnings` 通过。替身帧明确 test-only-run／test_mode，不冒充真实 ES 或 root 采集。
+- 本机事实依据：macOS 15.6.1 的 eslogger／launchd.plist／getpeereid 手册，核查日期 2026-10-03。最终安装、后台 FDA、注销／未登录、开机／重启恢复和性能尚待票据 06 的真实验收；未在本票据中执行系统安装或后台授权变更。
