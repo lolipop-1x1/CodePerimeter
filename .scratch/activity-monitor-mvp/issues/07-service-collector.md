@@ -37,3 +37,10 @@ Blocked by: 01
 - root 采集 socket 固定于 `/var/run/codeperimeter-<uid>/collector.sock`，拒绝任意 root socket 目标；macOS 用 getpeereid 双向验证内核 peer 身份。安装自有 root 文件／目录清除继承 ACL；用户路径的 mkdir／chmod／通知文件复制和卸载通过普通账户运行系统命令，root 不追随用户可改父路径写入。两个 system job 停止时持久禁用，再次启动显式 enable；卸载保留所有 SQLite／目录配置。
 - 验证：3 个 unit＋10 个集成测试通过，包括实际 Unix peer uid、身份拒绝、权限／symlink／可写父目录、替身帧传输与 EOF、超长帧边界恢复、bounded queue 过载、计划篡改、三角色 argv、本机 3 份 plutil 检查与实际扩展 ACL 清除；`cargo fmt --check` 和 clippy `--all-targets -- -D warnings` 通过。替身帧明确 test-only-run／test_mode，不冒充真实 ES 或 root 采集。
 - 本机事实依据：macOS 15.6.1 的 eslogger／launchd.plist／getpeereid 手册，核查日期 2026-10-03。最终安装、后台 FDA、注销／未登录、开机／重启恢复和性能尚待票据 06 的真实验收；未在本票据中执行系统安装或后台授权变更。
+
+
+### 06 接入发现的临时采集生命周期修复（2026-10-04）
+
+`run_collector` 在 sudo 同 TTY 认证完成后建立自己的 PGID（已有自有组时保留），eslogger 继承该组。SIGINT／SIGTERM 处理器只设置无锁退出标志；主循环随后发送 stopped，kill＋wait 自己启动的 eslogger，并删除自己的 socket，受控停止返回成功。来源子进程由作用域 guard 管理，其他 early Err 同样回收该子进程，不按进程名或共享组清理。无新增依赖或公开 API；可信 `run_id=eslogger-<collector_pid>-<timestamp_ms>` 可供临时验收入口取得 collector PID，再核验 root 身份、自有 PGID、二进制与本次启动的父子关系。
+
+新增独立测试子进程验证 SIGINT／SIGTERM 下 PGID=PID、与测试宿主组不同、退出成功且已回收明确的 sleep 替身；另测 early Err 也回收来源。信号 worker 标为 ignored，只由监督测试显式启动，不在并行测试宿主中改变信号处理器。结果：service unit 5 passed／1 helper ignored（其中监督测试实际调用两个信号 worker），service_collector 10 passed；clippy all-targets 无警告。该测试验证生命周期机制，未以 root 启动 eslogger；真实临时链路清理由 06 实测核验。

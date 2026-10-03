@@ -11,8 +11,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -432,20 +432,87 @@ fn deliver(client: &mut Option<UnixStream>, frame: &CollectorFrame) -> bool {
     false
 }
 
+static COLLECTOR_STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn collector_stop_signal(_signal: libc::c_int) {
+    // 信号处理器只设置无锁原子标志；子进程回收在正常循环中执行。
+    COLLECTOR_STOP.store(true, Ordering::Relaxed);
+}
+
+struct CollectorSignals {
+    previous: Vec<(libc::c_int, libc::sighandler_t)>,
+}
+
+impl CollectorSignals {
+    fn install() -> io::Result<Self> {
+        // sudo 完成同 TTY 认证后才隔离采集组；eslogger 继承本组。
+        if unsafe { libc::getpgrp() } != unsafe { libc::getpid() }
+            && unsafe { libc::setpgid(0, 0) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        COLLECTOR_STOP.store(false, Ordering::Relaxed);
+        let mut guard = Self {
+            previous: Vec::new(),
+        };
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            let previous =
+                unsafe { libc::signal(signal, collector_stop_signal as libc::sighandler_t) };
+            if previous == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
+            guard.previous.push((signal, previous));
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for CollectorSignals {
+    fn drop(&mut self) {
+        for (signal, previous) in &self.previous {
+            unsafe { libc::signal(*signal, *previous) };
+        }
+    }
+}
+
+struct CollectorSource {
+    child: Child,
+}
+
+impl CollectorSource {
+    fn stop(&mut self) -> io::Result<ExitStatus> {
+        if self.child.try_wait()?.is_none() {
+            let _ = self.child.kill();
+        }
+        self.child.wait()
+    }
+}
+
+impl Drop for CollectorSource {
+    fn drop(&mut self) {
+        // 正常停止和每一条 early Err 都只回收本次启动的来源，不按名称杀进程。
+        let _ = self.stop();
+    }
+}
+
 pub fn run_collector(options: CollectorOptions) -> Result<()> {
     require_root()?;
+    let _signals = CollectorSignals::install()?;
     let listener = bind_collector(&options.socket_path, options.allowed_uid)?;
     let run_id = format!("eslogger-{}-{}", std::process::id(), now_ms());
-    let mut child = Command::new("/usr/bin/eslogger")
-        .args(SUBSCRIBED_EVENTS)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()?;
+    let mut source = CollectorSource {
+        child: Command::new("/usr/bin/eslogger")
+            .args(SUBSCRIBED_EVENTS)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()?,
+    };
     let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
     let drops = Arc::new(AtomicU64::new(0));
     produce_stdout(
-        child
+        source
+            .child
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("采集 stdout 未建立"))?,
@@ -453,7 +520,8 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
         Arc::clone(&drops),
     );
     produce_stderr(
-        child
+        source
+            .child
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("采集 stderr 未建立"))?,
@@ -464,7 +532,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
     let mut last_heartbeat = Instant::now();
     let mut previous_drops = 0;
     let mut last_diagnostic = None;
-    loop {
+    while !COLLECTOR_STOP.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 if verify_peer_uid(&stream, options.allowed_uid).is_ok() && client.is_none() {
@@ -481,10 +549,8 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => {
-                let _ = child.kill();
-                return Err(error.into());
-            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
         }
         match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(SourceItem::Line(line, received_timestamp_ms)) => {
@@ -539,10 +605,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
             last_heartbeat = Instant::now();
         }
     }
-    if child.try_wait()?.is_none() {
-        let _ = child.kill();
-    }
-    let status = child.wait()?;
+    let status = source.stop()?;
     let stopped = CollectorFrame::Status {
         run_id: run_id.clone(),
         state: "stopped".into(),
@@ -555,9 +618,13 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
         dropped_lines: drops.load(Ordering::Relaxed),
     };
     deliver(&mut client, &stopped);
+    if COLLECTOR_STOP.load(Ordering::Relaxed) {
+        let _ = fs::remove_file(&options.socket_path);
+        return Ok(());
+    }
     // 退出前保留短暂状态窗口，让启动顺序较后的普通用户宿主看到 FDA／源故障。
     let diagnostic_deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < diagnostic_deadline {
+    while Instant::now() < diagnostic_deadline && !COLLECTOR_STOP.load(Ordering::Relaxed) {
         for item in receiver.try_iter() {
             if let SourceItem::Status(state, message) = item {
                 last_diagnostic = Some((state, message));
@@ -592,7 +659,11 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
         thread::sleep(Duration::from_millis(20));
     }
     let _ = fs::remove_file(&options.socket_path);
-    Err(io::Error::other("eslogger 采集已停止；launchd 可重启新的采集实例").into())
+    if COLLECTOR_STOP.load(Ordering::Relaxed) {
+        Ok(())
+    } else {
+        Err(io::Error::other("eslogger 采集已停止；launchd 可重启新的采集实例").into())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1118,6 +1189,102 @@ fn render_plist(label: &str, argv: &[String], username: Option<&str>, agent: boo
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    #[ignore = "由受控子进程信号测试调用，不在测试宿主中改信号处理器"]
+    fn collector_signal_worker() {
+        assert_eq!(
+            std::env::var("CODEPERIMETER_SERVICE_SIGNAL_WORKER").as_deref(),
+            Ok("yes")
+        );
+        let _signals = CollectorSignals::install().unwrap();
+        let mut source = CollectorSource {
+            child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
+        };
+        println!(
+            "COLLECTOR_READY {} {} {}",
+            std::process::id(),
+            unsafe { libc::getpgrp() },
+            source.child.id()
+        );
+        io::stdout().flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !COLLECTOR_STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(COLLECTOR_STOP.load(Ordering::Relaxed));
+        source.stop().unwrap();
+    }
+
+    #[test]
+    fn collector_signals_isolate_group_and_reap_owned_source() {
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            let mut worker = CollectorSource {
+                child: Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "service::tests::collector_signal_worker",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("CODEPERIMETER_SERVICE_SIGNAL_WORKER", "yes")
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            };
+            let stdout = worker.child.stdout.take().unwrap();
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout)
+                    .lines()
+                    .map_while(std::result::Result::ok)
+                {
+                    if let Some(values) = line.strip_prefix("COLLECTOR_READY ") {
+                        let _ = sender.send(values.to_owned());
+                    }
+                }
+            });
+            let values = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+            let pids: Vec<libc::pid_t> = values
+                .split_whitespace()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            assert_eq!(pids[0], worker.child.id() as libc::pid_t);
+            assert_eq!(pids[0], pids[1]);
+            assert_ne!(pids[1], unsafe { libc::getpgrp() });
+            assert_eq!(unsafe { libc::kill(pids[0], signal) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let status = loop {
+                if let Some(status) = worker.child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    // 失败时仍只清理本次测试的已记录来源 PID。
+                    unsafe { libc::kill(pids[2], libc::SIGKILL) };
+                    panic!("collector 信号停止超时");
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert!(status.success());
+            assert_eq!(unsafe { libc::kill(pids[2], 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
+    }
+
+    #[test]
+    fn owned_source_is_reaped_when_an_error_returns_early() {
+        let mut pid = 0;
+        let result = (|| -> io::Result<()> {
+            let source = CollectorSource {
+                child: Command::new("/bin/sleep").arg("30").spawn()?,
+            };
+            pid = source.child.id() as libc::pid_t;
+            Err(io::Error::other("合成 early Err"))
+        })();
+        assert!(result.is_err());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
 
     #[test]
     fn source_queue_is_bounded_and_reports_discarded_events() {
