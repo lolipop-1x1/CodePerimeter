@@ -2,11 +2,11 @@
 
 Status: ready-for-agent
 Type: task
-Blocked by: 05
+Blocked by: 05, 08
 
 ## Scope
 
-所有权：`tests/end_to_end.rs`、合成发送器与验证脚本、README、`docs/validation/activity-monitor-mvp.md`、CI。必要运行修复单独回传，不覆盖他人模块。
+所有权：`tests/end_to_end.rs`、完整链路验证脚本（`scripts/validate-*`）、README、`docs/validation/activity-monitor-mvp.md`、CI。合成操作发送器由 08 提供；必要运行修复单独回传，不覆盖他人模块。
 
 ## Acceptance
 
