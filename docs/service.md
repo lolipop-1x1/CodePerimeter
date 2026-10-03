@@ -12,7 +12,7 @@ CLI 通过服务计划预览、安装、启动、停止和卸载。计划中的�
 
 安装二进制为 `/Library/CodePerimeter/<uid>/codeperimeter`，由 root 拥有、0755；目录同样由 root 拥有且普通用户不可写。本服务管理的 root 目录／文件会清除继承 ACL，避免 POSIX 模式之外的普通用户写权限。system job 位于 `/Library/LaunchDaemons`，不长期执行用户可修改的 checkout 或 target 二进制。安装复制完成后再启动，更新需重新安装并重启 job。安装来源必须为目标账户拥有，或 root 拥有且普通用户可读的普通文件；不接收符号链接叶节点和组／其他用户可写的来源。
 
-collector socket 固定为 `/var/run/codeperimeter-<uid>/collector.sock`。父目录 root-owned、0750，socket root-owned、0660、目标账户主组；服务仍逐连接检查真实 peer uid，仅接受配置账户。普通用户客户端同时检查路径权限和内核报告的 root peer，不能仅靠文件名相信来源。一个采集实例只向一个消费者传流。
+collector socket 固定为 `/Library/CodePerimeter/<uid>/run/collector.sock`。先严格核验既有受保护安装目录的完整 root 父路径，再创建专用 run 目录；不修改 `/var/run` 等系统目录。run 目录 root-owned、0750，socket root-owned、0660、目标账户主组；服务仍逐连接检查真实 peer uid，仅接受配置账户。普通用户客户端同时检查路径权限和内核报告的 root peer，不能仅靠文件名相信来源。一个采集实例只向一个消费者传流。
 
 分析数据目录为 `~/Library/Application Support/CodePerimeter`，安装时通过降权的系统命令创建并设为 0700。通知 plist 也通过普通账户写入；root 不直接在用户可改目录中执行写入，避免父路径符号链接竞态扩大 root 权限。控制 socket、SQLite 和其侧文件的私有权限由分析宿主维护。停止会持久禁用两个 system job，直到再次启动启用，避免下次开机自行恢复采集；当前桌面通知 job 同时卸载，未来会话中的通知代理只能等待已停用的宿主。卸载删除本服务 job、二进制与已知安装临时文件，默认保留目录配置和 SQLite 数据。
 

@@ -180,6 +180,14 @@ fn service_plan_separates_root_daemon_and_desktop_roles() {
     assert_eq!(plan.jobs.len(), 3);
     assert!(plan.installed_binary.starts_with("/Library/CodePerimeter"));
     assert_ne!(plan.installed_binary, plan.source_binary);
+    assert_eq!(
+        plan.collector_socket,
+        plan.installed_binary
+            .parent()
+            .unwrap()
+            .join("run/collector.sock")
+    );
+    assert!(!plan.collector_socket.starts_with("/var/run"));
     let collector = &plan.jobs[0];
     assert_eq!(collector.domain, "system");
     assert_eq!(collector.argv[1], "collector");
@@ -223,6 +231,22 @@ fn installation_rejects_tampered_plan_before_writing() {
     fs::write(&path, "synthetic").unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
     assert!(checked_root_path(&path).is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mutable_system_run_directory_remains_rejected() {
+    use std::os::unix::fs::MetadataExt;
+    let path = fs::canonicalize("/var/run").unwrap();
+    let metadata = fs::symlink_metadata(&path).unwrap();
+    // 首跑机器为 root:daemon 0775；严格校验仍拒绝这一真实系统布局。
+    if metadata.mode() & 0o022 != 0 {
+        assert_eq!(
+            checked_root_path(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+    assert!(checked_root_path(Path::new("/Library")).is_ok());
 }
 
 #[cfg(target_os = "macos")]

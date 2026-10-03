@@ -7,7 +7,7 @@ Type: grilling
 ## Notes
 
 - 2026-10-03：用户显式调用 `implement-spec`，进入实现；后续任务与完成证据见 [实现任务图](implementation-contract.md)，早期等待确认记录作为讨论历史保留。
-- 2026-10-04 当前进展：01–05、07–10 的实现已接通且组件回归通过；[本机字段探针](real-probe.md) 取得部分真实事件字段证据。[06 完整验收](issues/06-validation-delivery.md) 仍 claimed：完整 root／FDA、3秒目标、桌面展示与后台生命周期待验；审查修复见 [双轴审查](code-review.md)。
+- 2026-10-04 当前进展：01–05、07–10 的实现已接通且组件回归通过；[本机字段探针](real-probe.md) 取得部分真实事件字段证据。[06 完整验收](issues/06-validation-delivery.md) 仍 claimed：完整入口首跑在建socket前失败，修复后root／FDA、3秒目标、桌面展示与后台生命周期待验；审查修复见 [双轴审查](code-review.md)。
 - 本轮按 `grill-with-docs`，结合 `grilling` 与 `domain-modeling` 讨论最小 MVP。
 - 用户明确要求先聚焦文件读取监控、压缩监控与及时发现。
 - 已有项目上下文仍保留未经批准外传控制的完整产品目标；本轮讨论第一阶段的观察与发现交付。
@@ -35,6 +35,8 @@ Type: grilling
 - 2026-10-03 开始 [技术讨论](technical-design.md)：已确认 Rust CLI 核心、仅采集器 root、SQLite、后台常驻与自动启动、50 文件／10 秒原型值。后台启动时机和采集入口仍在讨论。
 - 技术轮进一步明确系统启动即监控、不依赖终端或桌面会话；优先验证 eslogger，进入桌面后补发未展示告警汇总。新增手动多个目录与历史候选批量导入，集合持久化，新会话不自动扩大范围；历史来源与故障细节见技术讨论。
 - 技术轮 T1–T13 已逐项明确：首批 Codex／Claude Code CLI 分别适配，Codex 包含每轮目录变化，60 秒合并告警；SQLite 失败时继续发现并显示保存缺口。用户已显式授权实现，当前实现已接通；系统验收缺口单独记录。
+
+- 2026-10-04完整匿名首跑已执行但无源事件，旧var/run权限拒绝触发启动补修；[06实际结果与待验](issues/06-validation-delivery.md)及[审查后续记录](code-review.md)保存失败与新端点／安全替换说明。先前CI pin已远端通过，启动新head CI与实际重跑待验；旧实现worktree归档受App固定保护限制。
 
 ## 设计树
 

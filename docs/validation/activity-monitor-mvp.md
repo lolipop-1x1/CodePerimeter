@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | Adapter／规则／SQLite／IPC／CLI | 匿名 fixtures、真实本地 IPC、持久化回查、故障注入、信号子进程 | 组件契约通过；替身不代表 root ES |
 | 系统字段探针 | [本机探针](../../.scratch/activity-monitor-mvp/real-probe.md) | eslogger 真实字段已见；短时探针不代表持续链路 |
-| 完整匿名真实运行 | `scripts/validate-mvp.py` | 已准备，尚未获本轮真实运行证据 |
+| 完整匿名真实运行 | `scripts/validate-mvp.py` | 首跑已执行但采集前失败；没有真实源事件，修复后重跑待验 |
 | 3 秒生成／通知发送 | 实际标准事件、outbox、通知反馈的独立时间 | 待真实运行裁决 |
 | 通知到屏、后台 FDA、登录补发和重启 | 下文独立步骤 | 尚未验收 |
 
@@ -29,7 +29,7 @@ cargo build --release --locked
 ./target/release/codeperimeter service plan --user "$(id -un)"
 ```
 
-固定采集端点为 `/var/run/codeperimeter-<uid>/collector.sock`，一个 collector 只服务一个分析消费者。已有固定 socket 时，入口不连接它并拒绝继续，包括可能的残留端点；先查看计划、状态和已有目录，明确决定是否执行 `sudo ./target/release/codeperimeter service stop --user "$(id -un)"`。脚本不会代替用户停止已有服务或修改其数据库。
+固定采集端点为 `/Library/CodePerimeter/<uid>/run/collector.sock`，一个 collector 只服务一个分析消费者。已有固定 socket 时，入口不连接它并拒绝继续，包括可能的残留端点；先查看计划、状态和已有目录，明确决定是否执行 `sudo ./target/release/codeperimeter service stop --user "$(id -un)"`。脚本不会代替用户停止已有服务或修改其数据库。
 
 新环境先在同一终端完成 sudo 授权，然后显式准备受保护副本：
 
@@ -38,7 +38,17 @@ sudo -v
 python3 -B scripts/validate-prepare-collector.py --binary target/release/codeperimeter
 ```
 
-准备入口检查来源普通文件和权限，检查 root 父路径／ACL，先复制到 root 私有暂存文件，清除新创建自有目录／文件的继承 ACL 并核对 SHA256，再用系统 link 原子发布为 `/Library/CodePerimeter/<uid>/codeperimeter`；发布也拒绝已有目标，包括并发创建。已有目标一律拒绝覆盖；已有安装应先按服务管理流程核对版本，不能为了验收覆盖使用中的 root 二进制。此入口只准备副本，不创建 job、不运行 collector、不变更 FDA。
+准备入口检查来源普通文件和权限，检查 root 父路径／ACL，先复制到 root 私有暂存文件，清除新创建自有目录／文件的继承 ACL 并核对 SHA256，再用系统 link 原子发布为 `/Library/CodePerimeter/<uid>/codeperimeter`；发布也拒绝已有目标，包括并发创建。默认拒绝已有目标。仅对无 launchd 安装的验收副本，可明确指定 `--replace-sha256`：普通用户先核对旧hash与完整root路径／ACL；发布时固定 `/usr/bin/python3 -I -B -S` 再核验旧／新SHA256、root属主与完整路径／ACL、旧／新采集端点和控制端点、任何codeperimeter进程、该UID的三份plist与loaded jobs，全部静止才原子替换。系统Python不可用或任一检查不符就失败，不降级、不删除未知端点。已有服务安装应按服务管理流程处理，本入口不是通用更新器。此入口只准备副本，不创建 job、不运行 collector、不变更 FDA。
+
+本次首跑已准备的旧副本SHA256为 `6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13`。重新构建修复版后，用户可在同一终端显式更新并重跑：
+
+```sh
+sudo -v
+python3 -B scripts/validate-prepare-collector.py --binary target/release/codeperimeter --replace-sha256 6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13
+python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
+```
+
+指定旧hash仅适用于已核对的上述副本；检查失败保留原副本，不自动停止或卸载服务。
 
 这条观察路线使用系统 eslogger 的已有 ES 授权，不需要为本项目申请自有 ES 开发者签名。责任进程仍需要 FDA：终端／eslogger 探针成功不推导包装二进制或 launchd 已授权。实际错误包含 `permission_denied` 时，到系统设置检查责任进程；必要时给上述受保护 codeperimeter 副本和 eslogger 授予完全磁盘访问，再重试。不改 TCC 数据库、SIP、AMFI 或 sudoers。
 
@@ -71,11 +81,15 @@ python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
 - 缺失、负时延、超过 3000ms、字段／序号缺口、桥接／宿主丢弃、数据库缺口或不完整清理明确判失败／部分通过。无真实源不会回退 fixture。
 - sent 只表示通知命令接受，不等于用户看到弹窗。脚本结束仍将桌面展示和系统后台验收列为待验。
 
-标准输出仅给结果与 `summary.json` 路径。结果目录包含私有权限的匿名操作元数据、筛选后的标准证据与健康状态；完整系统 raw JSON、完整 args／env 和文件正文不落盘。采样以后台角色及后代 RSS 求和、ps 累计平均 %cpu 报告，无性能基线时不宣称开销达标。脚本保留合成产物和证据，方便核查；目录外归档仍按发送器清单登记，不自动删除未知文件。
+标准输出仅给结果与 `summary.json` 路径。结果目录包含私有权限的匿名操作元数据、筛选后的标准证据与健康状态；collector启动stderr持续有界排空，只在 `root_startup` 保留最多8种白名单静态诊断码、退出码与排空完整性；提前退出立即失败，不等待通用超时。完整系统 raw JSON、原stderr、完整 args／env 和文件正文不落盘。采样以后台角色及后代 RSS 求和、ps 累计平均 %cpu 报告，无性能基线时不宣称开销达标。脚本保留合成产物和证据，方便核查；目录外归档仍按发送器清单登记，不自动删除未知文件。
 
 退出码：0 代表本轮脚本定义的真实观察／发送检查通过（仍有到屏和后台待验），1 代表实际场景失败／部分通过，2 代表前置条件、源连接或执行失败。`--preflight-only` 的 0 只表示前置检查通过。
 
 前置失败已本机检查：未准备受保护副本时返回 2，摘要 `real_source_confirmed=false`／`failed_no_fixture_fallback`，只留下私有摘要，没有启动 daemon／collector／发送器。这不是实际 ES 运行。
+
+2026-10-04完整入口首跑已实际执行，证据目录 `/private/tmp/codeperimeter-validation-zxf_c66m`：`summary.json` 和 `failure-or-final-evidence.json` 显示run_id为空、九类计数及筛选事件均0、collector reconnecting，`root_cleanup_complete=true`。本机代码和权限核对定位：旧固定路径经canonicalize进入root:daemon 0775的 `/private/var/run`，严格root路径校验在创建socket前拒绝；首跑原stderr未保存，不能把该失败报告成FDA或ES事件通过。现改为安装目录内专用run路径，严格权限拒绝不变；下一轮实际root／FDA、九类完整事件、3秒、到屏及后台仍待验。
+
+CI固定基线的先前head `2e18ef6` 已由远端push／PR两条 Component checks确认SUCCESS（run `37144069732`／`37144066116`）；本次启动修复新head仍需单独CI。十个旧实现worktree的归档被App以pinned task/workspace保护拒绝，未手工删除或修改固定状态，不报告全部清理完成。
 
 ## 后台和故障的独立验收
 
