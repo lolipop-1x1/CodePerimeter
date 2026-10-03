@@ -16,10 +16,12 @@ Type: grilling
 
 ## Decisions-so-far
 
+- 2026-10-04：[双轴源码审查](code-review.md) resolved：原Standards2项／Spec4项均修复，候选 `0c9a1c9` 独立定点复核两轴各剩余0项，已合入 `a08bcc2` 且tree一致；release已构建。审查完成不代表系统验收通过，[06](issues/06-validation-delivery.md) 仍claimed，真实root／FDA／3秒／后台待验，PR ready与清理由主agent继续处理。
+
 - 2026-10-04：[01 工程与标准契约](issues/01-foundation.md) resolved，Rust 模块和最小事件结构已实现；[02 ES 适配](issues/02-eslogger-adapter.md) resolved，九类窄解析、序号与字段缺口可回查，来源版本按实际 run_id 记录；[03 历史目录](issues/03-history-directories.md) resolved，Codex／Claude 的匿名元信息适配、未知与目录去重已实现。
 - 2026-10-04：[04 规则与 SQLite](issues/04-rules-sqlite.md) resolved，50／10秒可调原型、60秒合并、归档关联、v3旧库迁移、30天明细保留与累计统计已实现；[05 运行宿主](issues/05-runtime-cli.md) resolved，普通用户单写、认证 IPC、故障状态、持久通知与恢复已实现。组件证明不代表 root ES 或到屏通过。
 - 2026-10-04：[07 服务采集](issues/07-service-collector.md) resolved，root桥接、三角色 launchd 文件和 install／start／stop／uninstall 已接通，后台 FDA 与生命周期仍待实测；[08 合成发送器](issues/08-synthetic-sender.md) resolved，匿名读／映射／归档／正常操作与清理入口可复现。
-- 2026-10-04：[09 跨模块契约](issues/09-core-pipeline.md) resolved，标准事件→规则→SQLite匿名链路已验证；[10 CLI](issues/10-cli.md) resolved，多目录、历史快照导入、状态／证据与服务入口已接通。[06](issues/06-validation-delivery.md) 保持 claimed，完整系统验证、最终定点复核、PR ready 与清理由主 agent 完成。
+- 2026-10-04：[09 跨模块契约](issues/09-core-pipeline.md) resolved，标准事件→规则→SQLite匿名链路已验证；[10 CLI](issues/10-cli.md) resolved，多目录、历史快照导入、状态／证据与服务入口已接通。[06](issues/06-validation-delivery.md) 保持 claimed，双轴定点复核已通过；完整系统验证、PR ready 与清理由主 agent 继续完成。
 
 - 当前迭代优先围绕文件访问、压缩／归档迹象和及时发现定义最小交付。
 - macOS 首先验证；沿用用户选定目录、本地分析和必要事件记录的既有方向。

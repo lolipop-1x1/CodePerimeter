@@ -2,7 +2,7 @@
 
 Status: claimed
 Type: task
-Blocked by: none (实现依赖已接入；真实授权运行与最终审查待 root 统一协调)
+Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与交付收尾由 root 统一协调)
 
 ## Scope
 
@@ -19,7 +19,7 @@ Blocked by: none (实现依赖已接入；真实授权运行与最终审查待 r
 
 ## Answer
 
-实现已准备，整票尚未 resolved：真实授权链路、桌面／后台验收、双轴 review、PR ready 与 worktree 清理由主 agent 统一完成。
+实现与双轴源码审查已完成，整票尚未 resolved：真实授权链路、桌面／后台验收、PR ready 与 worktree 清理由主 agent 统一完成。
 
 - `tests/end_to_end.rs` 运行真实 CLI→普通用户 daemon→SQLite：手动目录、匿名 Codex／Claude 元信息合并、预览后新增历史不扩大范围、同库重启回查／移除；独立用例验证普通用户启动 collector 被拒绝。采集源刻意不可用，不冒充 ES。
 - `scripts/validate-prepare-collector.py --binary target/release/codeperimeter` 只在用户终端显式 `sudo -v` 后准备 root-owned `/Library/CodePerimeter/<uid>/codeperimeter`，检查 root 父路径、写 ACL、来源权限和复制 SHA256，已有目标一律拒绝覆盖；不创建 job、不改 FDA。
@@ -38,4 +38,6 @@ Blocked by: none (实现依赖已接入；真实授权运行与最终审查待 r
 
 最终 manifest：`.github/workflows/ci.yml`、本票、`.gitignore`、`README.md`、`docs/validation/activity-monitor-mvp.md`、`scripts/validate-mvp.py`、`scripts/validate-prepare-collector.py`、`scripts/validate-selftest.py`、`tests/end_to_end.rs`。07 生命周期修复另列其既有提交所有权。
 
-- 2026-10-04审查补修：双轴固定点审查发现Standards 2项、Spec 4项，已逐项修复并添加组件回归；tar／zip两种输出位置现在独立要求实际输出事件和项目关联，读取器锁定schema3；install后明确start；地图同步resolved票据和当前待验口径。完整系统验收、最终复核、PR ready与清理仍未完成，整票保持claimed，详见 [审查记录](../code-review.md)。
+- 2026-10-04审查补修：双轴固定点审查发现Standards 2项、Spec 4项，已逐项修复并添加组件回归；tar／zip两种输出位置现在独立要求实际输出事件和项目关联，读取器锁定schema3；install后明确start；地图同步resolved票据和当前待验口径。双轴定点复核已通过；完整系统验收、PR ready与清理仍未完成，整票保持claimed，详见 [审查记录](../code-review.md)。
+
+- 2026-10-04定点复核完成：Standards S1／S2与Spec P1–P4均通过，各剩余可证缺陷0；原始2＋4统计保留在审查记录。修复来源`0c9a1c9`已合入`a08bcc2`，tree同为`bc683f579403766f5d4a80d7055ca0b90987ef2d`。release已由主agent构建并复制集成target/release，SHA256 `6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13`；用户已取得真实终端匿名验收步骤，尚无本轮实际结果。源码冻结，本阶段不重复全套；真实root／FDA、3秒、到屏、后台与性能仍待验，PR ready和cleanup尚未报告完成。
