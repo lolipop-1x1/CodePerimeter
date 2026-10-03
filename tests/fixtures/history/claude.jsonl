@@ -1,0 +1,4 @@
+{"type":"user","sessionId":"synthetic-claude","cwd":"@PROJECT_A@","version":"2.1.247","message":{"content":"PRIVATE_CONTENT_MUST_NOT_APPEAR"}}
+{"type":"assistant","sessionId":"synthetic-claude","cwd":"@PROJECT_A@","version":"2.1.247","message":{"content":[{"text":"PRIVATE_CONTENT_MUST_NOT_APPEAR"}]}}
+{"type":"system","cwd":"relative/project","version":"2.1.247"}
+{"type":"summary","message":"PRIVATE_CONTENT_MUST_NOT_APPEAR"}
