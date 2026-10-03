@@ -2,6 +2,7 @@ pub mod eslogger;
 pub mod history;
 pub mod model;
 pub mod rules;
+pub mod runtime;
 pub mod service;
 pub mod storage;
 
