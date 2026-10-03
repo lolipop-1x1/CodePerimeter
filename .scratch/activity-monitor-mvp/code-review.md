@@ -37,3 +37,10 @@ README和后台验收步骤补齐install后的显式service start；install只�
 最终检查（普通用户uid501）：Cargo fmt、check全部目标、严格clippy全部目标与git diff --check通过；Rust全部目标69 passed／1 ignored helper（由监督信号用例显式调用）；Python发送器8 passed、判定器9 passed；3个validate脚本AST与两个验收入口--help通过。runtime_host的7项真实本地IPC测试和rules_storage的14项测试均实际执行。CLI既有过滤器测试补证source-run-id参数经IPC传递。
 
 上述均为匿名组件、真实本地IPC和合成操作／判定器证据，不是实际ES防护验收。未运行root准备／安装、未改FDA、未读取真实历史；完整Rust root／FDA链、3秒生成／发送、通知到屏、launchd未登录／注销／重启、性能与持续完整性仍待06。未执行外传控制，也不报告控制成功。
+
+
+## CI 工具链基线修正
+
+2026-10-04远端 Component checks 首轮 `37142828933` 失败。主agent读取日志确认，浮动stable实际安装Rust 1.99.0，其新增的 `collapsible_if`／`function-casts-as-integer` 共11条lint被 `-D warnings` 阻断；源码编译不是本轮失败点。本机组件与release的已验证工具链为Rust 1.88.0，Cargo rust-version为1.88。
+
+仅在workflow的工具链输入固定 `1.88.0`，fmt／严格clippy／tests和其他步骤保持；README与验收文档同步基线。源码、脚本、测试、Cargo文件均不改，原release SHA256 `6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13` 仍有效。已做只读YAML解析、工具链与Cargo版本核对、原检查步骤保持及diff检查；远端重跑尚待结果，不能记为CI已通过。此配置修正不改变原Standards2／Spec4项的修复和两轴各0剩余结论，系统验收仍由06记录。
