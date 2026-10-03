@@ -1,6 +1,6 @@
 # CLI 配置、查询与服务管理入口
 
-Status: claimed
+Status: resolved
 Type: task
 Blocked by: 01、05 的公开控制契约
 
@@ -32,4 +32,4 @@ Blocked by: 01、05 的公开控制契约
 - tests/runtime_cli.rs 通过实际 codeperimeter 二进制检查参数解析、失败退出、IPC 请求字段、多个目录、查询过滤、累计清除、历史快照固定选择及失效路径拒绝。测试 socket 是同 UID 本机 IPC 替身，只验证 CLI 契约，不代表真实采集或通知通过。
 - service plan 测试核对三个 launchd job 的 argv 与对应 socket／数据库路径；帮助测试核对角色 CLI 参数名。src/main.rs 单元测试验证 OperationReport 有失败步骤时返回错误，不执行 launchd 安装或启动。
 - 真实 macOS root collector、FDA、后台运行、通知到屏、3 秒目标和重启恢复由票据 06 单独验收；本文档不将 CLI IPC 测试称为这些能力的证据。
-- 2026-10-04：cargo fmt --all -- --check 通过；cargo test --offline --locked --all-targets 为 57 passed、0 failed。cargo clippy --offline --locked --all-targets 可完成，当前只报告同期 05 runtime.rs 的 3 个 lint；全量 -D warnings 待 05 owner 修复后复验。CLI 本身未产生 clippy 诊断。
+- 2026-10-04：cargo fmt --all -- --check 通过；cargo test --offline --locked --all-targets 为 57 passed、0 failed。cargo clippy --offline --locked --all-targets 可完成，CLI 未产生 lint；加 -D warnings 时被依赖的 05 runtime checkpoint 中 3 个 lint 阻止，已交由 05 owner 修复，最终集成验证由主 agent 复跑。
