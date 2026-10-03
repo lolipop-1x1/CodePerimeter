@@ -1,5 +1,4 @@
-.DS_Store
-.env
-.env.*
-!.env.example
-*.log
+/target/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

@@ -1,10 +1,10 @@
 # 文件活动监控 MVP：技术讨论
 
 日期：2026-10-03
-Status: needs-info
+Status: claimed
 Type: grilling
 
-本轮使用 `grill-with-docs`，结合 `grilling` 与 `domain-modeling` 讨论具体技术路线。产品范围承接 [最小规格](spec.md)，已确认的产品选择不重复询问。逐项选择已记录，整份技术基线等待确认；尚未实现或通过本机验收。
+本轮使用 `grill-with-docs`，结合 `grilling` 与 `domain-modeling` 讨论具体技术路线。产品范围承接 [最小规格](spec.md)，已确认的产品选择不重复询问。用户 2026-10-03 显式调用 `implement-spec`，授权进入实现；本机验收结果由后续运行证据记录。
 
 ## Notes
 
