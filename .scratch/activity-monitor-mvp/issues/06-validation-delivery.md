@@ -19,7 +19,7 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 
 ## Answer
 
-实现与历次补修的双轴独立复核已完成，PR保持可审查。整票保持claimed：第三次真实运行已确认指定匿名源码文件可读OPEN入库及可信root桥接，但完整场景在mmap之前因操作端测试目录残留退出。该冲突和串联发现的tar附加成员问题已补修；九类完整覆盖、批量／归档告警、3秒、桌面／后台和持续性能仍需完整真实重跑。旧实现worktree归档受App保护，集成与修复树保留用于后续实测。本轮远端CI结果以PR检查回读为准。
+实现与历次补修的双轴独立复核已完成，PR保持可审查。第四轮真实已完成所有操作，16场景8通过／8证据缺失，最大生成3543ms／最终发送3956ms，整体仍失败或部分通过。普通权限测量复现调度背压，修复后相同样本2148ms→293ms；真实完成屏障及聚合指标已补，完整实机重跑仍待。06保持claimed；新head远端CI以PR回读为准。桌面／后台／长期性能与旧worktree保护边界保持。
 
 - `tests/end_to_end.rs` 运行真实 CLI→普通用户 daemon→SQLite：手动目录、匿名 Codex／Claude 元信息合并、预览后新增历史不扩大范围、同库重启回查／移除；独立用例验证普通用户启动 collector 被拒绝。采集源刻意不可用，不冒充 ES。
 - `scripts/validate-prepare-collector.py --binary target/release/codeperimeter` 只在用户终端显式 `sudo -v` 后准备 root-owned `/Library/CodePerimeter/<uid>/codeperimeter`，检查 root 父路径、写 ACL、来源权限和复制 SHA256，默认拒绝已有目标；仅无launchd安装的验收副本可明确旧hash安全替换，root发布时重查完整路径／ACL、旧新hash与无活动端点／进程／plist／loaded jobs；不创建 job、不改 FDA。
@@ -73,3 +73,18 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 
 
 - 2026-10-05 CI瞬时状态竞态补修：b958 push CI成功（Rust79／Python9+24），PR CI37216778870在既有断线测试的瞬时reconnecting轮询超时。唯一实现者冻结 `d277e3b55f548516a525f11c1fcdebac1c4c7ea9`（tree `5294482177eb244cd6afc21cdf4f854bee736391`），仅tests/runtime_host.rs。断线后快速接入使旧查询条件错过短暂状态；无sleep确定性反例0.26秒实见connected与旧reconnecting断言冲突。现检查断线前最大健康ID之后新增collector_eof/state reconnecting，保留连接恢复／第二代run_id及collector_restarted；新增先恢复后回查反例。runtime11、fmt、严格clippy、diff通过，两轴独立复核Standards hard0／heuristic0、Spec缺陷0／scope creep0，独立反例1通过／0.42秒。merger已快进集成并对齐HEAD/tree／双方clean。生产代码、权限、真实源与3000ms门槛均未改，a67副本保持；新head CI以PR回读为准，真实完整场景尚未重跑，06保持claimed。
+
+
+## 第四次真实运行与调度／完成屏障补修
+
+第四次真实运行 `codeperimeter-validation-ekj5ivqs` 已完成全部合成操作，整体判 `real_run_failed_or_partial`。macOS15.6.1、Python3.12.12、eslogger schema1／message9，a67二进制，root桥接verified、real_source_confirmed=true。约6.9秒观察9751条系统事件，保存766条项目标准事件，本地collector／reader丢弃、SQLite保存缺口及degraded健康计数均0，root清理完成；短时无已知缺口不证明长期完整性。
+
+16场景中8个通过：普通读取、mmap、重复读取、55文件批量、tar项目内／临时输出、九类操作及预加载纯内存对照。九类计数是系统范围，不能称九类项目事件均保存。zip、同进程落盘／内存归档、search／index／build后半8个操作成功，但指定PID没有项目事件进入标准快照；不能判定实际漏采或确定归因于积压。7条告警最慢生成3543ms；标准快照只有5条sent，最终证据7条均sent，最慢3956ms。两者均超3000ms，sent仍不等于桌面展示。
+
+2026-10-05 调度及验收补修 `d799d08e88ee43aa47c9171338becbcfed74216f`：保留32／64有界容量，宿主空闲使用recv_timeout即时唤醒，reader满队列阻塞等待容量、宿主停止先drop接收端再join。相同匿名schema1／message9约10MB交错样本：9751行、766项目事件、16外部进程实例、55独立inode、331次告警更新，完整桥接／分析／SQLite耗时2148ms→319ms；加入聚合指标后复测293ms，已知缺口0。这是普通用户组件测量，没有ES／FDA／通知角色，不证明实机3秒已通过。逐事件SQLite阶段约91ms，未据此修改事务或schema。
+
+状态新增pipeline_timing：root读行后向有界队列发送、socket写入及宿主处理的聚合总／最大时长、source到root接收的最大时差。send总时长包含发送本身，不全部代表满队列等待；received_timestamp_ms是完整读行后打点，背压也会延后下一行读取，不能直接断言eslogger本身慢。指标只诊断当前链路，不建立ES事件、替代健康门禁或保存原始JSON。
+
+验收保留业务场景原始突发顺序；末尾由独立PID访问唯一匿名文件，要求实际可读OPEN／MMAP及来源序号进入SQLite，再等待各场景证据与outbox排空，重新读取最终发送回执。完成等待20秒有限截止，报告是否越过来源屏障、缺失场景和deadline；屏障不能证明所有来源绝对完整，场景证据和缺口仍分别裁决。删除outbox空即场景完成与固定3秒快照，3000ms仍按实际来源触发时间计算，超时／晚到照常失败。
+
+本机完整Rust80通过／1信号helper由监督用例调用；Python判定器31通过、fmt／严格all-target clippy／AST／diff检查通过。双轴定点审查：Standards hard0／heuristic1（零秒测试未实际进入pending分支），唯一实现者补确定性正反例并独立复核关闭；Spec可证缺陷0／scope creep0（裁决26bfe35；d799仅测试补修由Standards窄复核）。新版release SHA256 `ecbd09284b9d404fe2cdb486f9e1a666e5a01da5e24483c534431548744cee06` 已构建，受保护副本仍a67，未替换或重新实机采集。本轮新head远端CI以PR回读为准；完整真实重跑、桌面到屏、后台／登录／重启与持续性能仍待，06保持claimed。

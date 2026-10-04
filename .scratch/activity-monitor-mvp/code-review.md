@@ -107,3 +107,18 @@ hard0／heuristic0。断线前ID基线与新增EOF条件避免旧证据冒充；
 可证缺陷0／scope creep0，没有弱化断流可见性。独立单跑先恢复再回查反例1通过、0.42秒；断线要求匹配collector_eof、reconnecting且ID大于本次基线。
 
 唯一实现者runtime11、fmt／严格clippy／diff通过，merger已快进集成并对齐双方HEAD/tree／clean。只修测试观测方式，生产代码、权限、Python及真实3000ms裁决不变；新head远端CI以PR回读为准。真实完整ES／九类／归档／3秒／后台仍待，06保持claimed。
+
+
+## 第四轮调度与完成屏障定点复核
+
+固定点 `043699d066e8a8329fbd5898168735a1fdfdfbb1` → 初始候选 `26bfe35a0031401e4948e347d3405fdf8b86f4c5`（tree db66ce4a7aaa560287bca12d92fa58ae1db988d6），三点diff和commitlog已核验。5文件：src/runtime.rs、src/service.rs、tests/runtime_host.rs、scripts/validate-mvp.py、scripts/validate-selftest.py。唯一实现者再补S1至 `d799d08e88ee43aa47c9171338becbcfed74216f`，仅测试变化，生产源码／release保持。
+
+### Standards
+
+初始hard0／heuristic1：S1未完成通知测试timeout=0，pending为空和非空均未实际调用control，不能证明队列语义。补mock单调时间，非空对照必须调用pending查询后不完成，空对照同样必须查询且完成；不使用sleep。旧测试添加assert_called_once确定性FAIL（调用0），修后正反与deadline回归通过；独立复核S1关闭，剩余hard0／heuristic0。
+
+### Spec
+
+可证缺陷0／scope creep0，裁决冻结26bfe35；最终d799仅变更测试，Standards已独立窄复核。保持有界保序、可靠状态、drop后join取消、原业务突发顺序、真实独立fence与预期场景证据、有限deadline；Metrics不建立实际ES证据或放宽健康。source-based3000ms、晚到／缺失与实际桌面／后台未验边界保持。
+
+主agent全Rust80通过／1监督helper调用，唯一实现者相关Rust10+11+12及Python31、fmt／严格clippy／AST／diff通过，独立复核普通定点反例通过。匿名10MB、9751行交错样本2148ms→319ms，指标版293ms，766项目事件／331合并更新／零已知缺口保持；普通组件测量不等于ES实机3秒。第四轮真实16场景8通过／8证据缺失，生成3543ms／最终7条均sent且最晚3956ms，原失败不改。release `ecbd09284b9d404fe2cdb486f9e1a666e5a01da5e24483c534431548744cee06` 已构建；受保护副本仍a67、未sudo部署／改FDA／安装launchd。新head CI及完整实机以对应后续回读为准，06保持claimed。
