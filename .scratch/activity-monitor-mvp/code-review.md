@@ -64,3 +64,14 @@ README和后台验收步骤补齐install后的显式service start；install只�
 主agent已对该候选成功offline release构建，产物 `/private/tmp/codeperimeter-integration-release/release/codeperimeter` 的SHA256为 `987018ac8168f6ad6170d520637a574a8dc470eb49e3c3bdaafc43b33b44e17a`；service plan回读确认三角色使用同一新collector socket。此时尚未复制集成target，root副本 `/Library/CodePerimeter/501/codeperimeter` 仍为旧SHA256 `6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13`，未执行替换或新源采集。新head远端CI、root／FDA、九类、3秒、到屏和后台仍待，06保持claimed。
 
 PR此前已Ready，不再列为未完成项。十个旧实现worktree归档均被App的pinned task/workspace保护拒绝，未手工删除或修改固定状态；当前修复worktree暂保留供后续实测问题处理，后续清理仍按App正常归档流程，不报告全部清理完成。本次收尾仅更新本记录与06，diff检查通过，不修改源码／脚本／测试，也不重复组件测试。
+
+
+## 第二次真实运行与传输补修复核
+
+第二次真实运行使用启动修复版 `987018ac8168f6ad6170d520637a574a8dc470eb49e3c3bdaafc43b33b44e17a`，实际观察11,726条系统事件，但合成项目事件0、collector丢弃136,612、reader丢弃4,085，仍判失败；旧摘要没有阶段，不能确定具体超时点。PR暂恢复Draft，实际门禁未关闭。
+
+固定点 `80683895634249c105b87af074c690885557350c` → 候选 `606baa8147a66913258129f8c04d04be01c77059`；Standards hard0／heuristic1（frame编码约束重复），Spec1个P2（reconnecting期间新的身份拒绝原因被抑制），scope creep0。唯一实现者统一补修到 `46dd68f616050cdf6f21210a8fdce8e32f2f7f17`，tree `cb5162f55a27e142d6b1a68953e052477927846a`；原两轴定点复核后Standards hard0／heuristic0，Spec剩余可证缺陷0／scope creep0。Spec独立原UID反例实见unavailable→identity_rejected均保存、未接受连接、无run_id，Stop 0.232秒、宿主exit0；匿名自身进程已回收。此结论仅关闭源码审查。
+
+有界背压、半帧保留与可取消写入、可靠生命周期状态、停滞／恢复健康记录和线程回收均有定点回归；身份错误按状态＋静态代码去重，成功连接清空；私有encode_frame统一协议编码。主agent在606候选全Rust回归78 passed／1信号helper由监督用例调用；统一补修46候选lib10＋runtime_host10＋service_collector12、fmt／严格all-target clippy／diff通过，Python未改沿用20项。没有删除序号缺口或放宽3000ms与真实项目门禁，背压仍可能引起系统来源丢失，必须实机裁决。
+
+46候选release构建成功，SHA256 `a67ecbff53ad0b44c7883af6c9286d5130df4f239f2a0742b9b4aecc37ab3f14`，已复制至集成target/release并核对一致。受保护副本仍为987版本，未替换或启动新真实源，未安装launchd／修改FDA。新head远端CI待跑，项目读取／九类／3秒／到屏／后台／性能仍待；06保持claimed，修复worktree保留供后续实测。

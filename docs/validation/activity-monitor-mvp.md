@@ -4,6 +4,10 @@
 
 ## 已验证与待验证
 
+最新传输补修源码为 `46dd68f`：有界队列改为背压保序，保留读写半帧，连接状态与错误分类可靠传递，连续无帧报告停滞及覆盖缺口，停止回收自身线程。两轴独立复核剩余0项；606候选完整Rust78通过，46补修定点lib10／runtime10／service12通过，Python判定器20通过，fmt与严格clippy通过。新head CI待跑；以上仍是组件证据。
+
+第二次真实运行的987版本已收到11,726条系统事件，但项目事件与告警0，collector丢弃136,612、reader丢弃4,085，仍失败。旧摘要缺少失败阶段，不能确定是身份等待或首条读取超时。新入口保存静态phase／identity原因、失败时已完成的匿名operations，并分别报告系统事件存在与指定合成项目读取确认；真实事件、健康和3000ms判定不变。补修版尚未实机运行。
+
 2026-10-04 集成基线 `5b93bc2`：62 项 Rust 测试通过、1 项信号 worker 由监督用例显式调用；8 项 Python 发送器测试通过，fmt 与严格 clippy 通过。06 验证分支在此基础上运行全部 64 项 Rust 测试通过、fmt／严格 clippy 通过；8 项 Python 发送器与 3 项验收计时判定器自测通过。新增两个实际 CLI→普通用户宿主→SQLite 用户流程／采集权限拒绝测试。它们刻意没有可用采集源，验证手动目录、固定历史快照导入、配置不随新历史扩张、宿主重启回查和权限边界。
 
 2026-10-04固定点审查补修：Rust全部目标69 passed／1 ignored监督helper、Python发送器8 passed、判定器9 passed；fmt、check与严格clippy通过。新增连接断开／读超时、宿主启动与定期保留故障、锁恢复后重启通知、来源版本／缺口回查与v1／v2迁移回归。以上是组件证据，完整系统待验项保持不变，详见 [审查记录](../../.scratch/activity-monitor-mvp/code-review.md)。
@@ -12,7 +16,7 @@
 | --- | --- | --- |
 | Adapter／规则／SQLite／IPC／CLI | 匿名 fixtures、真实本地 IPC、持久化回查、故障注入、信号子进程 | 组件契约通过；替身不代表 root ES |
 | 系统字段探针 | [本机探针](../../.scratch/activity-monitor-mvp/real-probe.md) | eslogger 真实字段已见；短时探针不代表持续链路 |
-| 完整匿名真实运行 | `scripts/validate-mvp.py` | 首跑已执行但采集前失败；没有真实源事件，修复后重跑待验 |
+| 完整匿名真实运行 | `scripts/validate-mvp.py` | 首跑采集前失败；第二轮系统事件已见但项目门禁未通过，存在大量丢弃；补修版待重跑 |
 | 3 秒生成／通知发送 | 实际标准事件、outbox、通知反馈的独立时间 | 待真实运行裁决 |
 | 通知到屏、后台 FDA、登录补发和重启 | 下文独立步骤 | 尚未验收 |
 
@@ -40,11 +44,11 @@ python3 -B scripts/validate-prepare-collector.py --binary target/release/codeper
 
 准备入口检查来源普通文件和权限，检查 root 父路径／ACL，先复制到 root 私有暂存文件，清除新创建自有目录／文件的继承 ACL 并核对 SHA256，再用系统 link 原子发布为 `/Library/CodePerimeter/<uid>/codeperimeter`；发布也拒绝已有目标，包括并发创建。默认拒绝已有目标。仅对无 launchd 安装的验收副本，可明确指定 `--replace-sha256`：普通用户先核对旧hash与完整root路径／ACL；发布时固定 `/usr/bin/python3 -I -B -S` 再核验旧／新SHA256、root属主与完整路径／ACL、旧／新采集端点和控制端点、任何codeperimeter进程、该UID的三份plist与loaded jobs，全部静止才原子替换。系统Python不可用或任一检查不符就失败，不降级、不删除未知端点。已有服务安装应按服务管理流程处理，本入口不是通用更新器。此入口只准备副本，不创建 job、不运行 collector、不变更 FDA。
 
-本次首跑已准备的旧副本SHA256为 `6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13`。重新构建修复版后，用户可在同一终端显式更新并重跑：
+本机第二轮已将受保护验收副本更新为SHA256 `987018ac8168f6ad6170d520637a574a8dc470eb49e3c3bdaafc43b33b44e17a`。构建传输补修版后，可在同一终端明确替换这个已核对的旧副本并重跑：
 
 ```sh
 sudo -v
-python3 -B scripts/validate-prepare-collector.py --binary target/release/codeperimeter --replace-sha256 6c07108515587f5c9b78e46b578105ce23f9680f366948934f43b8c0e5927b13
+python3 -B scripts/validate-prepare-collector.py --binary target/release/codeperimeter --replace-sha256 987018ac8168f6ad6170d520637a574a8dc470eb49e3c3bdaafc43b33b44e17a
 python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
 ```
 
