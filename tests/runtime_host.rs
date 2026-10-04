@@ -5,7 +5,7 @@ use codeperimeter::runtime::{
     notify_burst_with_sender, notify_once_with_sender, request_control,
     run_daemon_with_expected_collector_uid,
 };
-use codeperimeter::service::{CollectorFrame, write_frame};
+use codeperimeter::service::{CollectorFrame, CollectorTiming, write_frame};
 use codeperimeter::storage::{AlertFilter, EventFilter, HealthFilter, NotificationFilter};
 use rusqlite::Connection;
 use serde::de::DeserializeOwned;
@@ -937,6 +937,25 @@ fn collector_burst_preserves_data_order_and_terminal_diagnostic() {
     for sequence in 1..=512 {
         source.send(open_frame(&file, 900, 1, sequence));
     }
+    let timing = CollectorTiming {
+        sampled_timestamp_ms: now_ms(),
+        source_lines: 512,
+        source_bytes: 4096,
+        source_send_total_us: 100,
+        source_send_max_us: 50,
+        bridge_line_write_attempts: 512,
+        bridge_write_total_us: 200,
+        bridge_write_max_us: 60,
+    };
+    source.send(CollectorFrame::Metrics {
+        run_id: "synthetic-run-01".into(),
+        timing: timing.clone(),
+    });
+    // 旧实例的聚合报告不替换当前实例，且不建立新的事件来源。
+    source.send(CollectorFrame::Metrics {
+        run_id: "anonymous-stale-run".into(),
+        timing: CollectorTiming::default(),
+    });
     source.send(CollectorFrame::Status {
         run_id: "synthetic-run-01".into(),
         state: "permission_denied".into(),
@@ -953,6 +972,18 @@ fn collector_burst_preserves_data_order_and_terminal_diagnostic() {
     );
     let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
     assert_eq!(status.reader_dropped_frames, 0);
+    assert_eq!(status.pipeline_timing.collector, Some(timing));
+    assert!(status.pipeline_timing.host_frames >= 515);
+    assert!(
+        status.pipeline_timing.host_processing_total_us
+            >= status.pipeline_timing.host_processing_max_us
+    );
+    assert!(
+        status
+            .pipeline_timing
+            .source_to_collector_receive_max_ms
+            .is_some()
+    );
     let rows: Vec<Value> = query(
         &control_socket,
         ControlRequest::QueryEvents {

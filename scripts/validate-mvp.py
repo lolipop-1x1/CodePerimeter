@@ -210,6 +210,52 @@ def matrix_worker(project):
                       "pid": os.getpid(), "child_pid": child, "success": True}))
 
 
+def fence_worker(path):
+    # 独立 PID 在所有业务操作之后访问唯一文件；它的活动必须由真实采集进入 SQLite。
+    with path.open("xb") as stream:
+        stream.write(b"anonymous source completion fence")
+    with path.open("rb") as stream:
+        stream.read()
+    print(json.dumps({"pid": os.getpid(), "path": str(path), "success": True}))
+
+
+def completion_state(evidence, operations, project, initial_status, fence):
+    crossed = any(event["process"]["pid"] == fence["pid"]
+                  and event["kind"] in ("open", "mmap")
+                  and event.get("file") and event["file"].get("readable") is True
+                  and not event["file"]["path_truncated"]
+                  and canonical_path(event["file"]["path"]) == canonical_path(fence["path"])
+                  and event.get("global_seq") is not None
+                  and event.get("source_run_id") for event in evidence["events"])
+    cases = analyze(evidence, operations, project, initial_status, initial_status)["cases"]
+    pending = [{"scenario": case["scenario"], "output_scope": case["output_scope"]}
+               for case in cases if not case["passed"]]
+    return {"source_fence_crossed": crossed, "expected_evidence_complete": not pending,
+            "pending_cases": pending}
+
+
+def wait_for_completion(database, control_socket, operations, project, initial_status, fence, timeout=20):
+    deadline = time.monotonic() + timeout
+    result = {"deadline_timestamp_ms": time.time_ns() // 1_000_000 + round(timeout * 1000),
+              "timeout_seconds": timeout, "completed": False, "notifications_drained": False}
+    while True:
+        evidence = load_evidence(database)
+        result.update(completion_state(evidence, operations, project, initial_status, fence))
+        # 空 outbox 只在来源屏障和各场景实际证据都完成后才表示发送队列已排空。
+        if result["source_fence_crossed"] and result["expected_evidence_complete"] and time.monotonic() <= deadline:
+            result["notifications_drained"] = not control(control_socket, "pending_notifications", {"limit": 10000})
+            if result["notifications_drained"]:
+                # 回执可能在上次 SQLite 快照之后完成，裁决使用排空后的再次读取。
+                evidence = load_evidence(database)
+                result["completed"] = time.monotonic() <= deadline
+                break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(.1)
+    result["finished_timestamp_ms"] = time.time_ns() // 1_000_000
+    return result, evidence
+
+
 def load_evidence(database):
     # 仅从本轮匿名数据库读取；唯一写入方仍是普通用户 daemon。
     with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1) as connection:
@@ -553,15 +599,17 @@ def run(args, report, summary):
                                 ("disk-archive", "inside"), ("disk-archive", "temporary"), ("memory-archive", "inside"),
                                 ("search", "inside"), ("index", "inside"), ("build", "inside")]:
             operations.append({"scenario": scenario, "scope": scope, "metadata": sender(workspace, scenario, scope)})
-            try:
-                wait_for(lambda: not control(control_socket, "pending_notifications", {"limit": 10000}), 7)
-                operations[-1]["notification_queue_drained"] = True
-            except TimeoutError:
-                operations[-1]["notification_queue_drained"] = False
+        summary["phase"] = "source_completion_barrier"
+        fence_path = project / (".validation-fence-" + os.urandom(12).hex())
+        fence_process = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()),
+                                        "--source-fence-worker", str(fence_path)],
+                                       capture_output=True, text=True, timeout=15, check=True, start_new_session=True)
+        fence = json.loads(fence_process.stdout)
+        summary["source_completion"], evidence = wait_for_completion(
+            database, control_socket, operations, project, initial, fence)
+        summary["source_completion"]["fence"] = fence
         summary["phase"] = "evidence_analysis"
-        time.sleep(3)
         final_status = control(control_socket, "status")
-        evidence = load_evidence(database)
         save(report / "operations.json", operations)
         save(report / "standard-evidence.json", evidence)
         summary["initial_status"], summary["final_status"] = initial, final_status
@@ -581,7 +629,7 @@ def run(args, report, summary):
         summary["controlled_disconnect"] = {"collector_state": fault_status["collector_state"], "state": fault_status["state"], "observed": fault_status["collector_state"] != final_status["collector_state"]}
         verification = summary["verification"]
         healthy = final_status["database_state"] == "ready" and not any(summary["coverage"][field] for field in ("collector_dropped_lines", "reader_dropped_frames", "database_gap_events", "degraded_health_records"))
-        passed = healthy and summary["collector_stopped"] and summary["controlled_disconnect"]["observed"] and all(case["passed"] for case in verification["cases"]) and verification["nine_event_aggregate_passed"] and verification["generation_latency"]["within_3000_ms"] and verification["notification_send_latency"]["within_3000_ms"]
+        passed = summary["source_completion"]["completed"] and healthy and summary["collector_stopped"] and summary["controlled_disconnect"]["observed"] and all(case["passed"] for case in verification["cases"]) and verification["nine_event_aggregate_passed"] and verification["generation_latency"]["within_3000_ms"] and verification["notification_send_latency"]["within_3000_ms"]
         summary["phase"] = "completed"
         summary["result"] = "real_run_passed_display_and_boot_pending" if passed else "real_run_failed_or_partial"
         return 0 if passed else 1
@@ -628,8 +676,12 @@ def main():
     parser.add_argument("--report-dir", type=Path)
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--event-matrix-worker", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--source-fence-worker", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
+    if args.source_fence_worker:
+        fence_worker(args.source_fence_worker)
+        return 0
     if args.event_matrix_worker:
         matrix_worker(args.event_matrix_worker)
         return 0

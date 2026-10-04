@@ -27,6 +27,19 @@ pub struct CollectorOptions {
     pub allowed_uid: u32,
 }
 
+// 聚合采集行数与队列／写帧耗时；不保留原始事件或逐行轨迹。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorTiming {
+    pub sampled_timestamp_ms: i64,
+    pub source_lines: u64,
+    pub source_bytes: u64,
+    pub source_send_total_us: u64,
+    pub source_send_max_us: u64,
+    pub bridge_line_write_attempts: u64,
+    pub bridge_write_total_us: u64,
+    pub bridge_write_max_us: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CollectorFrame {
@@ -34,6 +47,10 @@ pub enum CollectorFrame {
         run_id: String,
         line: String,
         received_timestamp_ms: i64,
+    },
+    Metrics {
+        run_id: String,
+        timing: CollectorTiming,
     },
     Heartbeat {
         run_id: String,
@@ -395,10 +412,19 @@ enum SourceItem {
     End,
 }
 
+#[derive(Default)]
+struct SourceTiming {
+    lines: AtomicU64,
+    bytes: AtomicU64,
+    send_total_us: AtomicU64,
+    send_max_us: AtomicU64,
+}
+
 fn produce_stdout(
     stdout: impl Read + Send + 'static,
     sender: mpsc::SyncSender<SourceItem>,
     drops: Arc<AtomicU64>,
+    timing: Arc<SourceTiming>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -424,8 +450,19 @@ fn produce_stdout(
             ) {
                 drops.fetch_add(1, Ordering::Relaxed);
             }
-            // 队列满时给来源背压；退出时 receiver 被释放，阻塞发送随之结束。
-            if sender.send(item).is_err() {
+            if let SourceItem::Line(line, _) = &item {
+                timing.lines.fetch_add(1, Ordering::Relaxed);
+                timing.bytes.fetch_add(line.len() as u64, Ordering::Relaxed);
+            }
+            // 记录 send 的总耗时（含等待容量）；不把它等同于纯阻塞时间。
+            let started = Instant::now();
+            let sent = sender.send(item);
+            let elapsed_us = started.elapsed().as_micros() as u64;
+            timing
+                .send_total_us
+                .fetch_add(elapsed_us, Ordering::Relaxed);
+            timing.send_max_us.fetch_max(elapsed_us, Ordering::Relaxed);
+            if sent.is_err() {
                 return;
             }
         }
@@ -578,6 +615,8 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
     };
     let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
     let drops = Arc::new(AtomicU64::new(0));
+    let source_timing = Arc::new(SourceTiming::default());
+    let mut timing = CollectorTiming::default();
     let stdout_reader = produce_stdout(
         source
             .child
@@ -586,6 +625,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
             .ok_or_else(|| io::Error::other("采集 stdout 未建立"))?,
         sender.clone(),
         Arc::clone(&drops),
+        Arc::clone(&source_timing),
     );
     let stderr_reader = produce_stderr(
         source
@@ -634,7 +674,15 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
                     line: line.clone(),
                     received_timestamp_ms: *received_timestamp_ms,
                 };
-                if deliver(&mut client, &frame) {
+                let started = Instant::now();
+                let delivered = deliver(&mut client, &frame);
+                let elapsed_us = started.elapsed().as_micros() as u64;
+                timing.bridge_line_write_attempts =
+                    timing.bridge_line_write_attempts.saturating_add(1);
+                timing.bridge_write_total_us =
+                    timing.bridge_write_total_us.saturating_add(elapsed_us);
+                timing.bridge_write_max_us = timing.bridge_write_max_us.max(elapsed_us);
+                if delivered {
                     pending = None;
                 }
             }
@@ -666,6 +714,18 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
                 &CollectorFrame::Heartbeat {
                     run_id: run_id.clone(),
                     dropped_lines,
+                },
+            );
+            timing.sampled_timestamp_ms = now_ms();
+            timing.source_lines = source_timing.lines.load(Ordering::Relaxed);
+            timing.source_bytes = source_timing.bytes.load(Ordering::Relaxed);
+            timing.source_send_total_us = source_timing.send_total_us.load(Ordering::Relaxed);
+            timing.source_send_max_us = source_timing.send_max_us.load(Ordering::Relaxed);
+            deliver(
+                &mut client,
+                &CollectorFrame::Metrics {
+                    run_id: run_id.clone(),
+                    timing: timing.clone(),
                 },
             );
             last_heartbeat = Instant::now();
@@ -1356,13 +1416,23 @@ mod tests {
 
     #[test]
     fn source_queue_preserves_a_burst_and_end_under_backpressure() {
+        let timing = Arc::new(SourceTiming::default());
         let (sender, receiver) = mpsc::sync_channel(2);
         let drops = Arc::new(AtomicU64::new(0));
         let producer = produce_stdout(
             Cursor::new(b"one\ntwo\nthree\nfour\n".to_vec()),
             sender,
             Arc::clone(&drops),
+            Arc::clone(&timing),
         );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while timing.lines.load(Ordering::Relaxed) < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "producer 应开始等待第三行的队列容量"
+            );
+            thread::yield_now();
+        }
         thread::sleep(Duration::from_millis(30));
         for expected in ["one", "two", "three", "four"] {
             let SourceItem::Line(line, _) = receiver.recv_timeout(Duration::from_secs(1)).unwrap()
@@ -1377,13 +1447,25 @@ mod tests {
         ));
         producer.join().unwrap();
         assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(timing.lines.load(Ordering::Relaxed), 4);
+        assert_eq!(timing.bytes.load(Ordering::Relaxed), 15);
+        assert!(timing.send_max_us.load(Ordering::Relaxed) >= 20_000);
+        assert!(
+            timing.send_total_us.load(Ordering::Relaxed)
+                >= timing.send_max_us.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
     fn rejected_source_line_keeps_a_visible_gap_and_lifecycle_marker() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let drops = Arc::new(AtomicU64::new(0));
-        let producer = produce_stdout(Cursor::new(vec![0xff, b'\n']), sender, Arc::clone(&drops));
+        let producer = produce_stdout(
+            Cursor::new(vec![0xff, b'\n']),
+            sender,
+            Arc::clone(&drops),
+            Arc::new(SourceTiming::default()),
+        );
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
             SourceItem::Status("invalid_line", _)
@@ -1403,6 +1485,7 @@ mod tests {
             Cursor::new(b"one\ntwo\nthree\n".to_vec()),
             sender,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(SourceTiming::default()),
         );
         thread::sleep(Duration::from_millis(20));
         assert!(!producer.is_finished());

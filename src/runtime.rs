@@ -4,7 +4,9 @@ use crate::Result;
 use crate::eslogger::EsloggerAdapter;
 use crate::model::{ActivityEvent, Alert, EventKind, now_ms};
 use crate::rules::{RuleConfig, RuleEngine};
-use crate::service::{CollectorClient, CollectorFrame, read_bounded_line, verify_peer_uid};
+use crate::service::{
+    CollectorClient, CollectorFrame, CollectorTiming, read_bounded_line, verify_peer_uid,
+};
 use crate::storage::{
     AlertFilter, DirectoryConfig, EventFilter, HealthFilter, HealthRecord, NotificationFilter,
     NotificationOutcome, NotificationRecord, PendingNotification, PendingNotificationSummary,
@@ -121,6 +123,15 @@ pub struct ControlResponse {
     pub data: Option<Value>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipelineTiming {
+    pub collector: Option<CollectorTiming>,
+    pub host_frames: u64,
+    pub host_processing_total_us: u64,
+    pub host_processing_max_us: u64,
+    pub source_to_collector_receive_max_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeStatus {
     pub state: String,
@@ -139,6 +150,7 @@ pub struct RuntimeStatus {
     pub retention_state: String,
     pub retention_last_run_ms: Option<i64>,
     pub last_event_received_ms: Option<i64>,
+    pub pipeline_timing: PipelineTiming,
     pub observed_events_by_kind: BTreeMap<String, u64>,
     pub persisted_events_by_kind: BTreeMap<String, u64>,
     pub filtered_events_by_kind: BTreeMap<String, u64>,
@@ -260,6 +272,7 @@ struct DaemonState {
     collector_dropped_lines: u64,
     reader_dropped_frames: Arc<AtomicU64>,
     last_event_received_ms: Option<i64>,
+    pipeline_timing: PipelineTiming,
     counters: RuntimeCounters,
     deduper: Deduper,
     memory_alerts: VecDeque<MemoryAlert>,
@@ -531,6 +544,7 @@ fn run_daemon_inner(
         collector_dropped_lines: 0,
         reader_dropped_frames,
         last_event_received_ms: None,
+        pipeline_timing: PipelineTiming::default(),
         counters: RuntimeCounters::default(),
         deduper: Deduper::default(),
         memory_alerts: VecDeque::new(),
@@ -569,7 +583,10 @@ fn run_daemon_inner(
         state.retry_database_if_due();
         state.prune_if_due();
         if processed == 0 {
-            thread::sleep(Duration::from_millis(10));
+            // 空闲时阻塞等待新帧并即时唤醒；控制请求仍最多等待十毫秒。
+            if let Ok(message) = receiver.recv_timeout(Duration::from_millis(10)) {
+                state.handle_reader_message(message);
+            }
         }
     }
     reader_stopping.store(true, Ordering::Relaxed);
@@ -584,20 +601,11 @@ fn run_daemon_inner(
 
 fn send_reader_message(
     sender: &mpsc::SyncSender<ReaderMessage>,
-    mut message: ReaderMessage,
+    message: ReaderMessage,
     stopping: &AtomicBool,
 ) -> bool {
-    while !stopping.load(Ordering::Relaxed) {
-        match sender.try_send(message) {
-            Ok(()) => return true,
-            Err(mpsc::TrySendError::Full(pending)) => {
-                message = pending;
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => return false,
-        }
-    }
-    false
+    // 有界队列释放容量时立即唤醒；宿主停止先释放 receiver，再回收读取线程。
+    !stopping.load(Ordering::Relaxed) && sender.send(message).is_ok()
 }
 
 fn spawn_collector_reader(
@@ -816,6 +824,7 @@ impl DaemonState {
             retention_state: self.retention_state.clone(),
             retention_last_run_ms: self.retention_last_run_ms,
             last_event_received_ms: self.last_event_received_ms,
+            pipeline_timing: self.pipeline_timing.clone(),
             observed_events_by_kind: self.counters.observed.clone(),
             persisted_events_by_kind: self.counters.persisted.clone(),
             filtered_events_by_kind: self.counters.filtered.clone(),
@@ -1010,12 +1019,30 @@ impl DaemonState {
                     },
                 );
             }
-            ReaderMessage::Frame(frame) => self.handle_frame(frame),
+            ReaderMessage::Frame(frame) => {
+                let started = Instant::now();
+                self.handle_frame(frame);
+                let elapsed_us = started.elapsed().as_micros() as u64;
+                self.pipeline_timing.host_frames =
+                    self.pipeline_timing.host_frames.saturating_add(1);
+                self.pipeline_timing.host_processing_total_us = self
+                    .pipeline_timing
+                    .host_processing_total_us
+                    .saturating_add(elapsed_us);
+                self.pipeline_timing.host_processing_max_us =
+                    self.pipeline_timing.host_processing_max_us.max(elapsed_us);
+            }
         }
     }
 
     fn handle_frame(&mut self, frame: CollectorFrame) {
         match frame {
+            CollectorFrame::Metrics { run_id, timing } => {
+                // 指标只补充当前实例的状态，不建立 ES 事件或驱动健康判定。
+                if self.adapter_run_id.as_deref() == Some(run_id.as_str()) {
+                    self.pipeline_timing.collector = Some(timing);
+                }
+            }
             CollectorFrame::Line {
                 run_id,
                 line,
@@ -1140,6 +1167,7 @@ impl DaemonState {
             return;
         }
         let changed = self.adapter_run_id.is_some();
+        self.pipeline_timing.collector = None;
         self.adapter_run_id = Some(run_id.to_owned());
         self.adapter = Some(EsloggerAdapter::new(run_id));
         self.source_state = "connected".into();
@@ -1160,6 +1188,14 @@ impl DaemonState {
         let kind = event_kind_name(event.kind).to_owned();
         *self.counters.observed.entry(kind.clone()).or_default() += 1;
         self.last_event_received_ms = Some(event.received_timestamp_ms);
+        if let Some(timestamp) = event.source_timestamp_ms {
+            let lag = event.received_timestamp_ms.saturating_sub(timestamp);
+            self.pipeline_timing.source_to_collector_receive_max_ms = Some(
+                self.pipeline_timing
+                    .source_to_collector_receive_max_ms
+                    .map_or(lag, |previous| previous.max(lag)),
+            );
+        }
         if !self.deduper.insert(&event) {
             self.counters.duplicates += 1;
             self.write_health(
@@ -1906,7 +1942,7 @@ mod reader_tests {
             matches!(receiver.recv().unwrap(), ReaderMessage::State { code, .. } if code == "collector_eof")
         );
 
-        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel(1);
         sender
             .send(ReaderMessage::Frame(CollectorFrame::Heartbeat {
                 run_id: "anonymous".into(),
@@ -1926,6 +1962,7 @@ mod reader_tests {
         });
         thread::sleep(Duration::from_millis(20));
         stopping.store(true, Ordering::Relaxed);
+        drop(receiver);
         assert!(!worker.join().unwrap());
     }
 }

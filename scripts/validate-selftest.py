@@ -137,6 +137,91 @@ class ValidationArchiveOutputTests(unittest.TestCase):
         self.assertIn("发送器未声明预期归档输出", missing["missing_evidence"])
 
 
+class ValidationCompletionTests(unittest.TestCase):
+    def setUp(self):
+        self.status = {"observed_events_by_kind": {kind: 0 for kind in validation.KINDS}}
+        self.fence = {"pid": 999, "path": str(PROJECT / ".validation-fence-anonymous")}
+        self.operation = {"scenario": "read", "scope": "inside", "metadata": [{"pid": 100}]}
+        self.base = {"events": [], "alerts": [], "outbox": {}, "notifications": []}
+        self.fence_event = event(1100, process={"pid": 999, "pid_version": 5},
+                                 file=event(1100)["file"] | {"path": self.fence["path"]})
+
+    def wait(self, snapshots, pending=None, timeout=.01):
+        with patch.object(validation, "load_evidence", side_effect=snapshots), patch.object(validation, "control", return_value=pending or []) as control:
+            result, snapshot = validation.wait_for_completion(Path("/anonymous.sqlite"), Path("/anonymous.sock"),
+                                                              [self.operation], PROJECT, self.status, self.fence, timeout)
+        return result, snapshot, control
+
+    def test_empty_outbox_before_event_progress_cannot_complete_and_retains_failure(self):
+        # 旧逐场景条件此时为真；但来源访问与业务证据都还没有进入数据库。
+        self.assertFalse(self.base["outbox"])
+        result, snapshot, control = self.wait([self.base], timeout=0)
+        self.assertFalse(result["completed"])
+        self.assertFalse(result["source_fence_crossed"])
+        self.assertEqual(result["pending_cases"], [{"scenario": "read", "output_scope": "inside"}])
+        self.assertEqual(snapshot, self.base)
+        control.assert_not_called()
+        self.assertIn("deadline_timestamp_ms", result)
+
+    def test_fence_alone_does_not_replace_expected_business_evidence(self):
+        result, _, control = self.wait([self.base | {"events": [self.fence_event]}], timeout=0)
+        self.assertTrue(result["source_fence_crossed"])
+        self.assertFalse(result["expected_evidence_complete"])
+        self.assertFalse(result["completed"])
+        control.assert_not_called()
+
+    def test_real_fence_requires_read_flag_matching_pid_path_and_sequence(self):
+        for replacement in ({"global_seq": None}, {"kind": "close"}, {"process": PROCESS},
+                            {"file": self.fence_event["file"] | {"readable": False}},
+                            {"file": self.fence_event["file"] | {"path_truncated": True}},
+                            {"file": self.fence_event["file"] | {"path": str(PROJECT / "other")}}):
+            with self.subTest(replacement=replacement):
+                snapshot = self.base | {"events": [event(1000), self.fence_event | replacement]}
+                self.assertFalse(validation.completion_state(snapshot, [self.operation], PROJECT, self.status, self.fence)["source_fence_crossed"])
+
+    def test_lagged_stream_waits_then_uses_feedback_after_drain_without_relaxing_latency(self):
+        ready = self.base | {"events": [event(1000), self.fence_event]}
+        final = ready | {"notifications": [{"alert_id": "anonymous", "outcome": "sent", "observed_timestamp_ms": 4100}]}
+        result, snapshot, control = self.wait([self.base, ready, final], timeout=1)
+        self.assertTrue(result["completed"])
+        self.assertTrue(result["notifications_drained"])
+        self.assertEqual(snapshot, final)
+        control.assert_called_once()
+        case = validation.analyze(snapshot, [self.operation], PROJECT, self.status, self.status)["cases"][0]
+        self.assertEqual(case["standard_event_count"], 1, "独立 fence PID 不增加业务读取数")
+        self.assertFalse(validation.latency_summary([3100], 0)["within_3000_ms"])
+
+    def test_feedback_read_after_deadline_preserves_evidence_but_cannot_complete(self):
+        ready = self.base | {"events": [event(1000), self.fence_event]}
+        with patch.object(validation.time, "monotonic", side_effect=[0, .5, 1.5]):
+            result, snapshot, _ = self.wait([ready, ready], timeout=1)
+        self.assertTrue(result["source_fence_crossed"])
+        self.assertTrue(result["notifications_drained"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(snapshot, ready)
+
+    def test_unfinished_notifications_cannot_complete_even_after_source_fence(self):
+        ready = self.base | {"events": [event(1000), self.fence_event]}
+        result, _, _ = self.wait([ready], pending=[{"alert_id": "anonymous"}], timeout=0)
+        self.assertTrue(result["source_fence_crossed"])
+        self.assertFalse(result["notifications_drained"])
+        self.assertFalse(result["completed"])
+
+    def test_fence_worker_is_independent_and_refuses_existing_file(self):
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-fence-test-", dir="/private/tmp") as directory:
+            path = Path(directory) / ".validation-fence-anonymous"
+            command = [sys.executable, "-B", validation.__file__, "--source-fence-worker", str(path)]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15, start_new_session=True)
+            self.assertEqual(result.returncode, 0)
+            metadata = json.loads(result.stdout)
+            self.assertNotEqual(metadata["pid"], os.getpid())
+            self.assertEqual(metadata["path"], str(path))
+            self.assertTrue(metadata["success"])
+            self.assertTrue(path.is_file())
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15, start_new_session=True)
+            self.assertNotEqual(result.returncode, 0)
+
+
 class ValidationStartupTests(unittest.TestCase):
     def test_startup_diagnostics_are_bounded_static_and_never_echo_raw(self):
         stream = io.BytesIO(("执行失败：root 服务文件或父目录可被普通用户修改\n"
