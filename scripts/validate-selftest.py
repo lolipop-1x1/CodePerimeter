@@ -202,10 +202,16 @@ class ValidationCompletionTests(unittest.TestCase):
 
     def test_unfinished_notifications_cannot_complete_even_after_source_fence(self):
         ready = self.base | {"events": [event(1000), self.fence_event]}
-        result, _, _ = self.wait([ready], pending=[{"alert_id": "anonymous"}], timeout=0)
-        self.assertTrue(result["source_fence_crossed"])
-        self.assertFalse(result["notifications_drained"])
-        self.assertFalse(result["completed"])
+        for pending, completed, clock in (([{"alert_id": "anonymous"}], False, [0, .1, 1.1]),
+                                           ([], True, [0, .1, .2])):
+            with self.subTest(pending=pending), patch.object(validation.time, "monotonic", side_effect=clock):
+                snapshots = [ready, ready] if completed else [ready]
+                result, _, control = self.wait(snapshots, pending=pending, timeout=1)
+            control.assert_called_once_with(Path("/anonymous.sock"), "pending_notifications", {"limit": 10000})
+            self.assertTrue(result["source_fence_crossed"])
+            self.assertTrue(result["expected_evidence_complete"])
+            self.assertEqual(result["notifications_drained"], completed)
+            self.assertEqual(result["completed"], completed)
 
     def test_fence_worker_is_independent_and_refuses_existing_file(self):
         with tempfile.TemporaryDirectory(prefix="codeperimeter-fence-test-", dir="/private/tmp") as directory:
