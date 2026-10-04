@@ -75,3 +75,20 @@ PR此前已Ready，不再列为未完成项。十个旧实现worktree归档均�
 有界背压、半帧保留与可取消写入、可靠生命周期状态、停滞／恢复健康记录和线程回收均有定点回归；身份错误按状态＋静态代码去重，成功连接清空；私有encode_frame统一协议编码。主agent在606候选全Rust回归78 passed／1信号helper由监督用例调用；统一补修46候选lib10＋runtime_host10＋service_collector12、fmt／严格all-target clippy／diff通过，Python未改沿用20项。没有删除序号缺口或放宽3000ms与真实项目门禁，背压仍可能引起系统来源丢失，必须实机裁决。
 
 46候选release构建成功，SHA256 `a67ecbff53ad0b44c7883af6c9286d5130df4f239f2a0742b9b4aecc37ab3f14`，已复制至集成target/release并核对一致。受保护副本仍为987版本，未替换或启动新真实源，未安装launchd／修改FDA。新head远端CI待跑，项目读取／九类／3秒／到屏／后台／性能仍待；06保持claimed，修复worktree保留供后续实测。
+
+
+## 第三次真实运行与操作端补修复核
+
+2026-10-05，固定点 `2f38c95439679a60265bbc78adcf1d2031ba1735` → 唯一实现者冻结候选 `d4cdc40f96057345a135637f454dd229e85f46bc`，tree `3e3a4678dfdcb18a9b89d9af9e3e88418fbbd4eb`。完整diff为 `git diff 2f38c95...d4cdc40`，仅4个Python文件。第三轮a67实机已确认指定匿名普通文件可读OPEN入库、桥接root身份可信、本地丢弃0，但后续mmap在执行前被残留.event-matrix的严格项目清单拒绝，整体仍失败。
+
+修复仅清理matrix成功后已知产物及自建空目录；串联回归发现tar默认AppleDouble附加成员，改为仅tar子环境COPYFILE_DISABLE=1，原argv／父环境和严格55成员／正文校验保持。Python3.12.12判定器24／发送器9通过，AST／diff通过；Rust源码未改，没有重复全Rust或运行root。本轮远端CI结果以PR检查回读为准。
+
+### Standards
+
+hard0／heuristic0。四文件全部hunk已核对；未知文件保留、匿名数据与最小设计符合工程约定，十二项smell baseline没有需修项。
+
+### Spec
+
+可证缺陷0／scope creep0。独立原始CLI完整顺序、预加载后源码路径暂移仍能用内存完成压缩、两位置tar严格55成员及每份正文、源xattr／父环境、未知符号链接保护与严格cleanup均通过；审查自身测试进程及合成产物已清理。
+
+以上仅关闭操作端补修审查。原真实失败报告保持原样，真实九类项目覆盖、批量／归档告警、3秒生成／发送、到屏及后台仍待完整实机重跑。merger已快进合入d4，HEAD/tree与实现者一致；构建／系统副本均为a67，无需二进制替换。

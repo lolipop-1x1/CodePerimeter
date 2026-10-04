@@ -4,9 +4,13 @@
 
 ## 已验证与待验证
 
-最新传输补修源码为 `46dd68f`：有界队列改为背压保序，保留读写半帧，连接状态与错误分类可靠传递，连续无帧报告停滞及覆盖缺口，停止回收自身线程。两轴独立复核剩余0项；606候选完整Rust78通过，46补修定点lib10／runtime10／service12通过，Python判定器20通过，fmt与严格clippy通过。新head CI待跑；以上仍是组件证据。
+传输补修源码为 `46dd68f`：有界队列使用背压保序，保留读写半帧，可靠传递连接状态和错误分类，报告停滞及覆盖缺口，停止回收自身线程。两轴独立复核剩余0项。交付基线 `2f38c95` 的 PR／push CI均成功，日志核实 Rust79通过／1信号helper由监督用例调用、Python发送器8／判定器20通过，fmt与严格clippy通过；这些是组件证据。
 
-第二次真实运行的987版本已收到11,726条系统事件，但项目事件与告警0，collector丢弃136,612、reader丢弃4,085，仍失败。旧摘要缺少失败阶段，不能确定是身份等待或首条读取超时。新入口保存静态phase／identity原因、失败时已完成的匿名operations，并分别报告系统事件存在与指定合成项目读取确认；真实事件、健康和3000ms判定不变。补修版尚未实机运行。
+第三次真实运行已使用受保护的 `a67ecbff53ad0b44c7883af6c9286d5130df4f239f2a0742b9b4aecc37ab3f14` 二进制。macOS15.6.1、Python3.12.12、eslogger schema1／message9，root身份与桥接核验通过，指定合成进程的普通源码文件可读OPEN已持久化，`real_source_confirmed=true`。本轮观察3,680条系统事件、保存5个open和5个close，本地collector／reader丢弃及SQLite保存缺口均0，root清理完成。运行仅2.765秒：这不证明长期完整性、性能或3秒告警达标。
+
+该轮仍判 `failed_no_fixture_fallback`，阶段为 `synthetic_scenario_matrix`：九类事件操作留下 `.event-matrix`，后续mmap发送器在严格项目清单检查时退出2，映射尚未执行。普通用户按原顺序已复现此测试脚本冲突。完整九类项目覆盖、批量／归档告警、3秒生成／发送、到屏与后台仍待完整重跑；不回退fixture，也不放宽事件、健康或3000ms判定。
+
+2026-10-05 操作端补修 `d4cdc40`：九类worker成功后只删除已知重命名文件和自建空目录，既有目录与未知文件继续拒绝清理。完整普通用户顺序进一步复现macOS tar默认AppleDouble附加成员导致严格清单失败；仅对子tar设置 `COPYFILE_DISABLE=1`，保持父环境、argv及严格55个源码成员和全部正文校验。此开关以本机bsdtar3.5.3／libarchive3.7.4实际create为依据，不宣称所有版本兼容；PAX扩展属性仍可能保留。Python3.12.12验收自测24项、发送器9项通过，包含原始完整场景顺序、预加载释放、项目内／临时输出、正常操作、严格cleanup与未知文件保留。冻结候选 `d4cdc40` 的两轴独立复核：Standards hard0／heuristic0，Spec可证缺陷0／scope creep0；独立验证预加载后源码路径暂时缺失仍能完成内存压缩、完整场景顺序、未知符号链接保留与严格清理。这是操作端回归，不代替完整真实系统重跑；本轮远端CI结果以PR检查回读为准。
 
 2026-10-04 集成基线 `5b93bc2`：62 项 Rust 测试通过、1 项信号 worker 由监督用例显式调用；8 项 Python 发送器测试通过，fmt 与严格 clippy 通过。06 验证分支在此基础上运行全部 64 项 Rust 测试通过、fmt／严格 clippy 通过；8 项 Python 发送器与 3 项验收计时判定器自测通过。新增两个实际 CLI→普通用户宿主→SQLite 用户流程／采集权限拒绝测试。它们刻意没有可用采集源，验证手动目录、固定历史快照导入、配置不随新历史扩张、宿主重启回查和权限边界。
 
@@ -16,7 +20,7 @@
 | --- | --- | --- |
 | Adapter／规则／SQLite／IPC／CLI | 匿名 fixtures、真实本地 IPC、持久化回查、故障注入、信号子进程 | 组件契约通过；替身不代表 root ES |
 | 系统字段探针 | [本机探针](../../.scratch/activity-monitor-mvp/real-probe.md) | eslogger 真实字段已见；短时探针不代表持续链路 |
-| 完整匿名真实运行 | `scripts/validate-mvp.py` | 首跑采集前失败；第二轮系统事件已见但项目门禁未通过，存在大量丢弃；补修版待重跑 |
+| 完整匿名真实运行 | `scripts/validate-mvp.py` | 第三轮已通过指定合成普通文件可读OPEN门禁；后续发送器因测试目录残留退出，完整场景仍待重跑 |
 | 3 秒生成／通知发送 | 实际标准事件、outbox、通知反馈的独立时间 | 待真实运行裁决 |
 | 通知到屏、后台 FDA、登录补发和重启 | 下文独立步骤 | 尚未验收 |
 
@@ -44,15 +48,12 @@ python3 -B scripts/validate-prepare-collector.py --binary target/release/codeper
 
 准备入口检查来源普通文件和权限，检查 root 父路径／ACL，先复制到 root 私有暂存文件，清除新创建自有目录／文件的继承 ACL 并核对 SHA256，再用系统 link 原子发布为 `/Library/CodePerimeter/<uid>/codeperimeter`；发布也拒绝已有目标，包括并发创建。默认拒绝已有目标。仅对无 launchd 安装的验收副本，可明确指定 `--replace-sha256`：普通用户先核对旧hash与完整root路径／ACL；发布时固定 `/usr/bin/python3 -I -B -S` 再核验旧／新SHA256、root属主与完整路径／ACL、旧／新采集端点和控制端点、任何codeperimeter进程、该UID的三份plist与loaded jobs，全部静止才原子替换。系统Python不可用或任一检查不符就失败，不降级、不删除未知端点。已有服务安装应按服务管理流程处理，本入口不是通用更新器。此入口只准备副本，不创建 job、不运行 collector、不变更 FDA。
 
-本机第二轮已将受保护验收副本更新为SHA256 `987018ac8168f6ad6170d520637a574a8dc470eb49e3c3bdaafc43b33b44e17a`。构建传输补修版后，可在同一终端明确替换这个已核对的旧副本并重跑：
+本机第三轮已将受保护验收副本更新为SHA256 `a67ecbff53ad0b44c7883af6c9286d5130df4f239f2a0742b9b4aecc37ab3f14`，并真实启动采集。此次补修仅涉及Python合成操作脚本；二进制未变且副本一致时，不需重复准备或替换，在同一终端继续运行：
 
 ```sh
 sudo -v
-python3 -B scripts/validate-prepare-collector.py --binary target/release/codeperimeter --replace-sha256 987018ac8168f6ad6170d520637a574a8dc470eb49e3c3bdaafc43b33b44e17a
 python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
 ```
-
-指定旧hash仅适用于已核对的上述副本；检查失败保留原副本，不自动停止或卸载服务。
 
 这条观察路线使用系统 eslogger 的已有 ES 授权，不需要为本项目申请自有 ES 开发者签名。责任进程仍需要 FDA：终端／eslogger 探针成功不推导包装二进制或 launchd 已授权。实际错误包含 `permission_denied` 时，到系统设置检查责任进程；必要时给上述受保护 codeperimeter 副本和 eslogger 授予完全磁盘访问，再重试。不改 TCC 数据库、SIP、AMFI 或 sudoers。
 

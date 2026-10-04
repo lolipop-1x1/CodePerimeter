@@ -19,7 +19,7 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 
 ## Answer
 
-实现与两轮双轴源码定点复核已完成，PR此前已Ready。整票保持claimed：首跑失败后新源真实授权链路、桌面／后台验收与新head CI仍待；旧实现worktree归档受App保护，修复worktree暂保留，由主agent统一协调后续运行与清理。
+实现与历次补修的双轴独立复核已完成，PR保持可审查。整票保持claimed：第三次真实运行已确认指定匿名源码文件可读OPEN入库及可信root桥接，但完整场景在mmap之前因操作端测试目录残留退出。该冲突和串联发现的tar附加成员问题已补修；九类完整覆盖、批量／归档告警、3秒、桌面／后台和持续性能仍需完整真实重跑。旧实现worktree归档受App保护，集成与修复树保留用于后续实测。本轮远端CI结果以PR检查回读为准。
 
 - `tests/end_to_end.rs` 运行真实 CLI→普通用户 daemon→SQLite：手动目录、匿名 Codex／Claude 元信息合并、预览后新增历史不扩大范围、同库重启回查／移除；独立用例验证普通用户启动 collector 被拒绝。采集源刻意不可用，不冒充 ES。
 - `scripts/validate-prepare-collector.py --binary target/release/codeperimeter` 只在用户终端显式 `sudo -v` 后准备 root-owned `/Library/CodePerimeter/<uid>/codeperimeter`，检查 root 父路径、写 ACL、来源权限和复制 SHA256，默认拒绝已有目标；仅无launchd安装的验收副本可明确旧hash安全替换，root发布时重查完整路径／ACL、旧新hash与无活动端点／进程／plist／loaded jobs；不创建 job、不改 FDA。
@@ -65,3 +65,8 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 - Standards 的低优先级重复编码建议已处理：frame JSON 编码、MAX_FRAME_BYTES 与换行集中到私有最小 encode_frame，普通阻塞写与可取消分段写仍保留各自策略。没有修改事件、SQLite schema、验收脚本、权限或部署流程。定点回归 lib 10＋runtime_host 10＋service_collector 12 通过，另 1 个 ignored 信号 worker 由受控子进程信号用例实际调用；fmt、strict all-target clippy、diff 检查通过。Python 未改，沿用冻结候选的 20 项证据，无重复运行。此处只报告实现者修复与组件证据，原两轴复核仍待；新版真实 ES／项目读取／九类／3 秒／后台等仍待实机，06 保持 claimed。
 
 - 2026-10-04统一补修 `46dd68f616050cdf6f21210a8fdce8e32f2f7f17` 原两轴定点复核完成：Standards原heuristic关闭，hard0／heuristic0；Spec原P2关闭，剩余可证缺陷0／scope creep0。独立UID错误反例同时保留unavailable与identity_rejected、未接受连接／无run_id，Stop 0.232秒并回收自身进程。merger已ff合入集成，HEAD／tree与实现者一致。主agent在606全Rust78通过／1监督helper调用，46定点回归通过；release SHA256 `a67ecbff53ad0b44c7883af6c9286d5130df4f239f2a0742b9b4aecc37ab3f14` 已复制并校验。系统副本仍987，未部署新源；新head CI与实机重跑待验，06保持claimed，PR暂Draft。详见[审查记录](../code-review.md)。
+
+
+- 2026-10-05 第三次真实运行与操作端补修：原匿名摘要 `codeperimeter-validation-hu3qx44e` 使用a67版本，root／桥接身份verified、指定普通源码可读OPEN已持久化，real_source_confirmed=true；观察3,680条系统事件，保存open5／close5，本地两级丢弃及数据库缺口0，root清理完成。但仅2.765秒即在synthetic_scenario_matrix失败，mmap发送器退出2，没有告警时效或长期稳定性结论。原因是matrix成功后残留.event-matrix，违反sender严格项目清单；相同Python3.12.12普通权限已复现。
+- 唯一实现者从2f38c95补修至 `d4cdc40f96057345a135637f454dd229e85f46bc`（tree `3e3a4678dfdcb18a9b89d9af9e3e88418fbbd4eb`）：matrix成功后只unlink已知renamed.txt及rmdir自建空目录，未知条目不删除。完整匿名顺序进一步发现macOS tar默认AppleDouble附加文件；仅对子tar设置COPYFILE_DISABLE=1，保留原argv、父环境、严格55源码成员及全部正文校验，不增加不受支持的parser参数。只改scripts/synthetic_sender.py、validate-mvp.py、validate-selftest.py和tests/test_synthetic_sender.py；Rust／权限／健康／3000ms裁决未改，a67构建与系统副本一致，无需重建或替换。
+- 修前matrix→mmap准确失败；显式合成xattr的tar inside／temporary均失败。修后Python3.12.12验收自测24项、发送器9项通过，最终增强tar正文断言的单用例通过；AST／diff通过。独立Standards hard0／heuristic0，Spec可证缺陷0／scope creep0；独立完整原始顺序、预加载后源码路径缺失仍可释放、归档两位置55正文、父环境／源xattr保留、未知符号链接保护及严格cleanup通过。merger快进合入d4并核对HEAD/tree及两树干净，未部署、改FDA、安装launchd或注销重启。真实完整场景仍待，06保持claimed。
