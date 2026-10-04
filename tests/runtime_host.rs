@@ -888,3 +888,134 @@ fn source_versions_and_structured_gaps_are_queryable_by_run_after_restart() {
     assert_eq!(events[0]["event"]["source_message_version"], 10);
     stop_host(&control_socket, host);
 }
+
+#[test]
+fn collector_burst_preserves_data_order_and_terminal_diagnostic() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = fixture();
+    let project = temp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let file = project.join("anonymous.txt");
+    fs::write(&file, b"anonymous").unwrap();
+    let runtime = options(temp.path());
+    let control_socket = runtime.control_socket.clone();
+    let source = SyntheticSource::start(&runtime.collector_socket);
+    let host = start_host(runtime);
+    wait_for_socket(&control_socket);
+    source.wait_connected();
+    let _: Value = query(
+        &control_socket,
+        ControlRequest::AddDirectories {
+            entries: vec![DirectoryImport {
+                path: project,
+                sources: vec!["manual".into()],
+            }],
+        },
+    );
+    for sequence in 1..=512 {
+        source.send(open_frame(&file, 900, 1, sequence));
+    }
+    source.send(CollectorFrame::Status {
+        run_id: "synthetic-run-01".into(),
+        state: "permission_denied".into(),
+        message: "匿名生命周期诊断".into(),
+        dropped_lines: 0,
+    });
+    wait_until(
+        || {
+            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+            status.persisted_events_by_kind["open"] == 512
+                && status.collector_state == "permission_denied"
+        },
+        "超过两级队列容量的突发及最后诊断均不得静默丢失",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.reader_dropped_frames, 0);
+    let rows: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryEvents {
+            filter: EventFilter {
+                limit: 100,
+                ..EventFilter::default()
+            },
+        },
+    );
+    let sequences: Vec<u64> = rows
+        .iter()
+        .map(|row| row["event"]["global_seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(sequences, (413..=512).rev().collect::<Vec<_>>());
+    let health: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryHealth {
+            filter: HealthFilter {
+                component: Some("eslogger".into()),
+                ..HealthFilter::default()
+            },
+        },
+    );
+    assert!(
+        !health
+            .iter()
+            .any(|row| row["record"]["code"] == "global_sequence_gap")
+    );
+    source.stop();
+    stop_host(&control_socket, host);
+}
+
+#[test]
+fn stalled_source_has_explicit_unknown_coverage_health_and_recovers() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = fixture();
+    let runtime = options(temp.path());
+    let control_socket = runtime.control_socket.clone();
+    let source = SyntheticSource::start(&runtime.collector_socket);
+    let host = start_host(runtime);
+    wait_for_socket(&control_socket);
+    source.wait_connected();
+    source.send(CollectorFrame::Heartbeat {
+        run_id: "anonymous-idle-run".into(),
+        dropped_lines: 0,
+    });
+    wait_until(
+        || {
+            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+            status.collector_state == "stalled"
+        },
+        "持续无心跳时必须报告来源停滞",
+    );
+    let health: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryHealth {
+            filter: HealthFilter {
+                component: Some("collector".into()),
+                ..HealthFilter::default()
+            },
+        },
+    );
+    assert!(
+        health
+            .iter()
+            .any(|row| row["record"]["code"] == "collector_frame_timeout"
+                && row["record"]["state"] == "gap")
+    );
+    source.send(CollectorFrame::Heartbeat {
+        run_id: "anonymous-idle-run".into(),
+        dropped_lines: 0,
+    });
+    wait_until(
+        || {
+            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+            status.collector_state == "connected"
+        },
+        "新心跳恢复连接状态但不删除此前覆盖缺口",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.reader_dropped_frames, 0);
+    source.stop();
+    stop_host(&control_socket, host);
+}

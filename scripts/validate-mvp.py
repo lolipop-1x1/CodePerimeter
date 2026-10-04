@@ -51,6 +51,12 @@ class CollectorStartupError(RuntimeError):
     pass
 
 
+class BridgeIdentityError(CollectorStartupError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__("采集桥接身份核验失败：" + code + "；拒绝控制未经本次启动确认的进程")
+
+
 def startup_diagnostics(stream, codes):
     # 只保存白名单静态分类，原 stderr 持续有界排空，不保存原文或全系统事件。
     patterns = (("root 服务文件或父目录可被普通用户修改", "unsafe_root_path"),
@@ -72,16 +78,41 @@ def startup_diagnostics(stream, codes):
     stream.close()
 
 
-def wait_for_bridge(control_socket, launcher, collector):
-    def ready():
+def wait_for_bridge(control_socket, launcher, collector, diagnostics=None, timeout=15):
+    diagnostics = diagnostics if diagnostics is not None else {}
+    diagnostics.update(result="waiting", reason="bridge_status_unavailable", status_received=False, run_id_present=False)
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
         code = launcher.poll()
         if code is not None:
+            diagnostics.update(result="failed", reason="collector_exited")
             raise CollectorStartupError(f"root collector 在连接前退出，退出码 {code}；见 root_startup 静态诊断")
-        return bridge_identity(control(control_socket, "status"), launcher, collector)
-    return wait_for(ready)
+        try:
+            status = control(control_socket, "status")
+        except (OSError, ValueError, RuntimeError):
+            diagnostics["reason"] = "bridge_status_unavailable"
+            time.sleep(.1)
+            continue
+        diagnostics.update(status_received=True, run_id_present=bool(status.get("collector_run_id")))
+        if not status.get("collector_run_id"):
+            diagnostics["reason"] = "bridge_run_id_missing"
+            time.sleep(.1)
+            continue
+        try:
+            identity = bridge_identity(status, launcher, collector)
+        except BridgeIdentityError as error:
+            diagnostics.update(result="failed", reason=error.code)
+            raise
+        if identity:
+            diagnostics.update(result="verified", reason="root_pid_path_group_and_sudo_ancestry_verified")
+            return identity
+        diagnostics["reason"] = "collector_exited"
+        time.sleep(.1)
+    diagnostics["result"] = "timeout"
+    raise TimeoutError("采集桥接等待超时：" + diagnostics["reason"] + "；没有使用 fixture")
 
 
-def wait_for(callback, timeout=15):
+def wait_for(callback, timeout=15, timeout_message="等待真实宿主／采集事件超时；没有使用 fixture"):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         try:
@@ -93,7 +124,7 @@ def wait_for(callback, timeout=15):
         except (OSError, ValueError, RuntimeError):
             pass
         time.sleep(0.1)
-    raise TimeoutError("等待真实宿主／采集事件超时；没有使用 fixture")
+    raise TimeoutError(timeout_message)
 
 
 def check_root_chain(path):
@@ -383,13 +414,22 @@ def process_info(pid):
 
 
 def bridge_identity(status, launcher, collector):
-    matched = re.fullmatch(r"eslogger-([1-9][0-9]*)-([0-9]+)", status.get("collector_run_id") or "")
-    if not matched or launcher.poll() is not None:
+    run_id = status.get("collector_run_id")
+    if not run_id or launcher.poll() is not None:
         return None
+    matched = re.fullmatch(r"eslogger-([1-9][0-9]*)-([0-9]+)", run_id)
+    if not matched:
+        raise BridgeIdentityError("invalid_run_id")
     pid = int(matched[1])
     info = process_info(pid)
-    if not info or info[0] != 0 or info[2] != pid or Path(info[3]) != collector:
-        raise RuntimeError("认证来源中的 collector PID／root 身份／自有进程组不符")
+    if not info:
+        raise BridgeIdentityError("collector_process_missing")
+    if info[0] != 0:
+        raise BridgeIdentityError("collector_not_root")
+    if info[2] != pid:
+        raise BridgeIdentityError("collector_process_group_mismatch")
+    if Path(info[3]) != collector:
+        raise BridgeIdentityError("collector_executable_mismatch")
     parent = pid
     for _ in range(8):
         if parent == launcher.pid:
@@ -398,7 +438,7 @@ def bridge_identity(status, launcher, collector):
         if not current or current[1] <= 1:
             break
         parent = current[1]
-    raise RuntimeError("认证 collector 不是本次 sudo 启动的后代，拒绝控制已有服务")
+    raise BridgeIdentityError("collector_sudo_ancestry_mismatch")
 
 
 def stop_root(bridge, launcher):
@@ -445,6 +485,7 @@ def start_preloaded(workspace):
 
 
 def run(args, report, summary):
+    summary["phase"] = "preflight"
     binary = args.binary.resolve()
     collector = args.collector_binary or Path(f"/Library/CodePerimeter/{os.getuid()}/codeperimeter")
     collector_socket = Path(f"/Library/CodePerimeter/{os.getuid()}/run/collector.sock")
@@ -452,6 +493,7 @@ def run(args, report, summary):
     if args.preflight_only:
         summary["result"] = "preflight_passed_real_run_not_started"
         return 0
+    summary["phase"] = "synthetic_project_prepare"
     workspace, host = report / "workspace", report / "host"
     host.mkdir(mode=0o700)
     control_socket, database = host / "host.sock", host / "events.sqlite"
@@ -464,12 +506,14 @@ def run(args, report, summary):
     operations = []
     startup_codes, startup_reader = [], None
     try:
+        summary["phase"] = "host_startup"
         daemon = subprocess.Popen([str(binary), "daemon", "--socket", str(collector_socket), "--control-socket", str(control_socket), "--db", str(database)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         wait_for(lambda: control(control_socket, "status"))
         control(control_socket, "add_directories", {"entries": [{"path": str(project), "sources": ["manual"]}]})
         configured = control(control_socket, "list_directories")
         if len(configured) != 1 or Path(configured[0]["path"]) != project:
             raise RuntimeError("匿名监控配置不是唯一合成项目，拒绝继续")
+        summary["phase"] = "collector_startup"
         root_process = subprocess.Popen(["/usr/bin/sudo", "-n", str(collector), "collector", "--socket", str(collector_socket), "--allowed-uid", str(os.getuid())], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         startup_reader = threading.Thread(target=startup_diagnostics, args=(root_process.stderr, startup_codes), daemon=True)
         startup_reader.start()
@@ -477,16 +521,21 @@ def run(args, report, summary):
         monitor = threading.Thread(target=performance, args=([root_process, daemon, notifier], stop_sampling, samples), daemon=True)
         monitor.start()
         # 桥接 connected 不等于实际 ES 可读；先要求真实合成文件事件。
-        bridge = wait_for_bridge(control_socket, root_process, collector)
+        summary["phase"] = "bridge_identity"
+        summary["bridge_identity"] = {}
+        bridge = wait_for_bridge(control_socket, root_process, collector, summary["bridge_identity"])
         initial = control(control_socket, "status")
+        summary["phase"] = "first_synthetic_read"
         operations.append({"scenario": "read", "scope": "inside", "metadata": sender(workspace, "read")})
         read_pids = {row["pid"] for row in operations[0]["metadata"] if row.get("pid")}
         wait_for(lambda: any(event["process"]["pid"] in read_pids
                              and event["kind"] in ("open", "mmap")
                              and event["file"].get("readable") is True
                              and Path(event["file"]["path"]).parent == project / "src"
-                             for event in load_evidence(database)["events"] if event.get("file")), 15)
+                             for event in load_evidence(database)["events"] if event.get("file")), 15,
+                 "首条合成读取事件超时；身份核验与项目读取分别验收，没有使用 fixture")
         summary["real_source_confirmed"] = True
+        summary["phase"] = "synthetic_scenario_matrix"
         preloaded.stdin.write("release\n")
         preloaded.stdin.flush()
         preloaded.wait(timeout=30)
@@ -506,6 +555,7 @@ def run(args, report, summary):
                 operations[-1]["notification_queue_drained"] = True
             except TimeoutError:
                 operations[-1]["notification_queue_drained"] = False
+        summary["phase"] = "evidence_analysis"
         time.sleep(3)
         final_status = control(control_socket, "status")
         evidence = load_evidence(database)
@@ -520,6 +570,7 @@ def run(args, report, summary):
             "health_counts": dict(Counter(row["code"] for row in evidence["health"])),
             "degraded_health_records": sum(row["state"] in ("degraded", "gap", "failed", "error", "permission_denied", "coverage_gap") for row in evidence["health"]),
         }
+        summary["phase"] = "controlled_disconnect"
         summary["collector_stopped"] = stop_root(bridge, root_process)
         time.sleep(1.5)
         fault_status = control(control_socket, "status")
@@ -528,6 +579,7 @@ def run(args, report, summary):
         verification = summary["verification"]
         healthy = final_status["database_state"] == "ready" and not any(summary["coverage"][field] for field in ("collector_dropped_lines", "reader_dropped_frames", "database_gap_events", "degraded_health_records"))
         passed = healthy and summary["collector_stopped"] and summary["controlled_disconnect"]["observed"] and all(case["passed"] for case in verification["cases"]) and verification["nine_event_aggregate_passed"] and verification["generation_latency"]["within_3000_ms"] and verification["notification_send_latency"]["within_3000_ms"]
+        summary["phase"] = "completed"
         summary["result"] = "real_run_passed_display_and_boot_pending" if passed else "real_run_failed_or_partial"
         return 0 if passed else 1
     finally:
@@ -537,6 +589,11 @@ def run(args, report, summary):
             try:
                 save(report / "failure-or-final-evidence.json", load_evidence(database))
                 summary["last_status"] = control(control_socket, "status")
+                summary["source_observation"] = {
+                    "system_events_observed": sum(summary["last_status"]["observed_events_by_kind"].values()) > 0,
+                    "synthetic_project_read_confirmed": summary["real_source_confirmed"],
+                    "method": "系统事件计数与指定合成进程可读文件事件分别报告",
+                }
             except (OSError, RuntimeError, ValueError, sqlite3.Error):
                 summary["evidence_read_gap"] = True
         if preloaded.poll() is None:
@@ -558,6 +615,7 @@ def run(args, report, summary):
                                    "stderr_complete": startup_reader is not None and not startup_reader.is_alive(),
                                    "method": "最多8种白名单静态分类；原stderr不落盘"}
         summary["artifacts_retained"] = "保留匿名证据与合成项目供回查；未删除用户数据或修改服务配置"
+        save(report / "operations.json", operations)
 
 
 def main():
@@ -585,7 +643,7 @@ def main():
         code = run(args, report, summary)
     except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError, sqlite3.Error, KeyError, KeyboardInterrupt) as error:
         summary["result"] = "failed_no_fixture_fallback"
-        summary["failure"] = {"type": type(error).__name__, "message": str(error).replace(str(REPO), "<repo>").replace(str(Path.home()), "<home>")}
+        summary["failure"] = {"phase": summary.get("phase", "not_started"), "code": getattr(error, "code", None), "type": type(error).__name__, "message": str(error).replace(str(REPO), "<repo>").replace(str(Path.home()), "<home>")}
         code = 2
     if summary.get("root_cleanup_complete") is False:
         summary["result"] = "failed_root_cleanup_incomplete"

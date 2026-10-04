@@ -268,3 +268,46 @@ fn generated_plists_pass_native_plutil() {
         );
     }
 }
+
+#[test]
+fn partial_frame_survives_a_transient_read_timeout() {
+    let (_directory, listener, path) = test_listener();
+    let frame = CollectorFrame::Heartbeat {
+        run_id: "test-only-partial-run".into(),
+        dropped_lines: 0,
+    };
+    let expected = frame.clone();
+    let producer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let bytes = serde_json::to_vec(&frame).unwrap();
+        stream.write_all(&bytes[..20]).unwrap();
+        thread::sleep(std::time::Duration::from_millis(3300));
+        stream.write_all(&bytes[20..]).unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+    let mut client = CollectorClient::connect_expected(&path, unsafe { libc::geteuid() }).unwrap();
+    let timeout = client.read_frame().unwrap_err();
+    assert!(matches!(
+        timeout.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ));
+    loop {
+        match client.read_frame() {
+            Ok(frame) => {
+                assert_eq!(frame, expected);
+                break;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("暂时超时后不得丢弃半帧：{error}"),
+        }
+    }
+    assert_eq!(
+        client.read_frame().unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    producer.join().unwrap();
+}

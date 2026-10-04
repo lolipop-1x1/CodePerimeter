@@ -154,6 +154,54 @@ class ValidationStartupTests(unittest.TestCase):
             control.assert_not_called()
 
 
+class ValidationBridgeIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.collector = Path("/Library/CodePerimeter/501/codeperimeter")
+        self.launcher = SimpleNamespace(pid=100, poll=lambda: None)
+        self.status = {"collector_run_id": "eslogger-200-1791123401112"}
+        self.processes = {200: (0, 150, 200, str(self.collector)), 150: (0, 100, 150, "/usr/bin/sudo")}
+
+    def identity(self, status=None):
+        with patch.object(validation, "process_info", side_effect=lambda pid: self.processes.get(pid)), patch.object(validation, "children", return_value=[201]):
+            return validation.bridge_identity(status or self.status, self.launcher, self.collector)
+
+    def test_exact_root_path_group_and_this_sudo_ancestry_are_required(self):
+        self.assertEqual(self.identity()["pid"], 200)
+        for code, process in (
+            ("collector_not_root", (501, 150, 200, str(self.collector))),
+            ("collector_process_group_mismatch", (0, 150, 150, str(self.collector))),
+            ("collector_executable_mismatch", (0, 150, 200, "/private/tmp/unknown-secret")),
+            ("collector_sudo_ancestry_mismatch", (0, 1, 200, str(self.collector))),
+            ("collector_process_missing", None),
+        ):
+            with self.subTest(code=code):
+                self.processes[200] = process
+                with self.assertRaises(validation.BridgeIdentityError) as result:
+                    self.identity()
+                self.assertEqual(result.exception.code, code)
+                self.assertNotIn("unknown-secret", str(result.exception))
+        with self.assertRaisesRegex(validation.BridgeIdentityError, "invalid_run_id"):
+            self.identity({"collector_run_id": "unknown-private-marker"})
+
+    def test_wait_never_swallows_identity_rejection_into_timeout(self):
+        diagnostics = {}
+        with patch.object(validation, "control", return_value=self.status), patch.object(validation, "bridge_identity", side_effect=validation.BridgeIdentityError("collector_not_root")):
+            with self.assertRaises(validation.BridgeIdentityError):
+                validation.wait_for_bridge(Path("/anonymous.sock"), self.launcher, self.collector, diagnostics)
+        self.assertEqual(diagnostics["reason"], "collector_not_root")
+        self.assertEqual(diagnostics["result"], "failed")
+
+    def test_missing_run_id_and_unavailable_status_have_distinct_anonymous_diagnostics(self):
+        for value, code in (({}, "bridge_run_id_missing"), (OSError("unknown-private-marker"), "bridge_status_unavailable")):
+            diagnostics = {}
+            kwargs = {"side_effect": value} if isinstance(value, OSError) else {"return_value": value}
+            with patch.object(validation, "control", **kwargs):
+                with self.assertRaisesRegex(TimeoutError, code):
+                    validation.wait_for_bridge(Path("/anonymous.sock"), self.launcher, self.collector, diagnostics, timeout=.01)
+            self.assertEqual(diagnostics["reason"], code)
+            self.assertNotIn("unknown-private-marker", str(diagnostics))
+
+
 class ProtectedReplacementTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

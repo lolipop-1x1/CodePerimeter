@@ -502,7 +502,7 @@ fn run_daemon_inner(
     let (sender, receiver) = mpsc::sync_channel(COLLECTOR_QUEUE_CAPACITY);
     let reader_dropped_frames = Arc::new(AtomicU64::new(0));
     let reader_stopping = Arc::new(AtomicBool::new(false));
-    spawn_collector_reader(
+    let reader = spawn_collector_reader(
         options.collector_socket.clone(),
         expected_collector_uid,
         sender,
@@ -573,9 +573,31 @@ fn run_daemon_inner(
         }
     }
     reader_stopping.store(true, Ordering::Relaxed);
+    drop(receiver);
+    reader
+        .join()
+        .map_err(|_| io::Error::other("采集读取线程异常退出"))?;
     drop(listener);
     let _ = fs::remove_file(&options.control_socket);
     Ok(())
+}
+
+fn send_reader_message(
+    sender: &mpsc::SyncSender<ReaderMessage>,
+    mut message: ReaderMessage,
+    stopping: &AtomicBool,
+) -> bool {
+    while !stopping.load(Ordering::Relaxed) {
+        match sender.try_send(message) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Full(pending)) => {
+                message = pending;
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+    }
+    false
 }
 
 fn spawn_collector_reader(
@@ -584,46 +606,127 @@ fn spawn_collector_reader(
     sender: mpsc::SyncSender<ReaderMessage>,
     dropped: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut last_state = String::new();
         while !stopping.load(Ordering::Relaxed) {
             let mut client = match CollectorClient::connect_expected(&socket_path, expected_uid) {
                 Ok(client) => {
                     if last_state != "connected" {
-                        let _ = sender.try_send(ReaderMessage::State {
-                            state: "connected".into(),
-                            code: "collector_connected".into(),
-                        });
+                        if !send_reader_message(
+                            &sender,
+                            ReaderMessage::State {
+                                state: "connected".into(),
+                                code: "collector_connected".into(),
+                            },
+                            &stopping,
+                        ) {
+                            return;
+                        }
                         last_state = "connected".into();
                     }
                     client
                 }
-                Err(_) => {
+                Err(error) => {
                     if last_state != "reconnecting" {
-                        let _ = sender.try_send(ReaderMessage::State {
-                            state: "reconnecting".into(),
-                            code: "collector_unavailable".into(),
-                        });
+                        if !send_reader_message(
+                            &sender,
+                            ReaderMessage::State {
+                                state: "reconnecting".into(),
+                                code: if error.kind() == io::ErrorKind::PermissionDenied {
+                                    "collector_identity_rejected"
+                                } else {
+                                    "collector_unavailable"
+                                }
+                                .into(),
+                            },
+                            &stopping,
+                        ) {
+                            return;
+                        }
                         last_state = "reconnecting".into();
                     }
                     thread::sleep(Duration::from_millis(250));
                     continue;
                 }
             };
+            let mut last_frame_at = Instant::now();
             while !stopping.load(Ordering::Relaxed) {
                 match client.read_frame() {
                     Ok(frame) => {
-                        if sender.try_send(ReaderMessage::Frame(frame)).is_err() {
-                            dropped.fetch_add(1, Ordering::Relaxed);
+                        last_frame_at = Instant::now();
+                        if last_state == "stalled" {
+                            if !send_reader_message(
+                                &sender,
+                                ReaderMessage::State {
+                                    state: "connected".into(),
+                                    code: "collector_stream_resumed".into(),
+                                },
+                                &stopping,
+                            ) {
+                                return;
+                            }
+                            last_state = "connected".into();
+                        }
+                        if !send_reader_message(&sender, ReaderMessage::Frame(frame), &stopping) {
+                            return;
                         }
                     }
-                    Err(_) => {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        // 系统桥接每秒有心跳；暂时拥塞保留连接，持续无帧另报覆盖未知。
+                        if last_frame_at.elapsed() >= Duration::from_secs(3)
+                            && last_state != "stalled"
+                        {
+                            if !send_reader_message(
+                                &sender,
+                                ReaderMessage::State {
+                                    state: "stalled".into(),
+                                    code: "collector_frame_timeout".into(),
+                                },
+                                &stopping,
+                            ) {
+                                return;
+                            }
+                            last_state = "stalled".into();
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        if !send_reader_message(
+                            &sender,
+                            ReaderMessage::State {
+                                state: "coverage_gap".into(),
+                                code: "collector_invalid_frame".into(),
+                            },
+                            &stopping,
+                        ) {
+                            return;
+                        }
+                    }
+                    Err(error) => {
                         if last_state != "reconnecting" {
-                            let _ = sender.try_send(ReaderMessage::State {
-                                state: "reconnecting".into(),
-                                code: "collector_disconnected".into(),
-                            });
+                            if !send_reader_message(
+                                &sender,
+                                ReaderMessage::State {
+                                    state: "reconnecting".into(),
+                                    code: if error.kind() == io::ErrorKind::UnexpectedEof {
+                                        "collector_eof"
+                                    } else {
+                                        "collector_read_error"
+                                    }
+                                    .into(),
+                                },
+                                &stopping,
+                            ) {
+                                return;
+                            }
                             last_state = "reconnecting".into();
                         }
                         break;
@@ -632,7 +735,7 @@ fn spawn_collector_reader(
             }
             thread::sleep(Duration::from_millis(100));
         }
-    });
+    })
 }
 
 fn accept_control(listener: &UnixListener, state: &mut DaemonState) -> Result<bool> {
@@ -896,8 +999,12 @@ impl DaemonState {
                 self.write_health(
                     "collector",
                     &code,
-                    &state,
-                    "采集器连接状态变化；覆盖以状态记录为准。",
+                    if state == "stalled" { "gap" } else { &state },
+                    if state == "stalled" {
+                        "连续三秒未收到帧或心跳；连接保留，来源覆盖未知。"
+                    } else {
+                        "采集器连接状态变化；覆盖以状态记录为准。"
+                    },
                 );
             }
             ReaderMessage::Frame(frame) => self.handle_frame(frame),
@@ -1698,5 +1805,124 @@ impl NotificationSender for OsascriptSender {
             let _ = (title, body);
             Err(io::Error::new(io::ErrorKind::Unsupported, "系统通知仅支持 macOS").into())
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    #[test]
+    fn reader_distinguishes_idle_stall_recovery_invalid_frame_and_eof_and_joins_on_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("collector.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicU64::new(0));
+        let reader = spawn_collector_reader(
+            path,
+            unsafe { libc::geteuid() },
+            sender,
+            Arc::clone(&drops),
+            Arc::clone(&stopping),
+        );
+        let (mut stream, _) = listener.accept().unwrap();
+        assert!(
+            matches!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReaderMessage::State { code, .. } if code == "collector_connected")
+        );
+        let heartbeat = CollectorFrame::Heartbeat {
+            run_id: "anonymous".into(),
+            dropped_lines: 0,
+        };
+        crate::service::write_frame(&mut stream, &heartbeat).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReaderMessage::Frame(_)
+        ));
+        assert!(
+            matches!(receiver.recv_timeout(Duration::from_secs(4)).unwrap(),
+            ReaderMessage::State { state, code } if state == "stalled" && code == "collector_frame_timeout")
+        );
+        crate::service::write_frame(&mut stream, &heartbeat).unwrap();
+        assert!(
+            matches!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReaderMessage::State { code, .. } if code == "collector_stream_resumed")
+        );
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReaderMessage::Frame(_)
+        ));
+        stream
+            .write_all(b"anonymous-invalid-private-marker\n")
+            .unwrap();
+        assert!(
+            matches!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReaderMessage::State { state, code } if state == "coverage_gap" && code == "collector_invalid_frame")
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        drop(stream);
+        assert!(
+            matches!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReaderMessage::State { code, .. } if code == "collector_eof")
+        );
+        stopping.store(true, Ordering::Relaxed);
+        drop(receiver);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn queued_lifecycle_message_waits_for_capacity_and_stop_cancels_backpressure() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(ReaderMessage::State {
+                state: "connected".into(),
+                code: "collector_connected".into(),
+            })
+            .unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
+        let worker = thread::spawn(move || {
+            send_reader_message(
+                &sender,
+                ReaderMessage::State {
+                    state: "reconnecting".into(),
+                    code: "collector_eof".into(),
+                },
+                &worker_stopping,
+            )
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(!worker.is_finished());
+        receiver.recv().unwrap();
+        assert!(worker.join().unwrap());
+        assert!(
+            matches!(receiver.recv().unwrap(), ReaderMessage::State { code, .. } if code == "collector_eof")
+        );
+
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        sender
+            .send(ReaderMessage::Frame(CollectorFrame::Heartbeat {
+                run_id: "anonymous".into(),
+                dropped_lines: 0,
+            }))
+            .unwrap();
+        let worker_stopping = Arc::clone(&stopping);
+        let worker = thread::spawn(move || {
+            send_reader_message(
+                &sender,
+                ReaderMessage::Frame(CollectorFrame::Heartbeat {
+                    run_id: "anonymous".into(),
+                    dropped_lines: 0,
+                }),
+                &worker_stopping,
+            )
+        });
+        thread::sleep(Duration::from_millis(20));
+        stopping.store(true, Ordering::Relaxed);
+        assert!(!worker.join().unwrap());
     }
 }

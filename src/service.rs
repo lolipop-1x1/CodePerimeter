@@ -49,25 +49,34 @@ pub enum CollectorFrame {
 
 /// 读取直到换行；超限行继续排空但不继续分配内存。
 pub fn read_bounded_line(reader: &mut impl BufRead, maximum: usize) -> io::Result<Option<Vec<u8>>> {
-    let mut bytes = Vec::new();
-    let mut oversized = false;
+    read_buffered_line(reader, maximum, &mut Vec::new(), &mut false)
+}
+
+fn read_buffered_line(
+    reader: &mut impl BufRead,
+    maximum: usize,
+    bytes: &mut Vec<u8>,
+    oversized: &mut bool,
+) -> io::Result<Option<Vec<u8>>> {
     loop {
+        // 暂时超时不会丢弃已经消费的半帧；下一次读取从同一缓冲继续。
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            if oversized {
+            if *oversized {
+                *oversized = false;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "输入行超过上限"));
             }
             return if bytes.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(bytes))
+                Ok(Some(std::mem::take(bytes)))
             };
         }
         let end = available.iter().position(|byte| *byte == b'\n');
         let count = end.map_or(available.len(), |position| position + 1);
-        if !oversized {
+        if !*oversized {
             if bytes.len().saturating_add(count) > maximum {
-                oversized = true;
+                *oversized = true;
                 bytes.clear();
             } else {
                 bytes.extend_from_slice(&available[..count]);
@@ -75,14 +84,15 @@ pub fn read_bounded_line(reader: &mut impl BufRead, maximum: usize) -> io::Resul
         }
         reader.consume(count);
         if end.is_some() {
-            if oversized {
+            if *oversized {
+                *oversized = false;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "输入行超过上限"));
             }
             bytes.pop();
             if bytes.last() == Some(&b'\r') {
                 bytes.pop();
             }
-            return Ok(Some(bytes));
+            return Ok(Some(std::mem::take(bytes)));
         }
     }
 }
@@ -138,6 +148,8 @@ pub fn verify_peer_uid(stream: &UnixStream, expected_uid: u32) -> io::Result<()>
 
 pub struct CollectorClient {
     reader: BufReader<UnixStream>,
+    partial_frame: Vec<u8>,
+    oversized_frame: bool,
 }
 
 impl CollectorClient {
@@ -165,15 +177,22 @@ impl CollectorClient {
         }
         let stream = UnixStream::connect(socket_path)?;
         verify_peer_uid(&stream, expected_uid)?;
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
         Ok(Self {
             reader: BufReader::new(stream),
+            partial_frame: Vec::new(),
+            oversized_frame: false,
         })
     }
 
     pub fn read_frame(&mut self) -> io::Result<CollectorFrame> {
-        let bytes = read_bounded_line(&mut self.reader, MAX_FRAME_BYTES + 1)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "采集连接已断开"))?;
+        let bytes = read_buffered_line(
+            &mut self.reader,
+            MAX_FRAME_BYTES + 1,
+            &mut self.partial_frame,
+            &mut self.oversized_frame,
+        )?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "采集连接已断开"))?;
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -376,7 +395,7 @@ fn produce_stdout(
     stdout: impl Read + Send + 'static,
     sender: mpsc::SyncSender<SourceItem>,
     drops: Arc<AtomicU64>,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
@@ -391,20 +410,29 @@ fn produce_stdout(
                     SourceItem::Status("oversized_line", "采集行超过上限，已跳过")
                 }
                 Err(_) => {
-                    let _ = sender.try_send(SourceItem::Status("source_error", "读取采集输出失败"));
+                    let _ = sender.send(SourceItem::Status("source_error", "读取采集输出失败"));
                     break;
                 }
             };
-            if sender.try_send(item).is_err() {
+            if matches!(
+                item,
+                SourceItem::Status("oversized_line" | "invalid_line", _)
+            ) {
                 drops.fetch_add(1, Ordering::Relaxed);
             }
+            // 队列满时给来源背压；退出时 receiver 被释放，阻塞发送随之结束。
+            if sender.send(item).is_err() {
+                return;
+            }
         }
-        // 生命周期标记使用有界阻塞发送，避免队列满时丢掉“源已停止”。
         let _ = sender.send(SourceItem::End);
-    });
+    })
 }
 
-fn produce_stderr(stderr: impl Read + Send + 'static, sender: mpsc::SyncSender<SourceItem>) {
+fn produce_stderr(
+    stderr: impl Read + Send + 'static,
+    sender: mpsc::SyncSender<SourceItem>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         while let Ok(Some(bytes)) = read_bounded_line(&mut reader, 16 * 1024) {
@@ -420,14 +448,54 @@ fn produce_stderr(stderr: impl Read + Send + 'static, sender: mpsc::SyncSender<S
                     "eslogger 报告诊断信息；原始 stderr 未保存",
                 )
             };
-            let _ = sender.try_send(item);
+            if sender.send(item).is_err() {
+                return;
+            }
         }
-    });
+    })
+}
+
+fn write_frame_cancellable(
+    stream: &mut UnixStream,
+    frame: &CollectorFrame,
+    stopping: &AtomicBool,
+) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(frame).map_err(io::Error::other)?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "采集 frame 超过上限",
+        ));
+    }
+    bytes.push(b'\n');
+    let mut written = 0;
+    while written < bytes.len() {
+        if stopping.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "采集正在停止"));
+        }
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "采集连接无法写入")),
+            Ok(count) => written += count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                // 保留写入偏移，暂时拥塞时不重发半帧、不伪造连接断开。
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn deliver(client: &mut Option<UnixStream>, frame: &CollectorFrame) -> bool {
     if let Some(stream) = client {
-        if write_frame(stream, frame).is_ok() {
+        if write_frame_cancellable(stream, frame, &COLLECTOR_STOP).is_ok() {
             return true;
         }
         *client = None;
@@ -513,7 +581,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
     };
     let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
     let drops = Arc::new(AtomicU64::new(0));
-    produce_stdout(
+    let stdout_reader = produce_stdout(
         source
             .child
             .stdout
@@ -522,7 +590,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
         sender.clone(),
         Arc::clone(&drops),
     );
-    produce_stderr(
+    let stderr_reader = produce_stderr(
         source
             .child
             .stderr
@@ -533,8 +601,8 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
     drop(sender);
     let mut client = None;
     let mut last_heartbeat = Instant::now();
-    let mut previous_drops = 0;
     let mut last_diagnostic = None;
+    let mut pending = None;
     while !COLLECTOR_STOP.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -546,7 +614,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
                         message: "采集桥接已连接；ES 事件完整性仍由宿主核验".into(),
                         dropped_lines: drops.load(Ordering::Relaxed),
                     };
-                    if write_frame(&mut stream, &frame).is_ok() {
+                    if write_frame_cancellable(&mut stream, &frame, &COLLECTOR_STOP).is_ok() {
                         client = Some(stream);
                     }
                 }
@@ -555,48 +623,46 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error.into()),
         }
-        match receiver.recv_timeout(Duration::from_millis(20)) {
-            Ok(SourceItem::Line(line, received_timestamp_ms)) => {
-                if !deliver(
-                    &mut client,
-                    &CollectorFrame::Line {
-                        run_id: run_id.clone(),
-                        line,
-                        received_timestamp_ms,
-                    },
-                ) {
-                    drops.fetch_add(1, Ordering::Relaxed);
+        if pending.is_none() {
+            match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok(item) => pending = Some(item),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        match pending.as_ref() {
+            Some(SourceItem::Line(line, received_timestamp_ms)) if client.is_some() => {
+                let frame = CollectorFrame::Line {
+                    run_id: run_id.clone(),
+                    line: line.clone(),
+                    received_timestamp_ms: *received_timestamp_ms,
+                };
+                if deliver(&mut client, &frame) {
+                    pending = None;
                 }
             }
-            Ok(SourceItem::Status(state, message)) => {
-                last_diagnostic = Some((state, message));
-                deliver(
+            Some(SourceItem::Status(state, message)) => {
+                last_diagnostic = Some((*state, *message));
+                if deliver(
                     &mut client,
                     &CollectorFrame::Status {
                         run_id: run_id.clone(),
-                        state: state.into(),
-                        message: message.into(),
+                        state: (*state).into(),
+                        message: (*message).into(),
                         dropped_lines: drops.load(Ordering::Relaxed),
                     },
-                );
+                ) {
+                    pending = None;
+                }
             }
-            Ok(SourceItem::End) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Some(SourceItem::End) => break,
+            Some(SourceItem::Line(_, _)) | None => {}
+        }
+        // 没有消费者时只保留一个待发送项，队列与管道持续有界，不消费后丢弃。
+        if pending.is_some() && client.is_none() {
+            thread::sleep(Duration::from_millis(20));
         }
         let dropped_lines = drops.load(Ordering::Relaxed);
-        if dropped_lines != previous_drops {
-            deliver(
-                &mut client,
-                &CollectorFrame::Status {
-                    run_id: run_id.clone(),
-                    state: "coverage_gap".into(),
-                    message: "无消费者、发送失败或队列过载导致桥接事件丢弃".into(),
-                    dropped_lines,
-                },
-            );
-            previous_drops = dropped_lines;
-        }
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             deliver(
                 &mut client,
@@ -621,10 +687,6 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
         dropped_lines: drops.load(Ordering::Relaxed),
     };
     deliver(&mut client, &stopped);
-    if COLLECTOR_STOP.load(Ordering::Relaxed) {
-        let _ = fs::remove_file(&options.socket_path);
-        return Ok(());
-    }
     // 退出前保留短暂状态窗口，让启动顺序较后的普通用户宿主看到 FDA／源故障。
     let diagnostic_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < diagnostic_deadline && !COLLECTOR_STOP.load(Ordering::Relaxed) {
@@ -646,7 +708,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
             if verify_peer_uid(&stream, options.allowed_uid).is_ok() {
                 stream.set_write_timeout(Some(Duration::from_millis(250)))?;
                 if let Some((state, message)) = last_diagnostic {
-                    let _ = write_frame(
+                    let _ = write_frame_cancellable(
                         &mut stream,
                         &CollectorFrame::Status {
                             run_id: run_id.clone(),
@@ -654,13 +716,18 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
                             message: message.into(),
                             dropped_lines: drops.load(Ordering::Relaxed),
                         },
+                        &COLLECTOR_STOP,
                     );
                 }
-                let _ = write_frame(&mut stream, &stopped);
+                let _ = write_frame_cancellable(&mut stream, &stopped, &COLLECTOR_STOP);
             }
         }
         thread::sleep(Duration::from_millis(20));
     }
+    // 先终止自有来源，再关闭接收端，释放满队列中的生产线程后回收。
+    drop(receiver);
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
     let _ = fs::remove_file(&options.socket_path);
     if COLLECTOR_STOP.load(Ordering::Relaxed) {
         Ok(())
@@ -1291,31 +1358,101 @@ mod tests {
     }
 
     #[test]
-    fn source_queue_is_bounded_and_reports_discarded_events() {
+    fn source_queue_preserves_a_burst_and_end_under_backpressure() {
         let (sender, receiver) = mpsc::sync_channel(2);
         let drops = Arc::new(AtomicU64::new(0));
-        produce_stdout(
+        let producer = produce_stdout(
             Cursor::new(b"one\ntwo\nthree\nfour\n".to_vec()),
             sender,
             Arc::clone(&drops),
         );
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while drops.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
-            thread::yield_now();
+        thread::sleep(Duration::from_millis(30));
+        for expected in ["one", "two", "three", "four"] {
+            let SourceItem::Line(line, _) = receiver.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("突发数据应保序传递");
+            };
+            assert_eq!(line, expected);
         }
-        assert_eq!(drops.load(Ordering::Relaxed), 2);
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            SourceItem::Line(_, _)
+            SourceItem::End
         ));
+        producer.join().unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rejected_source_line_keeps_a_visible_gap_and_lifecycle_marker() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let drops = Arc::new(AtomicU64::new(0));
+        let producer = produce_stdout(Cursor::new(vec![0xff, b'\n']), sender, Arc::clone(&drops));
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            SourceItem::Line(_, _)
+            SourceItem::Status("invalid_line", _)
         ));
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
             SourceItem::End
         ));
+        producer.join().unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn source_backpressure_ends_when_consumer_is_closed() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let producer = produce_stdout(
+            Cursor::new(b"one\ntwo\nthree\n".to_vec()),
+            sender,
+            Arc::new(AtomicU64::new(0)),
+        );
+        thread::sleep(Duration::from_millis(20));
+        assert!(!producer.is_finished());
+        drop(receiver);
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn partial_writes_survive_congestion_and_stop_releases_a_blocked_writer() {
+        let frame = CollectorFrame::Line {
+            run_id: "anonymous-run".into(),
+            line: "x".repeat(512 * 1024),
+            received_timestamp_ms: 100,
+        };
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let expected = frame.clone();
+        let producer = thread::spawn(move || {
+            write_frame_cancellable(&mut writer, &frame, &AtomicBool::new(false)).unwrap();
+        });
+        thread::sleep(Duration::from_millis(80));
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        producer.join().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<CollectorFrame>(&bytes).unwrap(),
+            expected
+        );
+
+        let (mut writer, _reader) = UnixStream::pair().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let writer_stopping = Arc::clone(&stopping);
+        let blocked = thread::spawn(move || {
+            write_frame_cancellable(&mut writer, &expected, &writer_stopping)
+        });
+        thread::sleep(Duration::from_millis(80));
+        assert!(!blocked.is_finished());
+        stopping.store(true, Ordering::Relaxed);
+        assert_eq!(
+            blocked.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
     }
 
     #[test]
