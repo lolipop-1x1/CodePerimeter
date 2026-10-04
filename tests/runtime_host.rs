@@ -154,6 +154,19 @@ fn query<T: DeserializeOwned>(socket: &Path, request: ControlRequest) -> T {
     serde_json::from_value(response.data.unwrap()).unwrap()
 }
 
+fn collector_eof_health(socket: &Path) -> Vec<Value> {
+    query(
+        socket,
+        ControlRequest::QueryHealth {
+            filter: HealthFilter {
+                component: Some("collector".into()),
+                code: Some("collector_eof".into()),
+                ..HealthFilter::default()
+            },
+        },
+    )
+}
+
 fn stop_host(socket: &Path, handle: JoinHandle<codeperimeter::Result<()>>) {
     let response = request_control(socket, ControlRequest::Stop).unwrap();
     assert!(response.ok);
@@ -434,13 +447,20 @@ fn selected_directory_events_trigger_alerts_once_and_reconnects_are_visible() {
     assert_eq!(burst_count, 3);
     assert_eq!(sender.messages.len(), 5);
 
+    let health_before = collector_eof_health(&control_socket)
+        .iter()
+        .map(|row| row["id"].as_i64().unwrap())
+        .max()
+        .unwrap_or(0);
     source.disconnect();
     wait_until(
         || {
-            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
-            status.collector_state == "reconnecting"
+            collector_eof_health(&control_socket).iter().any(|row| {
+                row["id"].as_i64().unwrap() > health_before
+                    && row["record"]["state"] == "reconnecting"
+            })
         },
-        "采集连接断开应显示重连状态",
+        "采集断线应留下新增的重连健康证据，查询不依赖瞬时状态",
     );
     source.wait_connected();
     source.send(CollectorFrame::Heartbeat {
@@ -1112,4 +1132,70 @@ fn reconnect_reason_changes_remain_visible_and_trusted_socket_recovers() {
     stop_host(&control_socket, host);
     assert!(before.elapsed() < Duration::from_secs(2));
     drop(stream);
+}
+
+#[test]
+fn fast_reconnect_preserves_disconnect_evidence_after_current_state_has_recovered() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = fixture();
+    let runtime = options(temp.path());
+    let control_socket = runtime.control_socket.clone();
+    let source = SyntheticSource::start(&runtime.collector_socket);
+    let host = start_host(runtime);
+    wait_for_socket(&control_socket);
+    source.wait_connected();
+    source.send(CollectorFrame::Heartbeat {
+        run_id: "anonymous-fast-run-01".into(),
+        dropped_lines: 0,
+    });
+    wait_until(
+        || {
+            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+            status.collector_run_id.as_deref() == Some("anonymous-fast-run-01")
+        },
+        "第一代匿名心跳应完成处理",
+    );
+    let before = collector_eof_health(&control_socket)
+        .iter()
+        .map(|row| row["id"].as_i64().unwrap())
+        .max()
+        .unwrap_or(0);
+
+    source.disconnect();
+    source.wait_connected();
+    source.send(CollectorFrame::Heartbeat {
+        run_id: "anonymous-fast-run-02".into(),
+        dropped_lines: 0,
+    });
+    wait_until(
+        || {
+            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+            status.collector_state == "connected"
+                && status.collector_run_id.as_deref() == Some("anonymous-fast-run-02")
+        },
+        "查询断线证据前，先确定第二代来源已经恢复",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_ne!(
+        status.collector_state, "reconnecting",
+        "快速恢复后，旧瞬时状态条件已经错过断线"
+    );
+    let health = collector_eof_health(&control_socket);
+    assert!(health.iter().any(
+        |row| row["id"].as_i64().unwrap() > before && row["record"]["state"] == "reconnecting"
+    ));
+    let health: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryHealth {
+            filter: HealthFilter {
+                code: Some("collector_restarted".into()),
+                ..HealthFilter::default()
+            },
+        },
+    );
+    assert!(!health.is_empty());
+    source.stop();
+    stop_host(&control_socket, host);
 }
