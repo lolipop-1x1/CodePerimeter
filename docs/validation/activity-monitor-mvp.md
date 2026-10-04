@@ -12,6 +12,8 @@
 
 2026-10-05 操作端补修 `d4cdc40`：九类worker成功后只删除已知重命名文件和自建空目录，既有目录与未知文件继续拒绝清理。完整普通用户顺序进一步复现macOS tar默认AppleDouble附加成员导致严格清单失败；仅对子tar设置 `COPYFILE_DISABLE=1`，保持父环境、argv及严格55个源码成员和全部正文校验。此开关以本机bsdtar3.5.3／libarchive3.7.4实际create为依据，不宣称所有版本兼容；PAX扩展属性仍可能保留。Python3.12.12验收自测24项、发送器9项通过，包含原始完整场景顺序、预加载释放、项目内／临时输出、正常操作、严格cleanup与未知文件保留。冻结候选 `d4cdc40` 的两轴独立复核：Standards hard0／heuristic0，Spec可证缺陷0／scope creep0；独立验证预加载后源码路径暂时缺失仍能完成内存压缩、完整场景顺序、未知符号链接保留与严格清理。这是操作端回归，不代替完整真实系统重跑；本轮远端CI结果以PR检查回读为准。
 
+2026-10-05 CI定点补修 `d277e3b`：b958的push CI成功（Rust79／发送器9／判定器24），PR CI在既有测试等待瞬时reconnecting时失败。合成来源立即重连，独立无sleep反例已证明恢复后旧状态条件会漏过断线；测试现以断线前健康记录ID为基线，要求新增collector_eof且state=reconnecting，并保留第二代心跳／run_id及重启检查。只改tests/runtime_host.rs，生产代码与真实3000ms裁决不变；runtime11项、fmt／严格clippy通过，Standards hard0／heuristic0、Spec缺陷0／scope creep0，独立反例通过。本轮新head的远端检查以PR回读为准。
+
 2026-10-04 集成基线 `5b93bc2`：62 项 Rust 测试通过、1 项信号 worker 由监督用例显式调用；8 项 Python 发送器测试通过，fmt 与严格 clippy 通过。06 验证分支在此基础上运行全部 64 项 Rust 测试通过、fmt／严格 clippy 通过；8 项 Python 发送器与 3 项验收计时判定器自测通过。新增两个实际 CLI→普通用户宿主→SQLite 用户流程／采集权限拒绝测试。它们刻意没有可用采集源，验证手动目录、固定历史快照导入、配置不随新历史扩张、宿主重启回查和权限边界。
 
 2026-10-04固定点审查补修：Rust全部目标69 passed／1 ignored监督helper、Python发送器8 passed、判定器9 passed；fmt、check与严格clippy通过。新增连接断开／读超时、宿主启动与定期保留故障、锁恢复后重启通知、来源版本／缺口回查与v1／v2迁移回归。以上是组件证据，完整系统待验项保持不变，详见 [审查记录](../../.scratch/activity-monitor-mvp/code-review.md)。

@@ -92,3 +92,18 @@ hard0／heuristic0。四文件全部hunk已核对；未知文件保留、匿名�
 可证缺陷0／scope creep0。独立原始CLI完整顺序、预加载后源码路径暂移仍能用内存完成压缩、两位置tar严格55成员及每份正文、源xattr／父环境、未知符号链接保护与严格cleanup均通过；审查自身测试进程及合成产物已清理。
 
 以上仅关闭操作端补修审查。原真实失败报告保持原样，真实九类项目覆盖、批量／归档告警、3秒生成／发送、到屏及后台仍待完整实机重跑。merger已快进合入d4，HEAD/tree与实现者一致；构建／系统副本均为a67，无需二进制替换。
+
+
+## CI快速重连测试定点复核
+
+2026-10-05固定点 `b9585549b8012271f214dc8bdb2e5770d827ea6b` → 候选 `d277e3b55f548516a525f11c1fcdebac1c4c7ea9`，tree `5294482177eb244cd6afc21cdf4f854bee736391`，diff为 `git diff b958554...d277e3b`，仅tests/runtime_host.rs。b958 push CI成功，PR CI在旧断线瞬时状态轮询失败；没有仅通过rerun略过该失败。唯一实现者的无sleep确定性反例已证明快速恢复后旧条件失败（connected／reconnecting，0.26秒），生产层持久EOF证据仍存在。
+
+### Standards
+
+hard0／heuristic0。断线前ID基线与新增EOF条件避免旧证据冒充；原第二代心跳／run_id和重启检查保留，新增反例不加sleep或延长等待。
+
+### Spec
+
+可证缺陷0／scope creep0，没有弱化断流可见性。独立单跑先恢复再回查反例1通过、0.42秒；断线要求匹配collector_eof、reconnecting且ID大于本次基线。
+
+唯一实现者runtime11、fmt／严格clippy／diff通过，merger已快进集成并对齐双方HEAD/tree／clean。只修测试观测方式，生产代码、权限、Python及真实3000ms裁决不变；新head远端CI以PR回读为准。真实完整ES／九类／归档／3秒／后台仍待，06保持claimed。
