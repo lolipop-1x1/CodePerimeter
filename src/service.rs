@@ -213,16 +213,20 @@ impl CollectorClient {
     }
 }
 
-pub fn write_frame(stream: &mut UnixStream, frame: &CollectorFrame) -> io::Result<()> {
-    let bytes = serde_json::to_vec(frame).map_err(io::Error::other)?;
+fn encode_frame(frame: &CollectorFrame) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(frame).map_err(io::Error::other)?;
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "采集 frame 超过上限",
         ));
     }
-    stream.write_all(&bytes)?;
-    stream.write_all(b"\n")
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub fn write_frame(stream: &mut UnixStream, frame: &CollectorFrame) -> io::Result<()> {
+    stream.write_all(&encode_frame(frame)?)
 }
 
 fn require_root() -> io::Result<()> {
@@ -460,14 +464,7 @@ fn write_frame_cancellable(
     frame: &CollectorFrame,
     stopping: &AtomicBool,
 ) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec(frame).map_err(io::Error::other)?;
-    if bytes.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "采集 frame 超过上限",
-        ));
-    }
-    bytes.push(b'\n');
+    let bytes = encode_frame(frame)?;
     let mut written = 0;
     while written < bytes.len() {
         if stopping.load(Ordering::Relaxed) {

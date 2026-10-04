@@ -1019,3 +1019,97 @@ fn stalled_source_has_explicit_unknown_coverage_health_and_recovers() {
     source.stop();
     stop_host(&control_socket, host);
 }
+
+#[test]
+fn reconnect_reason_changes_remain_visible_and_trusted_socket_recovers() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = fixture();
+    let runtime = options(temp.path());
+    let collector_socket = runtime.collector_socket.clone();
+    let control_socket = runtime.control_socket.clone();
+    let host = start_host(runtime);
+    wait_for_socket(&control_socket);
+    let health = || -> Vec<Value> {
+        query(
+            &control_socket,
+            ControlRequest::QueryHealth {
+                filter: HealthFilter {
+                    component: Some("collector".into()),
+                    ..HealthFilter::default()
+                },
+            },
+        )
+    };
+    wait_until(
+        || {
+            health()
+                .iter()
+                .any(|row| row["record"]["code"] == "collector_unavailable")
+        },
+        "缺少端点时应记录来源不可用",
+    );
+
+    let listener = UnixListener::bind(&collector_socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    fs::set_permissions(&collector_socket, fs::Permissions::from_mode(0o666)).unwrap();
+    wait_until(
+        || {
+            health()
+                .iter()
+                .any(|row| row["record"]["code"] == "collector_identity_rejected")
+        },
+        "重连状态相同但可信路径失败原因变化时仍须记录",
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.collector_state, "reconnecting");
+    assert!(status.collector_run_id.is_none());
+
+    fs::set_permissions(&collector_socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut stream = None;
+    wait_until(
+        || {
+            if let Ok((accepted, _)) = listener.accept() {
+                stream = Some(accepted);
+                true
+            } else {
+                false
+            }
+        },
+        "路径信任恢复后应重新连接",
+    );
+    let mut stream = stream.unwrap();
+    write_frame(
+        &mut stream,
+        &CollectorFrame::Heartbeat {
+            run_id: "anonymous-recovered-run".into(),
+            dropped_lines: 0,
+        },
+    )
+    .unwrap();
+    wait_until(
+        || {
+            let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+            status.collector_state == "connected"
+                && status.collector_run_id.as_deref() == Some("anonymous-recovered-run")
+        },
+        "可信端点恢复后应接收心跳",
+    );
+    let health = health();
+    for code in [
+        "collector_unavailable",
+        "collector_identity_rejected",
+        "collector_connected",
+    ] {
+        assert!(health.iter().any(|row| row["record"]["code"] == code));
+    }
+    // 对端保持打开且不再发帧，Stop仍须解除读取等待并回收reader。
+    let before = Instant::now();
+    stop_host(&control_socket, host);
+    assert!(before.elapsed() < Duration::from_secs(2));
+    drop(stream);
+}

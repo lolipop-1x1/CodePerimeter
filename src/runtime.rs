@@ -609,9 +609,11 @@ fn spawn_collector_reader(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut last_state = String::new();
+        let mut last_connect_error = None;
         while !stopping.load(Ordering::Relaxed) {
             let mut client = match CollectorClient::connect_expected(&socket_path, expected_uid) {
                 Ok(client) => {
+                    last_connect_error = None;
                     if last_state != "connected" {
                         if !send_reader_message(
                             &sender,
@@ -628,23 +630,24 @@ fn spawn_collector_reader(
                     client
                 }
                 Err(error) => {
-                    if last_state != "reconnecting" {
+                    let code = if error.kind() == io::ErrorKind::PermissionDenied {
+                        "collector_identity_rejected"
+                    } else {
+                        "collector_unavailable"
+                    };
+                    if last_state != "reconnecting" || last_connect_error != Some(code) {
                         if !send_reader_message(
                             &sender,
                             ReaderMessage::State {
                                 state: "reconnecting".into(),
-                                code: if error.kind() == io::ErrorKind::PermissionDenied {
-                                    "collector_identity_rejected"
-                                } else {
-                                    "collector_unavailable"
-                                }
-                                .into(),
+                                code: code.into(),
                             },
                             &stopping,
                         ) {
                             return;
                         }
                         last_state = "reconnecting".into();
+                        last_connect_error = Some(code);
                     }
                     thread::sleep(Duration::from_millis(250));
                     continue;
