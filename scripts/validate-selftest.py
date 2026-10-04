@@ -3,9 +3,12 @@
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -200,6 +203,89 @@ class ValidationBridgeIdentityTests(unittest.TestCase):
                     validation.wait_for_bridge(Path("/anonymous.sock"), self.launcher, self.collector, diagnostics, timeout=.01)
             self.assertEqual(diagnostics["reason"], code)
             self.assertNotIn("unknown-private-marker", str(diagnostics))
+
+
+class ValidationMatrixWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="codeperimeter-matrix-test-", dir="/private/tmp")
+        self.addCleanup(temporary.cleanup)
+        self.workspace = Path(temporary.name) / "workspace"
+        self.sender_cli("prepare", "--root", str(self.workspace), "--files", "55")
+        self.project = self.workspace / "project"
+
+    def sender_cli(self, *arguments):
+        result = subprocess.run([sys.executable, "-B", str(validation.SENDER), *arguments],
+                                capture_output=True, text=True, timeout=45, start_new_session=True)
+        self.assertEqual(result.returncode, 0, "匿名发送器 CLI 未成功完成")
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+    def matrix(self):
+        return subprocess.run([sys.executable, "-B", validation.__file__, "--event-matrix-worker", str(self.project)],
+                              capture_output=True, text=True, timeout=15, start_new_session=True)
+
+    def test_successful_matrix_allows_following_mmap_and_strict_cleanup(self):
+        self.assertEqual(self.matrix().returncode, 0)
+        rows = validation.sender(self.workspace, "mmap")
+        self.assertEqual(rows[-1]["phase"], "completed")
+        self.assertFalse((self.project / ".event-matrix").exists())
+        self.sender_cli("cleanup", "--root", str(self.workspace))
+        self.assertFalse(self.workspace.exists())
+
+    def test_complete_original_scenario_order_and_preloaded_release_can_finish(self):
+        preloaded, rows, reader = validation.start_preloaded(self.workspace)
+        try:
+            self.assertTrue(any(row["phase"] == "ready" for row in rows))
+            self.assertEqual(validation.sender(self.workspace, "read")[-1]["phase"], "completed")
+            preloaded.stdin.write("release\n")
+            preloaded.stdin.flush()
+            preloaded.wait(timeout=30)
+            reader.join(timeout=3)
+            self.assertFalse(reader.is_alive())
+            self.assertEqual(preloaded.returncode, 0)
+            self.assertEqual(rows[-1]["phase"], "completed")
+            self.assertTrue(any(row["phase"] == "released" for row in rows))
+            self.assertEqual(self.matrix().returncode, 0)
+            temporary_archives = []
+            for scenario, scope in [("mmap", "inside"), ("repeat-read", "inside"), ("bulk-read", "inside"),
+                                    ("tar", "inside"), ("tar", "temporary"), ("zip", "inside"), ("zip", "temporary"),
+                                    ("disk-archive", "inside"), ("disk-archive", "temporary"), ("memory-archive", "inside"),
+                                    ("search", "inside"), ("index", "inside"), ("build", "inside")]:
+                with self.subTest(scenario=scenario, scope=scope):
+                    result = validation.sender(self.workspace, scenario, scope)
+                    self.assertEqual(result[-1]["phase"], "completed")
+                    if scope == "temporary":
+                        temporary_archives.extend(Path(row["output_path"]).parent for row in result if row["phase"] == "archive_completed")
+            self.sender_cli("cleanup", "--root", str(self.workspace))
+            self.assertFalse(self.workspace.exists())
+            self.assertTrue(temporary_archives)
+            self.assertTrue(all(not directory.exists() for directory in temporary_archives))
+        finally:
+            if preloaded.poll() is None:
+                preloaded.kill()
+                preloaded.wait()
+            reader.join(timeout=3)
+            preloaded.stdin.close()
+            preloaded.stdout.close()
+
+    def test_existing_matrix_directory_and_its_unknown_file_are_preserved(self):
+        directory = self.project / ".event-matrix"
+        directory.mkdir()
+        unknown = directory / "unknown-owned-by-another-task.txt"
+        unknown.write_bytes(b"anonymous external artifact")
+        self.assertNotEqual(self.matrix().returncode, 0)
+        self.assertEqual(unknown.read_bytes(), b"anonymous external artifact")
+        self.assertEqual(set(directory.iterdir()), {unknown})
+
+    def test_unknown_file_added_to_owned_directory_is_never_deleted(self):
+        # 仅替换fork/exec为匿名等待结果；其余创建/读取/mmap/rename和清理执行真实文件操作。
+        unknown = self.project / ".event-matrix" / "unknown.txt"
+        def completed_child(pid, options):
+            unknown.write_bytes(b"anonymous external artifact")
+            return pid, 0
+        with patch.object(validation.os, "fork", return_value=123), patch.object(validation.os, "waitpid", side_effect=completed_child):
+            with self.assertRaises(OSError):
+                validation.matrix_worker(self.project)
+        self.assertEqual(unknown.read_bytes(), b"anonymous external artifact")
 
 
 class ProtectedReplacementTests(unittest.TestCase):

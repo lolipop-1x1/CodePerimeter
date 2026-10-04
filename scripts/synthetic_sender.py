@@ -251,12 +251,15 @@ def run_scenario(root, scenario, output_scope="inside", repeats=55, release_time
     elif scenario in ("tar", "zip"):
         output = register_output(root, manifest, scenario, output_scope, ".tar.gz" if scenario == "tar" else ".zip")
         tool = "/usr/bin/" + scenario
+        tool_environment = None
         if scenario == "tar":
             args = [tool, "-czf", str(output), "-C", str(root / "project"), "src"]
+            # 仅对子tar禁用AppleDouble附加成员；不修改父进程环境或放宽归档校验。
+            tool_environment = {**os.environ, "COPYFILE_DISABLE": "1"}
         else:
             args = [tool, "-q", "-r", str(output), "src"]
         started = time.time_ns()
-        child = subprocess.Popen(args, cwd=root / "project", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child = subprocess.Popen(args, cwd=root / "project", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=tool_environment)
         try:
             child_pgid = os.getpgid(child.pid)
         except ProcessLookupError:

@@ -83,6 +83,30 @@ class SyntheticSenderTests(unittest.TestCase):
                     if external:
                         self.assertNotEqual(external[0]["child_pid"], external[0]["pid"])
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS 系统tar元数据选项回归")
+    def test_tar_excludes_appledouble_members_without_changing_sources(self):
+        source = self.root / "project/src/module_000.py"
+        before = source.read_bytes()
+        parent_environment = os.environ.get("COPYFILE_DISABLE")
+        subprocess.run(["/usr/bin/xattr", "-w", "com.codeperimeter.synthetic-test",
+                        "anonymous test metadata", str(source)], check=True, capture_output=True)
+        for scope in ("inside", "temporary"):
+            with self.subTest(scope=scope):
+                records = self.run_sample("tar", "--output-scope", scope)
+                output = Path(next(row["output_path"] for row in records if row["phase"] == "archive_completed"))
+                with tarfile.open(output) as archive:
+                    regular = [member for member in archive.getmembers() if member.isfile()]
+                    self.assertEqual({member.name for member in regular},
+                                     {f"src/module_{index:03d}.py" for index in range(55)})
+                    self.assertFalse(any(member.name.startswith("._") or "/._" in member.name for member in archive.getmembers()))
+                    for member in regular:
+                        with archive.extractfile(member) as contents:
+                            self.assertEqual(contents.read(), (self.root / "project" / member.name).read_bytes())
+        self.assertEqual(source.read_bytes(), before)
+        self.assertEqual(os.environ.get("COPYFILE_DISABLE"), parent_environment)
+        self.assertEqual(subprocess.check_output(["/usr/bin/xattr", "-p", "com.codeperimeter.synthetic-test", str(source)]).strip(),
+                         b"anonymous test metadata")
+
     def test_memory_compression_has_no_disk_archive(self):
         before = set(self.root.rglob("*"))
         records = self.run_sample("memory-archive")

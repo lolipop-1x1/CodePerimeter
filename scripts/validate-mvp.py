@@ -203,6 +203,9 @@ def matrix_worker(project):
     _, status = os.waitpid(child, 0)
     if status:
         raise RuntimeError("显式 fork／exec 合成操作失败")
+    # 只清理本次成功创建并重命名的文件；未知条目使 rmdir 拒绝，避免扩大删除范围。
+    second.unlink()
+    directory.rmdir()
     print(json.dumps({"source": "validation_worker", "scenario": "nine-events",
                       "pid": os.getpid(), "child_pid": child, "success": True}))
 
