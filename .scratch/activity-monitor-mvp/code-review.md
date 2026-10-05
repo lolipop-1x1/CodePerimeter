@@ -129,3 +129,18 @@ hard0／heuristic0。断线前ID基线与新增EOF条件避免旧证据冒充；
 2026-10-05 固定点 `96dc4e34b1805adef1aa021afffc54a40701c4ae` → 候选 `939b8aafabd794df3b3d2a10cfc27e7667d7106d`（tree `a67acd2d1e457f38606eaca43ee5ee40006a9769`）：仅两份Python验收脚本，运行socket采用随机短私有目录，持久报告／SQLite不移动；宿主早退立即分类并保留退出码，原stderr不落盘。Standards hard0／heuristic0，Spec可证缺陷0／scope creep0；两轴独立生命周期6项通过。Standards最初关于TemporaryDirectory无法被mkdtemp补丁捕获的判断，经标准库源码与实际6例验证已撤回，不是候选缺陷；mode情景注入和独立host／root摘要按简单优先原则无需额外抽象。
 
 实现者37自测、AST／help／diff通过，主agent通过候选run调用实际普通宿主，在首次sudo前停止并确认长报告接线与短socket清理；不作为ES／FDA／通知或3000ms验收。merger快进合入并核对HEAD／tree，合并前后已有三份文档hash一致。Rust与ecbd二进制不变。06仍claimed，完整真实重跑待用户终端；没有新增实现worktree，既有修复树继续保留供实测，不绕过App的固定工作区保护。
+
+
+## macOS 接收连接模式补修复核
+
+2026-10-05固定点 `1dcfc5d5d02d3d39a470c28c8ffab00cd6107574` → 候选 `6ff3f6a1a956c4ae3b0cb76a2e1ed3070f24c397`（tree `38fd4b2e6456a27f113fb455ddb5115e7883e858`），三点diff及单一commit已核验，仅src/service.rs，47增／7删。真实cadc已完成16场景／22sent但全部超3000ms；匿名三轮A/B确认Darwin accept继承O_NONBLOCK、5ms写重试积累，未用组件结果改写真实失败。
+
+### Standards
+
+hard0／heuristic0。共享helper只服务两处真实accept，在peer校验后恢复blocking并保留250ms超时；中文注释与匿名回归符合AGENTS／implementation-contract，12类smell无行动项。此轴为独立静态审查，未自行复跑Cargo；其匿名socket探针受sandbox EPERM，未据此声明运行通过。本机工具链已由主agent按绝对路径核验1.88.0。
+
+### Spec
+
+缺失／partial0、scope creep0、可证缺陷0。符合票据07的采集身份与传输范围，写偏移／取消、有界队列、权限／所有进程／健康／3000ms门禁保持。独立普通权限2项测试通过：实际accepted fd继承NONBLOCK，配置后清除且listener不变、timeout250ms；512KiB半写完整且停止返回Interrupted，0.35秒。新构建真实时效为后续验收，未作为本次代码bug或已达标。
+
+唯一实现者的确定性旧策略红为flag4对0／exit101，修后34相关Rust通过／1信号helper由监督调用；取消组保留生产250ms，部分写组20ms仅为触发重试。fmt／strict all-target clippy／diff通过。merger已快进并核对HEAD/tree，原两份主agent文档hash保持。release `c8a7cd2ce0a4a50a96cbbf6b798f2bba6c6524301c379c0f927ba9f9d2725e0b` 已正常offline locked构建并复制普通工作区；系统副本仍ecbd、未启动root或修改FDA／launchd。私有持久封装新旧hash、语法／权限／忽略回读通过，06仍claimed；本次新headCI以PR回读为准，真实3秒／到屏／后台／持续性能仍待。

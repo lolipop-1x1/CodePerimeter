@@ -4,7 +4,9 @@
 
 ## 已验证与待验证
 
-2026-10-05 当前结果与补修：
+2026-10-05 当前：最新持久入口真实运行完成16／16场景、22／22告警sent，已知丢弃及保存缺口为0；生成max9235ms／发送max9620ms，整体仍部分失败。匿名组件三轮复现接收连接继承非阻塞模式所致背压，显式blocking对照首条outbox从10.419–11.766秒降至1.185–1.304秒；补修6ff3f6a及独立审查完成，新构建仍须重新真实验收3秒目标。sent仅表示通知命令接受，到屏、后台生命周期和持续性能仍未验。
+
+以下保留历次结果与补修：
 
 第四次真实运行 `codeperimeter-validation-ekj5ivqs` 已完成全部合成操作，整体判 `real_run_failed_or_partial`。macOS15.6.1、Python3.12.12、eslogger schema1／message9，a67二进制，root桥接verified、real_source_confirmed=true。约6.9秒观察9751条系统事件，保存766条项目标准事件，本地collector／reader丢弃、SQLite保存缺口及degraded健康计数均0，root清理完成；短时无已知缺口不证明长期完整性。
 
@@ -37,8 +39,8 @@
 | --- | --- | --- |
 | Adapter／规则／SQLite／IPC／CLI | 匿名 fixtures、真实本地 IPC、持久化回查、故障注入、信号子进程 | 组件契约通过；替身不代表 root ES |
 | 系统字段探针 | [本机探针](../../.scratch/activity-monitor-mvp/real-probe.md) | eslogger 真实字段已见；短时探针不代表持续链路 |
-| 完整匿名真实运行 | `scripts/validate-mvp.py` | 第三轮已通过指定合成普通文件可读OPEN门禁；后续发送器因测试目录残留退出，完整场景仍待重跑 |
-| 3 秒生成／通知发送 | 实际标准事件、outbox、通知反馈的独立时间 | 待真实运行裁决 |
+| 完整匿名真实运行 | `scripts/validate-mvp.py`，最新cadc本地报告 | 16场景全部通过、来源屏障和清理通过；整体因延迟超限而部分失败 |
+| 3 秒生成／通知发送 | 实际标准事件、outbox、通知反馈的独立时间 | cadc生成max9235ms／发送max9620ms，未通过；修复后的真实重跑待验 |
 | 通知到屏、后台 FDA、登录补发和重启 | 下文独立步骤 | 尚未验收 |
 
 原生输入参考 macOS 15.6.1 的 eslogger schema 1／message 9 和 Apple SDK 字段；实际脚本会报告本机 OS、Python、二进制版本及 SHA256。SQLite 读取器锁定 schema 3，发现不兼容立即失败。宿主状态回显当前 run_id 的实际 schema／message 版本；标准事件保存对应版本，健康查询的 source 保留 run_id、版本、field 和 missing_events。每个采集运行首次实见或版本变更才新增版本健康记录；用 `health --source-run-id <run_id>` 回查版本变化和缺口。旧 v1／v2 数据原子迁移，旧事件缺版本时保持未知。
@@ -135,3 +137,12 @@ sudo ./target/release/codeperimeter service start --user "$(id -un)"
 2026-10-05 持久入口本轮 `run-720dcf6660994f48a556410d18d75cb2` 已由用户终端运行：ecbd受保护副本准备成功，未改launchd/FDA；宿主启动15秒超时，root尚未启动，实际来源未确认。该持久报告目录的控制socket路径168字节，本机普通用户重现daemon退出1并报`path must be shorter than SUN_LEN`；旧入口丢弃宿主stderr。最小补修 `939b8aa` 只将运行时socket分离到短私有目录，保留持久报告／SQLite／合成项目，补宿主早退与静态分类；3000ms与真实场景门禁不变。Python自测37项通过，包含实际run长报告接线及正常／前置失败／中断清理。主agent通过该修复后的run调用实际普通用户daemon（173字节报告、35字节socket），成功配置合成项目及schema3 SQLite，在首次sudo边界前主动停止，宿主stderr排空与临时目录清理通过。此对照跳过管理员preflight、未启动root／ES／通知，只证明宿主启动与接线修复；下一轮完整真实场景与3秒仍待用户终端运行。
 
 候选939b8aa经独立两轴定点复核：Standards hard0／heuristic0、Spec可证缺陷0／scope creep0，独立生命周期6项通过；已快进合入，Rust与ecbd构建不变，受保护副本当前也为ecbd。持久封装入口可以直接重跑，相同hash只检查不替换；原本轮失败证据保留，未将其改写为通过。
+
+
+2026-10-05 最新完整真实运行 `run-cadc3c5691f340d896edf95c1eeab904` 已进入全部场景：ecbd构建／1dcfc5d脚本，16场景证据全部通过，22条告警均有sent回执，九类系统观察、来源完成屏障、受控断流与root清理通过；已知collector／reader丢弃、SQLite缺口及degraded健康均0。生成max9235ms／p95 9156ms，通知发送max9620ms／p95 9533ms，超过3000ms，故整体仍`real_run_failed_or_partial`。正常搜索／索引／构建也触发批量阈值，sent不证明到屏，短时无已知缺口不证明持续完整。采集51.08MB聚合输入期间Line桥接写帧共11.780秒、source send共11.878秒、host handle_frame共1.460秒，这些是重叠墙钟且计时范围不同，这些数字本身不能确定根因；下述匿名组件A/B另提供接收模式的因果证据。真实3秒、到屏和后台仍待。
+
+
+本轮22告警独立拆分：来源→collector读行p50／p95／max为6725／9144／9203ms，读行→outbox为16／32／34ms，首建→sent为295／377／385ms；同毫秒候选读行最多19ms边界不确定，epoch计时有系统时钟限制。匿名组件同一25000行／51.2MB三轮A/B确认：Darwin accepted stream继承非阻塞模式；原完整宿主1862–2077次WouldBlock进入5ms重试，首条outbox10419–11766ms，显式blocking后零重试且1185–1304ms，保存／筛选／缺口一致。该测试使用真实OS pipe和生产有界队列／帧读写／完整宿主SQLite，但来源是普通mocksource，不含ES／FDA／系统通知，不能替代真实3秒裁决。私有报告与样本持久保存在local-validation/cadc-transport-evidence，未保存原始系统JSON。
+
+
+生产补修6ff3f6a只改src/service.rs：常规和退出诊断accept均在peer验证后恢复blocking＋250ms写超时，listener和半写／停止语义保留；实际Darwin旧策略flag回归红（4对0），修后34相关Rust通过／1监督helper被调用，fmt／strict clippy通过。两轴Standards hard0／heuristic0（静态），Spec缺失／scope／缺陷0并独立2项真实accept／半写取消测试通过。正常Rust1.88.0／locked offline release SHA256 `c8a7cd2ce0a4a50a96cbbf6b798f2bba6c6524301c379c0f927ba9f9d2725e0b` 已复制普通工作区；受保护副本仍ecbd，私有持久入口已更新明确新旧hash并通过语法、权限和忽略检查。新版真实3秒与后续后台／到屏验收仍待，当前cadc失败报告不改写；源／脚本门禁保持。

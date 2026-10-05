@@ -19,7 +19,7 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 
 ## Answer
 
-实现与历次补修的双轴独立复核已完成，PR保持可审查。第四轮真实已完成所有操作，16场景8通过／8证据缺失，最大生成3543ms／最终发送3956ms，整体仍失败或部分通过。普通权限测量复现调度背压，修复后相同样本2148ms→293ms；真实完成屏障及聚合指标已补，完整实机重跑仍待。06保持claimed；新head远端CI以PR回读为准。桌面／后台／长期性能与旧worktree保护边界保持。
+实现与历次补修的双轴独立复核已完成，PR保持可审查。最新持久入口真实运行cadc已完成全部操作、16场景证据全部通过、22告警全部sent，九类系统计数／受控断流／清理成立，已知本地drop／SQLite gap／degraded为0；最大生成9235ms／发送9620ms仍超过3000ms，因此整体仍失败或部分通过。匿名普通组件已三轮确认Darwin接收连接继承非阻塞模式，导致5ms写重试累积；已补修两处accept后的连接模式并通过独立两轴审查，不把组件吞吐结论扩展为系统时效通过。06保持claimed；新head远端CI以PR回读为准。桌面／后台／长期性能与旧worktree保护边界保持。
 
 - `tests/end_to_end.rs` 运行真实 CLI→普通用户 daemon→SQLite：手动目录、匿名 Codex／Claude 元信息合并、预览后新增历史不扩大范围、同库重启回查／移除；独立用例验证普通用户启动 collector 被拒绝。采集源刻意不可用，不冒充 ES。
 - `scripts/validate-prepare-collector.py --binary target/release/codeperimeter` 只在用户终端显式 `sudo -v` 后准备 root-owned `/Library/CodePerimeter/<uid>/codeperimeter`，检查 root 父路径、写 ACL、来源权限和复制 SHA256，默认拒绝已有目标；仅无launchd安装的验收副本可明确旧hash安全替换，root发布时重查完整路径／ACL、旧新hash与无活动端点／进程／plist／loaded jobs；不创建 job、不改 FDA。
@@ -93,3 +93,18 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 2026-10-05 重启后的持久入口首跑 `run-720dcf6660994f48a556410d18d75cb2`：用户终端已将受保护副本更新为ecbd（完整hash见验收文档），launchd与FDA未修改。摘要停在host_startup，15秒超时；root采集器未启动、真实来源未确认、操作记录为空，清理完成。本机普通用户复现：将控制socket置于长报告目录产生168字节路径，daemon实际返回`path must be shorter than SUN_LEN`；原验收入口丢弃daemon stderr，故只报告通用超时。对照使用40字节私有socket与185字节数据库路径，308ms收到database_state=ready并Stop退出0，没有root／ES／通知。正在最小补修验收socket生命周期与宿主静态启动诊断；原3秒与场景门禁保持，06仍claimed。
 
 持久验收启动补修 `939b8aafabd794df3b3d2a10cfc27e7667d7106d`（tree `a67acd2d1e457f38606eaca43ee5ee40006a9769`）：只改validate-mvp.py／selftest.py，短随机0700控制目录覆盖前置失败与KeyboardInterrupt，退出时清理；报告／SQLite／合成项目不移出持久目录。宿主早退立即报host_exited及退出码，host_startup保留最多8种静态诊断码／排空状态，不保存stderr原文。修前4例红、修后37自测绿，AST／help／diff通过。主agent另外用实际普通daemon通过修复后的run接线：173字节报告／35字节socket，完成合成项目配置和schema3 SQLite，在首次sudo前主动停止，宿主及临时socket均回收；这是普通组件对照，不代表root／ES／3秒。Rust与ecbd二进制不改、不需重复替换；独立定点审查：Standards hard0／heuristic0，Spec可证缺陷0／scope creep0；独立生命周期6项均通过，merger快进合入并核对候选HEAD／tree，三份主agent文档改动合并前后hash保持。06仍claimed，下一轮真实系统验收仍待。
+
+
+2026-10-05 持久入口真实 `run-cadc3c5691f340d896edf95c1eeab904`：macOS15.6.1／Python3.12.12，ecbd构建（与受保护副本匹配），head1dcfc5d脚本；host/root启动诊断为空、可信桥接verified、real_source_confirmed=true、完成屏障越过且所有场景证据完整、通知队列排空、root清理完成、受控断流reconnecting已观察。16场景全通过，包括tar／zip两位置、落盘归档两位置、同进程内存归档的访问／批量告警、正常搜索／索引／构建。最终系统标准计数25242，筛选持久事件2581；22条告警首建和sent回执齐全，generation max9235ms／p95 9156ms，notification max9620ms／p95 9533ms。collector／reader drop及database gap、degraded健康均0；没有据此推导长期完整性或到屏。当前唯一脚本失败条件是实际来源计时超过3000ms。
+
+管线聚合：collector采样24498行／51082460字节，24465次Line写帧共11780074us（max10030us），source send共11878378us（max169461us）；host25267帧处理共1460160us（max5554us），source到collector完整读行最大10070ms。指标为跨线程墙钟，含等待且相互重叠，不能相加或相减后当作纯CPU；未包含外层帧解码、读线程send、控制查询、重试等全部时段。原始系统JSON未保存；本轮用匿名普通组件探针与已存标准证据缩小原因，不放宽3000ms、不跳过场景。性能20个样本聚合RSS峰值709456KiB、ps累计平均CPU百分比求和峰值78.9，无独立基线，不作为性能达标结论。06仍claimed。
+
+
+本轮标准证据独立拆分22条告警：source→collector完整读行p50／p95／max为6725／9144／9203ms，读行→outbox首建16／32／34ms，首建→sent反馈295／377／385ms；同毫秒触发候选的读行拆分存在最多19ms不确定度，epoch计时仍受系统时钟限制。全部22条来源到生成／发送都超3000ms。额外一条未归属合成发送器的项目批量告警保留在裁决中，不为通过时效而删去。
+
+匿名组件红反馈（三轮，普通UID／mocksource／Rust1.88.0）：同一25000行、51.2MB、schema1／message9输入，经实际OS pipe、生产32／64队列、writer／read_frame和完整宿主SQLite。Darwin实际fcntl确认非阻塞listener的accepted stream继承O_NONBLOCK；原策略完整宿主排空11536–12943ms、首条outbox10419–11766ms，1862–2077次WouldBlock进入生产5ms重试。唯一连接变量改为显式blocking后，排空2015–2121ms、首条outbox1185–1304ms，重试0；每轮25000帧、2500保存／22500筛选、零已知缺口和1条告警。decode-only7345–7951ms→113–125ms。报告与27样本已保存本地忽略目录local-validation/cadc-transport-evidence；组件首建时间相对预制匿名burst起点，没有ES／FDA／通知发送，不能作为真实3000ms通过。生产源码补修及稳定accept回归已完成，结果见下方；真实验收仍待，06仍claimed。
+
+
+接收连接最小补修 `6ff3f6a1a956c4ae3b0cb76a2e1ed3070f24c397`（tree `38fd4b2e6456a27f113fb455ddb5115e7883e858`）：仅src/service.rs，两处accept经peer验证后统一显式set_nonblocking(false)，保留250ms写超时和非阻塞listener；原写偏移／取消／5ms超时重试与32／64容量不改。确定性旧策略回归O_NONBLOCK=4／期望0，exit101；修后lib＋service_collector＋runtime_host共34通过／1信号helper由监督用例调用，真实accept下512KiB半写完整，取消保持生产250ms超时；fmt／严格all-target clippy／diff通过。Standards静态hard0／heuristic0；Spec缺失0／scope creep0／可证缺陷0，独立普通accept／半写取消2项通过，0.35秒；真实3秒未因此关闭。merger快进并核对HEAD／tree相同，原两份文档hash不变。
+
+主agent以Rust1.88.0及锁定依赖正常offline release构建成功，普通工作区复制并核对SHA256 `c8a7cd2ce0a4a50a96cbbf6b798f2bba6c6524301c379c0f927ba9f9d2725e0b`；受保护副本仍 `ecbd09284b9d404fe2cdb486f9e1a666e5a01da5e24483c534431548744cee06`，未替换／启动root。持久私有封装已更新明确新旧hash，sh语法／Python AST／0700权限／Git忽略及构建hash一致通过，CLI版本与三角色plan回读通过；未执行install、修改FDA、注销或重启。当前源码与组件审查完成，新head远端CI以PR回读为准；新构建真实3000ms、到屏、后台生命周期与持续性能仍待，06保持claimed。
