@@ -112,6 +112,69 @@ class BridgeIdentityError(CollectorStartupError):
         super().__init__("采集桥接身份核验失败：" + code + "；拒绝控制未经本次启动确认的进程")
 
 
+def privileged_command_failure(command):
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, timeout=5, check=False)
+    except OSError:
+        return "command_start_failed"
+    except subprocess.TimeoutExpired:
+        return "command_timeout"
+    if result.returncode == 0:
+        return None
+    stderr = result.stderr.lower() if isinstance(result.stderr, bytes) else b""
+    if any(pattern in stderr for pattern in (
+        b"password is required", b"a terminal is required", b"no tty present",
+    )):
+        return "sudo_authorization_required"
+    if b"operation not permitted" in stderr or b"permission denied" in stderr:
+        return "permission_denied"
+    if b"no such process" in stderr:
+        return "process_missing"
+    return "command_failed"
+
+
+class SudoAuthorization:
+    """只在当前真实验收中限频维护既有授权；没有线程或交互输入。"""
+
+    def __init__(self):
+        self.last_refresh = None
+        self.refresh_attempts = 0
+        self.failure_counts = Counter()
+        self.failure_code = None
+
+    def refresh(self, force=False):
+        now = time.monotonic()
+        if not force and self.last_refresh is not None and now - self.last_refresh < 30:
+            return self.failure_code is None
+        self.last_refresh = now
+        self.refresh_attempts += 1
+        failure = privileged_command_failure(["/usr/bin/sudo", "-n", "-v"])
+        if failure:
+            self.failure_counts[failure] += 1
+            self.failure_code = ("sudo_authorization_required" if failure == "sudo_authorization_required"
+                                 else "sudo_refresh_failed")
+            return False
+        self.failure_code = None
+        return True
+
+    def require(self, force=False):
+        if not self.refresh(force):
+            raise RuntimeError(self.failure_code)
+
+    def summary(self):
+        return {"refresh_attempts": self.refresh_attempts,
+                "failure_counts": dict(sorted(self.failure_counts.items()))}
+
+
+def signal_root(pid, signal_name, diagnostics):
+    failure = privileged_command_failure(["/usr/bin/sudo", "-n", "/bin/kill", "-" + signal_name, str(pid)])
+    if failure:
+        code = signal_name.lower() + "_" + failure
+        diagnostics[code] = diagnostics.get(code, 0) + 1
+    return failure is None
+
+
 def startup_diagnostics(stream, codes):
     # 只保存白名单静态分类，原 stderr 持续有界排空，不保存原文或全系统事件。
     patterns = (("root 服务文件或父目录可被普通用户修改", "unsafe_root_path"),
@@ -562,26 +625,30 @@ def bridge_identity(status, launcher, collector):
     raise BridgeIdentityError("collector_sudo_ancestry_mismatch")
 
 
-def stop_root(bridge, launcher):
+def stop_root(bridge, launcher, diagnostics=None):
+    diagnostics = diagnostics if diagnostics is not None else {}
     if not launcher:
         return True
     if bridge and launcher.poll() is None:
         info = process_info(bridge["pid"])
         if not info or info[0] != 0 or info[2] != bridge["pgid"] or info[3] != bridge["collector"]:
+            diagnostics["term_identity_unverified"] = diagnostics.get("term_identity_unverified", 0) + 1
             return False
-        if subprocess.run(["/usr/bin/sudo", "-n", "/bin/kill", "-TERM", str(bridge["pid"])], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+        if not signal_root(bridge["pid"], "TERM", diagnostics):
             return False
     elif launcher.poll() is None:
         # 尚未收到可信 run_id 时只请求本次 sudo 转发停止；不猜测 collector PID。
-        if subprocess.run(["/usr/bin/sudo", "-n", "/bin/kill", "-TERM", str(launcher.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+        if not signal_root(launcher.pid, "TERM", diagnostics):
             return False
     try:
         launcher.wait(timeout=10)
     except subprocess.TimeoutExpired:
+        diagnostics["root_wait_timeout"] = diagnostics.get("root_wait_timeout", 0) + 1
         return False
     if bridge:
         for pid in bridge["source_pids"]:
             if process_info(pid) is not None:
+                diagnostics["source_still_running"] = diagnostics.get("source_still_running", 0) + 1
                 return False
     return True
 

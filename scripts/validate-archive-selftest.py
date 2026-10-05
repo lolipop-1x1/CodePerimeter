@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import sqlite3
 import sys
 import tempfile
 import time
@@ -201,6 +202,267 @@ def reverse_fixture():
 
 
 class ArchiveValidationSelfTest(unittest.TestCase):
+    def test_positive_sidecar_is_always_used_for_exact_wrapper_identity(self):
+        case = positive_case(mode="stdout", output_path=None)
+        observer = mock.Mock()
+        execution = {"pids": {PID}, "return_code": 0, "failure_code": None, "stdout_bytes": 1}
+        with mock.patch.object(VALIDATOR, "execute", return_value=execution) as execute:
+            VALIDATOR.process_case(case, Path("/usr/bin/synthetic"), None, SOURCE_RUN,
+                                   SCRIPT_PATH, sidecar=observer)
+        self.assertIs(execute.call_args.kwargs["observer"], observer)
+        observer.begin_case.assert_called_once_with("zip")
+
+    def test_positive_short_wrapper_uses_exact_sidecar_generation_without_relaxing_main_evidence(self):
+        case, evidence = positive_fixture(positive_case(mode="stdout", output_path=None))
+        launcher = PID - 1
+        execution = {"pids": {launcher}, "sidecar_execs": [sidecar_exec(related_pids=[PID, launcher])]}
+        self.assertTrue(VALIDATOR.analyze_positive(case, execution, evidence, SOURCE_RUN)["passed"])
+        for replacement in (
+            {"target_pid_version": PID_VERSION + 1},
+            {"related_pid_chain": [PID, launcher + 9]},
+            {"executable": "other"},
+        ):
+            invalid = copy.deepcopy(execution)
+            invalid["sidecar_execs"][0].update(replacement)
+            self.assertFalse(VALIDATOR.analyze_positive(case, invalid, evidence, SOURCE_RUN)["passed"])
+        for replacement in (
+            {"input_paths": [str(UNRELATED / "other.bin")]},
+            {"output_path": str(OUTPUT)},
+        ):
+            invalid = copy.deepcopy(evidence)
+            invalid["events"][0]["archive"].update(replacement)
+            self.assertFalse(VALIDATOR.analyze_positive(case, execution, invalid, SOURCE_RUN)["passed"])
+        late = copy.deepcopy(evidence)
+        late["notifications"][0]["observed_timestamp_ms"] = 4001
+        self.assertEqual(VALIDATOR.analyze_positive(case, execution, late, SOURCE_RUN)["failure_code"],
+                         "notification_latency_over_3000ms")
+
+    def test_real_short_lived_wrapper_child_can_match_after_descendant_polling_misses_it(self):
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-short-wrapper-", dir="/private/tmp") as directory:
+            metadata = Path(directory) / "identity.json"
+            program = ("import json, os, subprocess, sys; from pathlib import Path; "
+                       "child = subprocess.Popen(['/usr/bin/true']); child.wait(); "
+                       "Path(sys.argv[1]).write_text(json.dumps({'parent': os.getpid(), 'child': child.pid}))")
+            observer = VALIDATOR.EsloggerSidecar()
+            observer.process = mock.Mock()
+            observer.process.poll.return_value = None
+            observer.begin_case("zip")
+            finish = observer.finish_case
+
+            def observe(pids):
+                identity = json.loads(metadata.read_text())
+                observer._record_exec({"seq_num": 1, "global_seq_num": 1, "event": {"exec": {"target": {
+                    "audit_token": {"pid": identity["child"], "pidversion": PID_VERSION},
+                    "ppid": identity["parent"], "executable": {"path": "/usr/bin/zip"},
+                }}}})
+                return finish(pids, timeout=0)
+
+            with mock.patch.object(VALIDATOR, "descendants", return_value=set()), \
+                    mock.patch.object(observer, "finish_case", side_effect=observe):
+                execution = VALIDATOR.execute(Path(sys.executable), ["-B", "-c", program, str(metadata)],
+                                              Path(directory), observer=observer)
+            identity = json.loads(metadata.read_text())
+            self.assertEqual(execution["pids"], {identity["parent"]})
+            self.assertEqual(execution["sidecar_execs"][0]["related_pid_chain"],
+                             [identity["child"], identity["parent"]])
+            case, evidence = positive_fixture(positive_case(mode="stdout", output_path=None))
+            evidence["events"][0]["process"]["pid"] = identity["child"]
+            evidence["alerts"][0]["process"]["pid"] = identity["child"]
+            self.assertTrue(VALIDATOR.analyze_positive(case, execution, evidence, SOURCE_RUN)["passed"])
+            self.assertFalse(VALIDATOR.analyze_positive(case, {"pids": execution["pids"]},
+                                                       evidence, SOURCE_RUN)["passed"])
+            for pid in identity.values():
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+    def test_authorization_expiry_during_execute_still_reaps_owned_child(self):
+        processes = []
+        launch = VALIDATOR.subprocess.Popen
+
+        def remember(*args, **kwargs):
+            child = launch(*args, **kwargs)
+            processes.append(child)
+            return child
+
+        authorization = VALIDATOR.MVP.SudoAuthorization()
+        with mock.patch.object(VALIDATOR.subprocess, "Popen", side_effect=remember), \
+                mock.patch.object(VALIDATOR, "descendants", return_value=set()), \
+                mock.patch.object(VALIDATOR.MVP, "privileged_command_failure",
+                                  return_value="sudo_authorization_required"), \
+                self.assertRaisesRegex(RuntimeError, "^sudo_authorization_required$"):
+            VALIDATOR.execute(Path("/bin/sleep"), ["1"], Path("/private/tmp"), authorization=authorization)
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(processes[0].pid, 0)
+        self.assertEqual(authorization.summary()["failure_counts"], {"sudo_authorization_required": 1})
+
+    def test_case_boundary_authorization_failure_still_attempts_both_exact_cleanups(self):
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-authorization-cleanup-", dir="/private/tmp") as directory:
+            report = Path(directory)
+            project = report / "project"
+            project.mkdir()
+            binary = report / "synthetic"
+            args = mock.Mock(binary=binary, collector_binary=binary, diagnose_source_latency=False)
+            versions = {tool: {"version": "1.0", "version_return_code": 0} for tool in VALIDATOR.TOOLS}
+            observer = mock.Mock(root_identity_verified=True, failure_codes=set())
+            observer.stop.return_value = True
+            observer.summary.return_value = {}
+            child = mock.Mock(stderr=io.BytesIO(b""))
+            child.poll.return_value = None
+            bridge = {"pid": PID, "pgid": PID, "collector": str(binary), "source_pids": []}
+
+            def control(_socket, operation, _payload=None):
+                if operation == "list_directories":
+                    return [{"path": str(project)}]
+                return {"collector_run_id": SOURCE_RUN}
+
+            with contextlib.ExitStack() as patches:
+                for target, name, kwargs in (
+                    (VALIDATOR.MVP, "preflight", {"return_value": {}}),
+                    (VALIDATOR.MVP, "privileged_command_failure", {"side_effect": [
+                        None, "sudo_authorization_required", "sudo_authorization_required",
+                    ]}),
+                    (VALIDATOR, "prepare_workspace", {"return_value": (report, project, project, {}, {}, {})}),
+                    (VALIDATOR, "all_cases", {"return_value": [positive_case()]}),
+                    (VALIDATOR, "EsloggerSidecar", {"return_value": observer}),
+                    (VALIDATOR.subprocess, "Popen", {"return_value": child}),
+                    (VALIDATOR.MVP, "control", {"side_effect": control}),
+                    (VALIDATOR.MVP, "wait_for_host", {}),
+                    (VALIDATOR.MVP, "wait_for_bridge", {"return_value": bridge}),
+                    (VALIDATOR.threading, "Thread", {}),
+                ):
+                    patches.enter_context(mock.patch.object(target, name, **kwargs))
+                stop = patches.enter_context(mock.patch.object(VALIDATOR.MVP, "stop_root", return_value=True))
+                summary = VALIDATOR.real_validation(args, report, {tool: binary for tool in VALIDATOR.TOOLS}, versions)
+            observer.stop.assert_called_once()
+            stop.assert_called_once_with(bridge, child, {})
+            self.assertTrue(summary["root_cleanup_complete"])
+            self.assertTrue(summary["sidecar_cleanup_complete"])
+            self.assertNotEqual(summary["result"], "real_run_passed")
+            self.assertIn("sudo_authorization_required", summary["failure_codes"])
+            self.assertEqual(summary["sudo_authorization"]["failure_counts"], {"sudo_authorization_required": 2})
+
+    def test_failed_sidecar_term_does_not_close_live_readers_or_claim_capture_failure(self):
+        observer = VALIDATOR.EsloggerSidecar()
+        observer.root_identity_verified = True
+        observer.eslogger_pid, observer.eslogger_pgid = PID, PID + 1
+        observer.failure_codes.add("sidecar_sequence_gap")
+        observer.process = mock.Mock(pid=PID)
+        observer.process.poll.return_value = None
+        observer.process.wait.side_effect = VALIDATOR.subprocess.TimeoutExpired("synthetic", 6)
+        observer.process.stdout.close.side_effect = AssertionError("活跃 reader 的 close 会阻塞")
+        observer.process.stderr.close.side_effect = AssertionError("活跃 reader 的 close 会阻塞")
+        observer.stdout_reader, observer.stderr_reader = mock.Mock(), mock.Mock()
+        observer.stdout_reader.is_alive.return_value = True
+        observer.stderr_reader.is_alive.return_value = True
+        with mock.patch.object(observer, "_verified_processes", return_value=[PID]), \
+                mock.patch.object(VALIDATOR.MVP, "process_info", return_value=(0, PID - 1, PID + 1, "/usr/bin/eslogger")), \
+                mock.patch.object(VALIDATOR.MVP, "privileged_command_failure", return_value="sudo_authorization_required"):
+            self.assertFalse(observer.stop())
+        observer.process.stdout.close.assert_not_called()
+        observer.process.stderr.close.assert_not_called()
+        self.assertEqual(observer.summary()["cleanup_diagnostic_counts"], {
+            "term_sudo_authorization_required": 1, "launcher_wait_timeout": 1,
+            "stdout_reader_still_running": 1, "stderr_reader_still_running": 1,
+            "source_still_running": 1,
+        })
+        self.assertEqual(observer.failure_codes, {"sidecar_sequence_gap"})
+
+    def test_reader_errors_after_stop_do_not_replace_preexisting_capture_failures(self):
+        for stopping in (False, True):
+            observer = VALIDATOR.EsloggerSidecar()
+            observer.stopping = stopping
+            observer.failure_codes.add("sidecar_sequence_gap")
+            observer.process = mock.Mock()
+            observer.process.poll.return_value = None
+            observer.process.stdout.readline.side_effect = OSError("SYNTHETIC_PRIVATE_MARKER")
+            observer.process.stderr.read.side_effect = OSError("SYNTHETIC_PRIVATE_MARKER")
+            observer._read_stdout()
+            observer._read_stderr()
+            self.assertEqual("sidecar_stream_failed" in observer.failure_codes, not stopping)
+            self.assertIn("sidecar_sequence_gap", observer.failure_codes)
+            self.assertNotIn("SYNTHETIC_PRIVATE_MARKER", json.dumps(observer.summary()))
+
+    def test_fence_uses_narrow_sql_and_waits_for_late_readable_evidence(self):
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-fence-query-", dir="/private/tmp") as directory:
+            database = Path(directory) / "events.sqlite"
+            with sqlite3.connect(database) as connection:
+                connection.executescript("PRAGMA user_version=3; CREATE TABLE events "
+                                         "(source_run_id TEXT,pid INTEGER,file_path TEXT,kind TEXT,event_json TEXT);")
+            clock = [0.0]
+            inserted = [False]
+            arrival = [9]
+            fence_event = event("open", identity=process(PID + 20, 23), file={
+                "path": str(FENCE), "readable": True, "path_truncated": False,
+            }) | {"source_stream": "activity", "source_timestamp_ms": 1000,
+                  "received_timestamp_ms": 10000}
+
+            def advance(seconds):
+                clock[0] += seconds
+                if clock[0] >= arrival[0] and not inserted[0]:
+                    with sqlite3.connect(database) as connection:
+                        connection.execute("INSERT INTO events VALUES(?,?,?,?,?)", (
+                            SOURCE_RUN, PID + 20, str(FENCE), "open", json.dumps(fence_event),
+                        ))
+                    inserted[0] = True
+
+            worker = mock.Mock(returncode=0, stdout=json.dumps({"pid": PID + 20, "success": True}).encode())
+            with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker), \
+                    mock.patch.object(VALIDATOR.MVP, "load_evidence", side_effect=AssertionError("禁止全量轮询")), \
+                    mock.patch.object(VALIDATOR.time, "monotonic", side_effect=lambda: clock[0]), \
+                    mock.patch.object(VALIDATOR.time, "sleep", side_effect=advance):
+                result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN)
+            self.assertTrue(result["crossed"])
+            self.assertIsNone(result["failure_code"])
+            self.assertEqual(result["timeout_seconds"], 60)
+            self.assertGreaterEqual(result["wait_duration_ms"], 9000)
+            self.assertEqual(result["source_to_receive_ms"], 9000)
+            with sqlite3.connect(database) as connection:
+                connection.execute("DELETE FROM events")
+            clock[0], inserted[0], arrival[0] = 0.0, False, 61
+            with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker), \
+                    mock.patch.object(VALIDATOR.time, "monotonic", side_effect=lambda: clock[0]), \
+                    mock.patch.object(VALIDATOR.time, "sleep", side_effect=advance):
+                result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN)
+            self.assertFalse(result["crossed"])
+            self.assertEqual(result["failure_code"], "negative_fence_timeout")
+            self.assertLess(result["wait_duration_ms"], 60100)
+
+    def test_fence_timeout_and_invalid_evidence_are_distinct_and_anonymous(self):
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-fence-invalid-", dir="/private/tmp") as directory:
+            database = Path(directory) / "events.sqlite"
+            with sqlite3.connect(database) as connection:
+                connection.executescript("PRAGMA user_version=3; CREATE TABLE events "
+                                         "(source_run_id TEXT,pid INTEGER,file_path TEXT,kind TEXT,event_json TEXT);")
+            worker = mock.Mock(returncode=0, stdout=json.dumps({"pid": PID + 20, "success": True}).encode())
+            for replacement in (None, ("file", {"readable": False}), ("file", {"path_truncated": True}),
+                                ("process", {"pid_version": None}), ("process", {"pid_version": True}),
+                                ("event", {"source_stream": "exec"}), ("event", {"global_seq": None}),
+                                ("event", {"global_seq": True}), ("event", {"source_run_id": "other-run"})):
+                with sqlite3.connect(database) as connection:
+                    connection.execute("DELETE FROM events")
+                    if replacement:
+                        invalid = event("open", identity=process(PID + 20, 23), file={
+                            "path": str(FENCE), "readable": True, "path_truncated": False,
+                        })
+                        container, fields = replacement
+                        (invalid if container == "event" else invalid[container]).update(fields)
+                        connection.execute("INSERT INTO events VALUES(?,?,?,?,?)", (
+                            SOURCE_RUN, PID + 20, str(FENCE), "open", json.dumps(invalid),
+                        ))
+                with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker):
+                    result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN, timeout=0)
+                self.assertFalse(result["crossed"])
+                self.assertEqual(result["failure_code"], "negative_fence_invalid" if replacement
+                                 else "negative_fence_timeout")
+                case, execution, evidence, _ = unrelated_fixture()
+                analysis = VALIDATOR.analyze_negative(case, execution, evidence, SOURCE_RUN, result, True)
+                summary = VALIDATOR.case_summary(case, execution, analysis, "synthetic-version")
+                self.assertEqual(summary["fence_failure_code"], result["failure_code"])
+                self.assertNotIn(str(FENCE), json.dumps(summary))
+                self.assertNotIn(str(PID + 20), json.dumps(summary))
+
     def test_negative_requires_exact_main_exec_receipt_before_the_file_fence(self):
         case, execution, evidence, barrier = unrelated_fixture()
         for field, value in (("main_exec_receipt", None),
@@ -272,7 +534,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
             self.assertEqual(payload, {"run_id": SOURCE_RUN, "pid": PID, "pid_version": PID_VERSION})
             return None if len(calls) == 1 else receipt
 
-        def fence(*_):
+        def fence(*_, **_kwargs):
             calls.append("fence")
             self.assertIs(execution["main_exec_processed_before_fence"], True)
             self.assertIs(execution["source_unknown_gap_before_fence"], True)
@@ -447,7 +709,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
             self.assertEqual(json.loads(stdout.getvalue())["tool_count"], 4)
             self.assertNotIn("SYNTHETIC_PRIVATE_FAILURE", stdout.getvalue())
 
-    def test_positive_sidecar_observation_is_opt_in_and_only_retains_parsed_numeric_time(self):
+    def test_positive_sidecar_timing_is_opt_in_and_only_retains_parsed_numeric_time(self):
         case = positive_case(mode="stdout", output_path=None)
         observer = mock.Mock()
         execution = {"pids": {PID}, "return_code": 0, "failure_code": None, "stdout_bytes": 1}
@@ -456,11 +718,11 @@ class ArchiveValidationSelfTest(unittest.TestCase):
             with mock.patch.object(VALIDATOR, "execute", return_value=dict(execution)) as execute:
                 VALIDATOR.process_case(case, Path("/usr/bin/synthetic"), None, SOURCE_RUN,
                                        SCRIPT_PATH, sidecar=observer, observe_positive=enabled)
-            self.assertIs(execute.call_args.kwargs["observer"], observer if enabled else None)
+            self.assertIs(execute.call_args.kwargs["observer"], observer)
             if enabled:
                 observer.begin_case.assert_called_once_with("zip", observe_timing=True)
             else:
-                observer.begin_case.assert_not_called()
+                observer.begin_case.assert_called_once_with("zip")
         sidecar = VALIDATOR.EsloggerSidecar()
         sidecar.begin_case("zip", observe_timing=True)
         sidecar.register_pids({PID})
@@ -597,7 +859,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
                     mock.patch.object(VALIDATOR.MVP, "stop_root", return_value=cleanup_ok) as stop:
                 self.assertEqual(observer.stop(), cleanup_ok)
                 self.assertEqual(observer.stop(), cleanup_ok)
-                stop.assert_called_once_with(None, observer.process)
+                stop.assert_called_once_with(None, observer.process, observer.cleanup_diagnostic_counts)
             self.assertEqual(observer.failure_codes, failures)
 
     def test_sidecar_start_preserves_the_authorized_terminal_session(self):
@@ -1349,7 +1611,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
         with mock.patch.object(observer, "_verified_processes", return_value=[]), \
                 mock.patch.object(VALIDATOR.MVP, "stop_root", return_value=True) as stop:
             self.assertTrue(observer.stop())
-            stop.assert_called_once_with(None, observer.process)
+            stop.assert_called_once_with(None, observer.process, observer.cleanup_diagnostic_counts)
         observer.process.terminate.assert_not_called()
 
     def test_report_directory_inside_repository_is_rejected(self):

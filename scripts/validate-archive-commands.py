@@ -62,6 +62,7 @@ ARCHIVE_STATIC_COVERAGE_CODES = {
 }
 PAYLOAD_BYTES = 1024 * 1024
 REAL_CASE_TIMEOUT_SECONDS = 8
+FENCE_TIMEOUT_SECONDS = 60
 TOOL_TIMEOUT_SECONDS = 60
 DESCENDANT_SCAN_INTERVAL_SECONDS = 0.05
 FAILURE_CODES = {
@@ -93,6 +94,8 @@ FAILURE_CODES = {
     "source_latency_exec_pair_missing", "source_latency_timestamp_missing",
     "source_latency_source_time_mismatch", "source_latency_execution_window_mismatch",
     "main_exec_receipt_missing",
+    "sudo_refresh_failed", "negative_fence_timeout", "negative_fence_invalid",
+    "negative_fence_worker_failed", "negative_fence_query_failed",
 }
 
 
@@ -329,6 +332,7 @@ class EsloggerSidecar:
         self.stopping = False
         self.stopped = False
         self.cleanup_result = None
+        self.cleanup_diagnostic_counts = {}
 
     @staticmethod
     def _ancestry_reaches(pid, launcher_pid):
@@ -525,7 +529,8 @@ class EsloggerSidecar:
                     continue
                 self._record_exec(record, received_timestamp_ns=received_timestamp_ns)
         except (OSError, ValueError):
-            self.failure_codes.add("sidecar_stream_failed")
+            if not self.stopping:
+                self.failure_codes.add("sidecar_stream_failed")
 
     def _read_stderr(self):
         # 原文只保留有界内存尾部，以识别跨 read 分片的固定诊断。
@@ -557,7 +562,8 @@ class EsloggerSidecar:
                     self.diagnostic_codes.add("source_startup_failed")
                 tail = text[-256:]
         except (OSError, ValueError):
-            self.failure_codes.add("sidecar_stream_failed")
+            if not self.stopping:
+                self.failure_codes.add("sidecar_stream_failed")
 
     @staticmethod
     def _pid_chain(candidate, pids, candidates):
@@ -648,27 +654,30 @@ class EsloggerSidecar:
                     info = MVP.process_info(pid)
                     if (not info or info[0] != 0 or Path(info[3]) != Path("/usr/bin/eslogger")
                             or not self._ancestry_reaches(pid, self.process.pid)):
+                        self.cleanup_diagnostic_counts["term_identity_unverified"] = (
+                            self.cleanup_diagnostic_counts.get("term_identity_unverified", 0) + 1
+                        )
                         cleanup_ok = False
                         continue
-                    if subprocess.run(
-                        ["/usr/bin/sudo", "-n", "/bin/kill", "-TERM", str(pid)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-                    ).returncode != 0:
+                    if not MVP.signal_root(pid, "TERM", self.cleanup_diagnostic_counts):
                         cleanup_ok = False
                 # sudo 已提升身份，普通用户不能直接 signal；只请求本轮 launcher 转发停止。
-                cleanup_ok = MVP.stop_root(None, self.process) and cleanup_ok
+                cleanup_ok = MVP.stop_root(None, self.process, self.cleanup_diagnostic_counts) and cleanup_ok
             elif self.eslogger_pid not in matches or len(matches) != 1:
+                self.cleanup_diagnostic_counts["term_identity_unverified"] = (
+                    self.cleanup_diagnostic_counts.get("term_identity_unverified", 0) + 1
+                )
                 cleanup_ok = False
-                MVP.stop_root(None, self.process)
+                MVP.stop_root(None, self.process, self.cleanup_diagnostic_counts)
             else:
                 info = MVP.process_info(self.eslogger_pid)
                 if (not info or info[0] != 0 or info[2] != self.eslogger_pgid
                         or Path(info[3]) != Path("/usr/bin/eslogger")):
+                    self.cleanup_diagnostic_counts["term_identity_unverified"] = (
+                        self.cleanup_diagnostic_counts.get("term_identity_unverified", 0) + 1
+                    )
                     cleanup_ok = False
-                elif subprocess.run(
-                    ["/usr/bin/sudo", "-n", "/bin/kill", "-TERM", str(self.eslogger_pid)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-                ).returncode != 0:
+                elif not MVP.signal_root(self.eslogger_pid, "TERM", self.cleanup_diagnostic_counts):
                     cleanup_ok = False
                 else:
                     deadline = time.monotonic() + 5
@@ -678,27 +687,32 @@ class EsloggerSidecar:
                         info = MVP.process_info(self.eslogger_pid)
                         if (info and info[0] == 0 and info[2] == self.eslogger_pgid
                                 and Path(info[3]) == Path("/usr/bin/eslogger")):
-                            killed = subprocess.run(
-                                ["/usr/bin/sudo", "-n", "/bin/kill", "-KILL", str(self.eslogger_pid)],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-                            ).returncode == 0
+                            killed = MVP.signal_root(self.eslogger_pid, "KILL", self.cleanup_diagnostic_counts)
                             cleanup_ok = cleanup_ok and killed
                         else:
+                            self.cleanup_diagnostic_counts["kill_identity_unverified"] = (
+                                self.cleanup_diagnostic_counts.get("kill_identity_unverified", 0) + 1
+                            )
                             cleanup_ok = False
         try:
             self.process.wait(timeout=6)
         except subprocess.TimeoutExpired:
+            self.cleanup_diagnostic_counts["launcher_wait_timeout"] = 1
             cleanup_ok = False
-        for reader in (self.stdout_reader, self.stderr_reader):
+        for name, reader, stream in (
+            ("stdout", self.stdout_reader, self.process.stdout),
+            ("stderr", self.stderr_reader, self.process.stderr),
+        ):
             if reader:
                 reader.join(timeout=3)
                 if reader.is_alive():
+                    self.cleanup_diagnostic_counts[name + "_reader_still_running"] = 1
                     cleanup_ok = False
-        if self.process.stdout:
-            self.process.stdout.close()
-        if self.process.stderr:
-            self.process.stderr.close()
+                    continue
+            if stream:
+                stream.close()
         if self.eslogger_pid and MVP.process_info(self.eslogger_pid):
+            self.cleanup_diagnostic_counts["source_still_running"] = 1
             cleanup_ok = False
         self.stopped = True
         self.cleanup_result = cleanup_ok
@@ -711,6 +725,7 @@ class EsloggerSidecar:
                 "exit_code": self.process.poll() if self.process else None,
                 "diagnostic_codes": sorted(self.diagnostic_codes),
                 "stderr_complete": self.stderr_complete,
+                "cleanup_diagnostic_counts": dict(sorted(self.cleanup_diagnostic_counts.items())),
                 "sequence_gap_count": self.sequence_gap_count,
                 "sequence_missing_total": self.sequence_missing_total,
                 "sequence_regression_count": self.sequence_regression_count,
@@ -721,7 +736,7 @@ class EsloggerSidecar:
 
 
 def execute(binary, argv, cwd, timeout=TOOL_TIMEOUT_SECONDS, capture_stdout=False, observer=None,
-            stdin_payload=None):
+            stdin_payload=None, authorization=None):
     started = time.monotonic_ns()
     started_timestamp_ns = time.time_ns()
     try:
@@ -769,6 +784,8 @@ def execute(binary, argv, cwd, timeout=TOOL_TIMEOUT_SECONDS, capture_stdout=Fals
             observer.register_pids(pids)
         next_scan = time.monotonic() + DESCENDANT_SCAN_INTERVAL_SECONDS
         while process.poll() is None and time.monotonic() < deadline:
+            if authorization:
+                authorization.require()
             if time.monotonic() >= next_scan:
                 pids.update(descendants(process.pid))
                 if observer:
@@ -1060,7 +1077,7 @@ def exact_inputs(archive, expected):
     return actual == {MVP.canonical_path(path) for path in expected}
 
 
-def matching_archive_exec(case, evidence, source_run_id, pids):
+def matching_archive_exec(case, evidence, source_run_id, pids, sidecar_execs=()):
     matched = []
     actual_tool_names = set()
     expected_names = expected_tool_names(case.tool)
@@ -1068,7 +1085,16 @@ def matching_archive_exec(case, evidence, source_run_id, pids):
         if event.get("kind") != "exec" or event_process_key(event) is None:
             continue
         key = event_process_key(event)
-        if key[0] != source_run_id or key[1] not in pids:
+        exact_sidecar = any(
+            type(row.get("target_pid")) is int and row["target_pid"] == key[1]
+            and type(row.get("target_pid_version")) is int and row["target_pid_version"] == key[2]
+            and row.get("executable") == executable_name(event)
+            and set(row.get("related_pid_chain") or []).intersection(pids)
+            for row in sidecar_execs
+        )
+        if key[0] != source_run_id or (key[1] not in pids and not exact_sidecar):
+            continue
+        if sidecar_execs and not exact_sidecar:
             continue
         event_tool = executable_name(event)
         if event_tool in expected_names:
@@ -1096,7 +1122,17 @@ def analyze_positive(case, execution, evidence, source_run_id):
               "notification_latency_ms": None, "actual_executable": None,
               "source_to_receive_ms": None, "receive_to_outbox_ms": None,
               "outbox_to_sent_ms": None}
-    matched, names = matching_archive_exec(case, evidence, source_run_id, execution["pids"])
+    sidecar = execution.get("sidecar") or {}
+    if execution.get("sidecar_failure_code") or sidecar.get("failure_code"):
+        code = execution.get("sidecar_failure_code") or sidecar["failure_code"]
+        result["failure_code"] = code if code in FAILURE_CODES else "sidecar_exec_identity_missing"
+        return result
+    execs = execution.get("sidecar_execs") or sidecar.get("execs") or []
+    if "sidecar" in execution and len(execs) != 1:
+        result["failure_code"] = "sidecar_exec_ambiguous" if execs else "sidecar_exec_identity_missing"
+        return result
+    result["sidecar_exec_count"] = len(execs)
+    matched, names = matching_archive_exec(case, evidence, source_run_id, execution["pids"], execs)
     result["actual_executable"] = sorted(names)[0] if names else None
     result["archive_exec_count"] = len(matched)
     if not matched:
@@ -1175,7 +1211,8 @@ def source_latency_comparison(case, execution, evidence, source_run_id):
               "main_source_in_execution_window": None, "sidecar_source_in_execution_window": None,
               "main_minus_sidecar_source_ns": None, "sidecar_source_to_receive_ms": None,
               "main_minus_sidecar_receive_ms": None}
-    matched, _ = matching_archive_exec(case, evidence, source_run_id, execution["pids"])
+    matched, _ = matching_archive_exec(case, evidence, source_run_id, execution["pids"],
+                                       execution.get("sidecar_execs") or [])
     if len(matched) != 1:
         result["failure_code"] = "source_latency_exec_pair_missing"
         return result
@@ -1260,7 +1297,7 @@ def matching_stdin_gaps(evidence, source_run_id, pid, pid_version, stream):
 
 
 def wait_for_negative_main_evidence(case, execution, database, source_run_id, control_socket,
-                                    timeout=REAL_CASE_TIMEOUT_SECONDS):
+                                    timeout=REAL_CASE_TIMEOUT_SECONDS, authorization=None):
     execution["main_exec_processed_before_fence"] = False
     execution["source_unknown_gap_before_fence"] = False
     execs = execution.get("sidecar_execs") or (execution.get("sidecar") or {}).get("execs") or []
@@ -1272,6 +1309,8 @@ def wait_for_negative_main_evidence(case, execution, database, source_run_id, co
     deadline = time.monotonic() + timeout
     failure = "main_exec_receipt_missing"
     while time.monotonic() < deadline:
+        if authorization:
+            authorization.require()
         try:
             receipt = MVP.control(control_socket, "exec_receipt", {
                 "run_id": source_run_id, "pid": pid, "pid_version": pid_version,
@@ -1300,6 +1339,11 @@ def analyze_negative(case, execution, evidence, source_run_id, barrier, healthy)
               "notification_latency_ms": None, "actual_executable": None,
               "sidecar_exec_count": 0,
               "barrier_crossed": False}
+    if barrier:
+        result.update(fence_wait_duration_ms=barrier.get("wait_duration_ms"),
+                      fence_source_to_receive_ms=barrier.get("source_to_receive_ms"),
+                      fence_timeout_seconds=barrier.get("timeout_seconds"),
+                      fence_failure_code=barrier.get("failure_code"))
     if not execution.get("operation_verified"):
         result["failure_code"] = (
             execution.get("failure_code") or
@@ -1373,7 +1417,8 @@ def analyze_negative(case, execution, evidence, source_run_id, barrier, healthy)
             or (MVP.source_stream(receipt), MVP.source_stream(barrier)) not in (
                 ("combined", "combined"), ("exec", "activity"),
             )):
-        result["failure_code"] = "negative_fence_missing"
+        code = barrier.get("failure_code")
+        result["failure_code"] = code if code in FAILURE_CODES else "negative_fence_missing"
         return result
     if case.mode == "stdin":
         stream = MVP.source_stream(receipt)
@@ -1448,7 +1493,16 @@ def fence_worker(path):
         return 2
 
 
-def run_fence(script, path, database, source_run_id, timeout=8):
+def run_fence(script, path, database, source_run_id, timeout=FENCE_TIMEOUT_SECONDS, authorization=None):
+    started = time.monotonic()
+    result = {"pid": None, "pid_version": None, "crossed": False,
+              "timeout_seconds": timeout, "wait_duration_ms": 0,
+              "source_to_receive_ms": None, "failure_code": "negative_fence_worker_failed"}
+
+    def finished(code):
+        result.update(failure_code=code, wait_duration_ms=round((time.monotonic() - started) * 1000))
+        return result
+
     try:
         process = subprocess.run(
             [sys.executable, "-B", str(script), "--fence-worker", str(path)],
@@ -1457,33 +1511,69 @@ def run_fence(script, path, database, source_run_id, timeout=8):
         )
         metadata = json.loads(process.stdout)
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
-        return {"pid": None, "pid_version": None, "crossed": False}
-    if process.returncode or not metadata.get("success"):
-        return {"pid": metadata.get("pid"), "pid_version": None, "crossed": False}
+        return finished("negative_fence_worker_failed")
+    if (not isinstance(metadata, dict) or type(metadata.get("pid")) is not int
+            or metadata["pid"] <= 0 or process.returncode or metadata.get("success") is not True):
+        return finished("negative_fence_worker_failed")
+    result["pid"] = metadata["pid"]
     expected = MVP.canonical_path(path)
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        evidence = MVP.load_evidence(database)
-        for event in evidence["events"]:
-            file = event.get("file") or {}
-            identity = event.get("process") or {}
-            if (event.get("source_run_id") == source_run_id
-                    and identity.get("pid") == metadata["pid"]
-                    and identity.get("pid_version") is not None
-                    and event.get("kind") in ("open", "mmap")
-                    and file.get("readable") is True and not file.get("path_truncated")
-                    and MVP.canonical_path(file.get("path")) == expected
-                    and MVP.source_stream(event) in ("combined", "activity")
-                    and event.get("global_seq") is not None):
-                return {"pid": metadata["pid"], "pid_version": identity["pid_version"],
-                        "source_stream": MVP.source_stream(event),
-                        "global_seq": event["global_seq"], "crossed": True}
-        time.sleep(0.05)
-    return {"pid": metadata.get("pid"), "pid_version": None, "crossed": False}
+    invalid_observed = False
+    try:
+        # 屏障只读取本轮独立 worker 的目标文件，不反复装载全部业务证据。
+        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1) as connection:
+            if connection.execute("PRAGMA user_version").fetchone()[0] != 3:
+                return finished("negative_fence_query_failed")
+            first_query = True
+            while True:
+                if not first_query and time.monotonic() > deadline:
+                    break
+                first_query = False
+                if authorization:
+                    authorization.require()
+                rows = connection.execute(
+                    "SELECT event_json FROM events WHERE source_run_id=? AND pid=? "
+                    "AND file_path=? AND kind IN ('open','mmap')",
+                    (source_run_id, metadata["pid"], expected),
+                )
+                for row in rows:
+                    try:
+                        event = json.loads(row[0])
+                        file = event.get("file") or {}
+                        identity = event.get("process") or {}
+                        eligible = (
+                            event.get("source_run_id") == source_run_id
+                            and type(identity.get("pid")) is int and identity["pid"] == metadata["pid"]
+                            and type(identity.get("pid_version")) is int and identity["pid_version"] >= 0
+                            and event.get("kind") in ("open", "mmap")
+                            and file.get("readable") is True and file.get("path_truncated") is False
+                            and isinstance(file.get("path"), str) and MVP.canonical_path(file["path"]) == expected
+                            and MVP.source_stream(event) in ("combined", "activity")
+                            and type(event.get("global_seq")) is int and event["global_seq"] >= 0
+                        )
+                    except (ValueError, TypeError, AttributeError):
+                        eligible = False
+                    if eligible:
+                        if time.monotonic() > deadline:
+                            return finished("negative_fence_timeout")
+                        result.update(pid_version=identity["pid_version"],
+                                      source_stream=MVP.source_stream(event),
+                                      global_seq=event["global_seq"], crossed=True)
+                        source, received = event.get("source_timestamp_ms"), event.get("received_timestamp_ms")
+                        if type(source) is int and type(received) is int:
+                            result["source_to_receive_ms"] = received - source
+                        return finished(None)
+                    invalid_observed = True
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+    except (OSError, sqlite3.Error):
+        return finished("negative_fence_query_failed")
+    return finished("negative_fence_invalid" if invalid_observed else "negative_fence_timeout")
 
 
 def process_case(case, binary, database, source_run_id, script, sidecar=None, observe_positive=False,
-                 control_socket=None):
+                 control_socket=None, authorization=None):
     negative = is_negative(case.mode)
     if case.preparation_failure:
         execution = {"return_code": None, "pids": set(), "duration_ms": None,
@@ -1492,22 +1582,23 @@ def process_case(case, binary, database, source_run_id, script, sidecar=None, ob
     if case.mode == "update" and not case.outputs[0].is_file():
         return {"return_code": None, "pids": set(), "duration_ms": None, "stdout_bytes": 0,
                 "failure_code": "update_seed_failed"}, None
-    observer = sidecar if negative or observe_positive else None
+    observer = sidecar
     if observer:
         observer.begin_case(case.tool, observe_timing=True) if observe_positive else observer.begin_case(case.tool)
     execution = execute(binary, case.argv, case.cwd, capture_stdout=case.stdout_expected,
-                        observer=observer, stdin_payload=case.stdin_payload)
+                        observer=observer, stdin_payload=case.stdin_payload, authorization=authorization)
     if execution["failure_code"]:
         return execution, None
     validate_operation(case, execution)
     if negative:
         if not execution.get("operation_verified"):
             return execution, None
-        failure = wait_for_negative_main_evidence(case, execution, database, source_run_id, control_socket)
+        failure = wait_for_negative_main_evidence(case, execution, database, source_run_id, control_socket,
+                                                  authorization=authorization)
         if failure:
             execution["failure_code"] = failure
             return execution, None
-        barrier = run_fence(script, case.fence_path, database, source_run_id)
+        barrier = run_fence(script, case.fence_path, database, source_run_id, authorization=authorization)
         return execution, barrier
     return execution, None
 
@@ -1556,6 +1647,10 @@ def case_summary(case, execution, result, version):
         "outbox_to_sent_ms": result.get("outbox_to_sent_ms"),
         "actual_executable": result.get("actual_executable"),
         "barrier_crossed": result.get("barrier_crossed", False),
+        "fence_wait_duration_ms": result.get("fence_wait_duration_ms"),
+        "fence_source_to_receive_ms": result.get("fence_source_to_receive_ms"),
+        "fence_timeout_seconds": result.get("fence_timeout_seconds"),
+        "fence_failure_code": result.get("fence_failure_code"),
         "passed": bool(result.get("passed")) and failure is None,
         "failure_code": failure,
     }
@@ -1684,8 +1779,11 @@ def real_validation(args, report, tools, version_rows):
     startup_codes, host_codes = [], []
     bridge = None
     sidecar = EsloggerSidecar()
+    authorization = MVP.SudoAuthorization()
+    root_cleanup_diagnostics = {}
     case_results = []
     try:
+        authorization.require(force=True)
         daemon = subprocess.Popen(
             [str(binary), "daemon", "--socket", str(collector_socket), "--control-socket",
              str(control_socket), "--db", str(database)], stdout=subprocess.DEVNULL,
@@ -1725,6 +1823,7 @@ def real_validation(args, report, tools, version_rows):
         sidecar.start()
         summary["sidecar_started"] = sidecar.root_identity_verified
         for case_number, case in enumerate(cases, 1):
+            authorization.require(force=True)
             tool = case.tool
             if version_rows[tool]["version"] is None or version_rows[tool]["version_return_code"] not in (0, None):
                 version_failure = ("version_probe_failed" if version_rows[tool]["version_return_code"] not in
@@ -1745,7 +1844,8 @@ def real_validation(args, report, tools, version_rows):
                 continue
             execution, barrier = process_case(case, tools[tool], database, source_run_id,
                                               Path(__file__).resolve(), sidecar=sidecar,
-                                              observe_positive=diagnostic, control_socket=control_socket)
+                                              observe_positive=diagnostic, control_socket=control_socket,
+                                              authorization=authorization)
             deadline = time.monotonic() + REAL_CASE_TIMEOUT_SECONDS
             result = {"passed": False, "failure_code": None, "evidence_event_count": 0,
                       "archive_exec_count": 0, "archive_command_alert_count": 0,
@@ -1755,6 +1855,7 @@ def real_validation(args, report, tools, version_rows):
                       "barrier_crossed": False}
             if case.positive:
                 while time.monotonic() < deadline:
+                    authorization.require()
                     evidence = MVP.load_evidence(database)
                     result = analyze_positive(case, execution, evidence, source_run_id)
                     if result["passed"] or result["failure_code"] not in (
@@ -1839,6 +1940,12 @@ def real_validation(args, report, tools, version_rows):
         summary["tools"] = summarize_tools(tools, version_rows, case_results, required_tools)
         return summary
     finally:
+        authorization.refresh(force=True)
+        summary["sudo_authorization"] = authorization.summary()
+        if authorization.failure_counts:
+            summary["failure_codes"].append("sudo_authorization_required" if
+                authorization.failure_counts.get("sudo_authorization_required") else "sudo_refresh_failed")
+            summary["result"] = validation_result(diagnostic, False)
         try:
             sidecar_cleanup_ok = sidecar.stop()
         except (OSError, subprocess.SubprocessError):
@@ -1867,12 +1974,13 @@ def real_validation(args, report, tools, version_rows):
         if host_reader:
             host_reader.join(timeout=3)
         try:
-            cleanup_ok = MVP.stop_root(bridge, root_process)
+            cleanup_ok = MVP.stop_root(bridge, root_process, root_cleanup_diagnostics)
         except (OSError, subprocess.SubprocessError):
             cleanup_ok = False
         if startup_reader:
             startup_reader.join(timeout=3)
         summary["root_cleanup_complete"] = cleanup_ok
+        summary["root_cleanup_diagnostic_counts"] = dict(sorted(root_cleanup_diagnostics.items()))
         summary["host_startup_diagnostic_codes"] = host_codes[:8]
         summary["root_startup_diagnostic_codes"] = startup_codes[:8]
         if not cleanup_ok:

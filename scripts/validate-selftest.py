@@ -448,6 +448,52 @@ class ValidationHostLifecycleTests(unittest.TestCase):
 
 
 class ValidationBridgeIdentityTests(unittest.TestCase):
+    def test_authorization_refresh_is_noninteractive_limited_and_failure_visible(self):
+        clock = [0.0]
+        responses = [SimpleNamespace(returncode=0, stderr=b""),
+                     SimpleNamespace(returncode=1, stderr=b"sudo: a password is required SYNTHETIC_PRIVATE_MARKER")]
+        with patch.object(validation.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(validation.subprocess, "run", side_effect=responses) as run:
+            authorization = validation.SudoAuthorization()
+            authorization.require()
+            clock[0] = 29
+            authorization.require()
+            self.assertEqual(run.call_count, 1)
+            clock[0] = 31
+            with self.assertRaisesRegex(RuntimeError, "^sudo_authorization_required$"):
+                authorization.require()
+            self.assertEqual(run.call_args.args[0], ["/usr/bin/sudo", "-n", "-v"])
+            self.assertEqual(run.call_args.kwargs["stdin"], validation.subprocess.DEVNULL)
+        self.assertEqual(authorization.summary()["refresh_attempts"], 2)
+        self.assertEqual(authorization.summary()["failure_counts"], {"sudo_authorization_required": 1})
+        self.assertNotIn("SYNTHETIC_PRIVATE_MARKER", json.dumps(authorization.summary()))
+
+    def test_failed_root_term_keeps_static_diagnostic_and_does_not_claim_cleanup(self):
+        diagnostics = {}
+        with patch.object(validation, "process_info", return_value=(0, 100, 200, str(self.collector))), \
+                patch.object(validation.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=1, stderr=b"sudo: a password is required SYNTHETIC_PRIVATE_MARKER")):
+            complete = validation.stop_root({"pid": 200, "pgid": 200,
+                                            "collector": str(self.collector), "source_pids": []},
+                                           self.launcher, diagnostics)
+        self.assertFalse(complete)
+        self.assertEqual(diagnostics, {"term_sudo_authorization_required": 1})
+        self.assertNotIn("SYNTHETIC_PRIVATE_MARKER", json.dumps(diagnostics))
+
+    def test_root_signal_failures_keep_only_fixed_term_and_kill_counts(self):
+        for stderr, expected in (
+            (b"sudo: a password is required SYNTHETIC_PRIVATE_MARKER", "sudo_authorization_required"),
+            (b"kill: Operation not permitted SYNTHETIC_PRIVATE_MARKER", "permission_denied"),
+            (b"kill: No such process SYNTHETIC_PRIVATE_MARKER", "process_missing"),
+            (b"SYNTHETIC_PRIVATE_MARKER", "command_failed"),
+        ):
+            diagnostics = {}
+            with patch.object(validation.subprocess, "run", return_value=SimpleNamespace(returncode=1, stderr=stderr)):
+                for signal_name in ("TERM", "KILL", "TERM"):
+                    self.assertFalse(validation.signal_root(200, signal_name, diagnostics))
+            self.assertEqual(diagnostics, {"term_" + expected: 2, "kill_" + expected: 1})
+            self.assertNotIn("SYNTHETIC_PRIVATE_MARKER", json.dumps(diagnostics))
+
     def setUp(self):
         self.collector = Path("/Library/CodePerimeter/501/codeperimeter")
         self.launcher = SimpleNamespace(pid=100, poll=lambda: None)
