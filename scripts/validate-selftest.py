@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """验收判定器的匿名自测；不启动采集，不能作为真实 ES 或通知验收。"""
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import io
+import itertools
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import subprocess
 import sys
@@ -246,6 +249,146 @@ class ValidationStartupTests(unittest.TestCase):
             with self.assertRaisesRegex(validation.CollectorStartupError, "退出码 7"):
                 validation.wait_for_bridge(Path("/anonymous.sock"), SimpleNamespace(poll=lambda: 7), Path("/anonymous"))
             control.assert_not_called()
+
+
+class ValidationHostLifecycleTests(unittest.TestCase):
+    def exercise_run(self, mode):
+        with tempfile.TemporaryDirectory(prefix="cpv-report-test-", dir="/private/tmp") as directory:
+            report = Path(directory) / ("persistent-report-" + "x" * 110)
+            report.mkdir(mode=0o700)
+            project = report / "workspace" / "project"
+            args = SimpleNamespace(binary=Path("/anonymous/codeperimeter"), collector_binary=None,
+                                   preflight_only=mode == "preflight_only")
+            summary = {"real_source_confirmed": False}
+            launches, runtime_paths, statuses = [], [], []
+            binding = socket.socket(socket.AF_UNIX)
+            self.addCleanup(binding.close)
+            class Process:
+                def __init__(self, code=None, diagnostic=b""):
+                    self.returncode, self.pid = code, 123
+                    self.stderr, self.stdin = io.BytesIO(diagnostic), io.StringIO()
+                def poll(self):
+                    return self.returncode
+                def wait(self, timeout=None):
+                    self.returncode = self.returncode or 0
+                    return self.returncode
+                def terminate(self):
+                    self.returncode = 0
+                    binding.close()
+                kill = terminate
+            def launch(command, **kwargs):
+                launches.append(command)
+                if command[1] == "daemon":
+                    self.assertEqual(kwargs["stderr"], subprocess.PIPE)
+                    path = Path(command[command.index("--control-socket") + 1])
+                    runtime_paths.append(path)
+                    self.assertLess(len(os.fsencode(path)), 104)
+                    self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+                    self.assertEqual(Path(command[command.index("--db") + 1]), report / "host" / "events.sqlite")
+                    if mode == "early_exit":
+                        return Process(7, b"path must be shorter than SUN_LEN /unknown-private-marker\n")
+                    binding.bind(str(path))
+                    return Process()
+                if command[1] == "notify":
+                    self.assertEqual(Path(command[command.index("--control-socket") + 1]), runtime_paths[0])
+                return Process()
+            def invoke(command, **kwargs):
+                if "prepare" in command:
+                    if mode == "prepare_error":
+                        raise RuntimeError("anonymous prepare failure")
+                    project.mkdir(parents=True)
+                    return SimpleNamespace(stdout=json.dumps({"project_root": str(project)}))
+                return SimpleNamespace(stdout=json.dumps({"pid": 999, "path": str(project / ".fence")}))
+            status = {"observed_events_by_kind": {kind: 0 for kind in validation.KINDS},
+                      "collector_dropped_lines": 0, "reader_dropped_frames": 0,
+                      "database_gap_events": 0, "database_state": "ready", "state": "ready"}
+            def request(path, operation, payload=None):
+                statuses.append(operation)
+                self.assertEqual(path, runtime_paths[0])
+                if mode == "interrupt":
+                    raise KeyboardInterrupt()
+                if operation == "list_directories":
+                    return [{"path": str(project)}]
+                return status | {"collector_state": "connected" if len(statuses) < 6 else "disconnected"}
+            events = {"events": [event(1000, file=event(1000)["file"] | {"path": str(project / "src/file.txt")})], "health": []}
+            ticks = itertools.count()
+            allocation = validation.tempfile.mkdtemp
+            def allocate(*arguments, **kwargs):
+                path = allocation(*arguments, **kwargs)
+                if mode in ("prepare_error", "preflight_error", "preflight_only"):
+                    runtime_paths.append(Path(path) / "host.sock")
+                return path
+            with ExitStack() as patches:
+                for name, kwargs in {
+                    "preflight": {"side_effect": RuntimeError("anonymous preflight failure")} if mode == "preflight_error" else {"return_value": {}},
+                    "start_preloaded": {"return_value": (Process(0), [{"phase": "completed"}], SimpleNamespace(join=lambda timeout: None))},
+                    "control": {"side_effect": request}, "load_evidence": {"return_value": events},
+                    "sender": {"return_value": [{"pid": 100}]},
+                    "wait_for_bridge": {"return_value": {}}, "performance": {"return_value": None},
+                    "stop_root": {"return_value": True},
+                    "wait_for_completion": {"return_value": ({"completed": True}, events)},
+                    "analyze": {"return_value": {"cases": [{"passed": True}], "nine_event_aggregate_passed": True,
+                                                       "generation_latency": {"within_3000_ms": True},
+                                                       "notification_send_latency": {"within_3000_ms": True}}},
+                }.items():
+                    patches.enter_context(patch.object(validation, name, **kwargs))
+                patches.enter_context(patch.object(validation.subprocess, "Popen", side_effect=launch))
+                patches.enter_context(patch.object(validation.subprocess, "run", side_effect=invoke))
+                patches.enter_context(patch.object(validation.tempfile, "mkdtemp", side_effect=allocate))
+                patches.enter_context(patch.object(validation.time, "sleep"))
+                patches.enter_context(patch.object(validation.time, "monotonic", side_effect=lambda: next(ticks)))
+                if mode == "early_exit":
+                    with self.assertRaisesRegex(RuntimeError, "普通用户 daemon.*退出码 7"):
+                        validation.run(args, report, summary)
+                elif mode == "interrupt":
+                    with self.assertRaises(KeyboardInterrupt):
+                        validation.run(args, report, summary)
+                elif mode == "preflight_error":
+                    with self.assertRaisesRegex(RuntimeError, "anonymous preflight failure"):
+                        validation.run(args, report, summary)
+                elif mode == "prepare_error":
+                    with self.assertRaisesRegex(RuntimeError, "anonymous prepare failure"):
+                        validation.run(args, report, summary)
+                else:
+                    self.assertEqual(validation.run(args, report, summary), 0)
+            self.assertTrue(runtime_paths)
+            self.assertTrue(all(not path.parent.exists() for path in runtime_paths))
+            self.assertTrue(report.is_dir())
+            if mode == "normal":
+                self.assertTrue((report / "operations.json").is_file())
+                self.assertTrue(project.is_dir())
+                collector = next(command for command in launches if command[0] == "/usr/bin/sudo")
+                self.assertEqual(collector[collector.index("--socket") + 1],
+                                 f"/Library/CodePerimeter/{os.getuid()}/run/collector.sock")
+            else:
+                self.assertFalse(any(command[0] == "/usr/bin/sudo" for command in launches))
+            if mode in ("preflight_only", "preflight_error", "prepare_error"):
+                self.assertFalse(launches)
+            if mode == "early_exit":
+                self.assertFalse(statuses)
+                self.assertEqual(summary["phase"], "host_startup")
+                self.assertEqual(summary["host_startup"]["exit_code"], 7)
+                self.assertEqual(summary["host_startup"]["diagnostic_codes"], ["socket_path_too_long"])
+                self.assertTrue(summary["host_startup"]["stderr_complete"])
+                self.assertNotIn("unknown-private-marker", str(summary))
+
+    def test_long_persistent_report_uses_short_private_socket_and_cleans_after_success(self):
+        self.exercise_run("normal")
+
+    def test_host_early_exit_is_diagnosed_before_any_root_launch_and_cleans_runtime(self):
+        self.exercise_run("early_exit")
+
+    def test_keyboard_interrupt_cleans_runtime_without_starting_root(self):
+        self.exercise_run("interrupt")
+
+    def test_prepare_failure_also_cleans_runtime(self):
+        self.exercise_run("prepare_error")
+
+    def test_preflight_failure_also_cleans_runtime(self):
+        self.exercise_run("preflight_error")
+
+    def test_preflight_only_cleans_runtime_without_starting_any_process(self):
+        self.exercise_run("preflight_only")
 
 
 class ValidationBridgeIdentityTests(unittest.TestCase):

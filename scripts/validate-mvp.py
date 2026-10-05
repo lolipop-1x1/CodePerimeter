@@ -51,6 +51,10 @@ class CollectorStartupError(RuntimeError):
     pass
 
 
+class HostStartupError(RuntimeError):
+    code = "host_exited"
+
+
 class BridgeIdentityError(CollectorStartupError):
     def __init__(self, code):
         self.code = code
@@ -66,7 +70,8 @@ def startup_diagnostics(stream, codes):
                 ("password is required", "sudo_authorization_required"),
                 ("a password is required", "sudo_authorization_required"),
                 ("No such file or directory", "missing_install_path"),
-                ("Permission denied", "permission_denied"))
+                ("Permission denied", "permission_denied"),
+                ("path must be shorter than SUN_LEN", "socket_path_too_long"))
     while True:
         chunk = stream.readline(4096)
         if not chunk:
@@ -119,12 +124,21 @@ def wait_for(callback, timeout=15, timeout_message="等待真实宿主／采集�
             result = callback()
             if result:
                 return result
-        except CollectorStartupError:
+        except (CollectorStartupError, HostStartupError):
             raise
         except (OSError, ValueError, RuntimeError):
             pass
         time.sleep(0.1)
     raise TimeoutError(timeout_message)
+
+
+def wait_for_host(control_socket, daemon, timeout=15):
+    def status():
+        code = daemon.poll()
+        if code is not None:
+            raise HostStartupError(f"普通用户 daemon 在连接前退出，退出码 {code}；见 host_startup 静态诊断")
+        return control(control_socket, "status")
+    return wait_for(status, timeout, "普通用户宿主启动等待超时；没有使用 fixture")
 
 
 def check_root_chain(path):
@@ -534,6 +548,12 @@ def start_preloaded(workspace):
 
 
 def run(args, report, summary):
+    # 持久报告路径可能超过 Unix socket 长度上限；私有运行目录覆盖全部退出路径。
+    with tempfile.TemporaryDirectory(prefix="cpv-", dir="/private/tmp") as runtime:
+        return run_with_socket(args, report, summary, Path(runtime) / "host.sock")
+
+
+def run_with_socket(args, report, summary, control_socket):
     summary["phase"] = "preflight"
     binary = args.binary.resolve()
     collector = args.collector_binary or Path(f"/Library/CodePerimeter/{os.getuid()}/codeperimeter")
@@ -545,7 +565,7 @@ def run(args, report, summary):
     summary["phase"] = "synthetic_project_prepare"
     workspace, host = report / "workspace", report / "host"
     host.mkdir(mode=0o700)
-    control_socket, database = host / "host.sock", host / "events.sqlite"
+    database = host / "events.sqlite"
     prepared = subprocess.run([sys.executable, "-B", str(SENDER), "prepare", "--root", str(workspace), "--files", "55"], capture_output=True, text=True, check=True, start_new_session=True)
     project = Path(json.loads(prepared.stdout)["project_root"]).resolve()
     preloaded, preload_rows, preload_reader = start_preloaded(workspace)
@@ -554,10 +574,13 @@ def run(args, report, summary):
     stop_sampling, samples = threading.Event(), []
     operations = []
     startup_codes, startup_reader = [], None
+    host_codes, host_reader = [], None
     try:
         summary["phase"] = "host_startup"
-        daemon = subprocess.Popen([str(binary), "daemon", "--socket", str(collector_socket), "--control-socket", str(control_socket), "--db", str(database)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        wait_for(lambda: control(control_socket, "status"))
+        daemon = subprocess.Popen([str(binary), "daemon", "--socket", str(collector_socket), "--control-socket", str(control_socket), "--db", str(database)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+        host_reader = threading.Thread(target=startup_diagnostics, args=(daemon.stderr, host_codes), daemon=True)
+        host_reader.start()
+        wait_for_host(control_socket, daemon)
         control(control_socket, "add_directories", {"entries": [{"path": str(project), "sources": ["manual"]}]})
         configured = control(control_socket, "list_directories")
         if len(configured) != 1 or Path(configured[0]["path"]) != project:
@@ -658,6 +681,12 @@ def run(args, report, summary):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+        if host_reader:
+            host_reader.join(timeout=3)
+        summary["host_startup"] = {"exit_code": daemon.poll() if daemon else None,
+                                   "diagnostic_codes": list(host_codes),
+                                   "stderr_complete": host_reader is not None and not host_reader.is_alive(),
+                                   "method": "最多8种白名单静态分类；原stderr不落盘"}
         summary["root_cleanup_complete"] = stop_root(bridge, root_process)
         if startup_reader:
             startup_reader.join(timeout=3)
