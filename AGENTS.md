@@ -1,6 +1,7 @@
 # 开发约定
 
 - 使用中文回答，代码注释使用中文。
+- 快速开发阶段直接在 `main` 分支开发、提交和推送，不创建 PR。
 - 开始产品或实现工作前读取 [CONTEXT.md](CONTEXT.md)；任务范围和术语以该文档为准。
 - 涉及系统接入、模块 Interface 或平台迁移时读取 [整体架构与技术候选](docs/architecture/technical-options.md)。
 - 涉及文件、打包、加密、权限或签名判断时读取 [核心可行性调研](docs/research/feasibility.md)；涉及现有工程复用时读取 [现有项目与复用](docs/research/existing-projects.md)。
