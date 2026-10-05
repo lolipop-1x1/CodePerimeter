@@ -10,6 +10,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -570,7 +571,7 @@ struct CollectorSignals {
 
 impl CollectorSignals {
     fn install() -> io::Result<Self> {
-        // sudo 完成同 TTY 认证后才隔离采集组；eslogger 继承本组。
+        // sudo 完成同 TTY 认证后才隔离采集组；保留会话与 TTY。
         if unsafe { libc::getpgrp() } != unsafe { libc::getpid() }
             && unsafe { libc::setpgid(0, 0) } != 0
         {
@@ -613,10 +614,21 @@ impl CollectorSource {
         drops: Arc<AtomicU64>,
         timing: Arc<SourceTiming>,
     ) -> io::Result<Self> {
+        let mut command = Command::new("/usr/bin/eslogger");
+        command.args(events);
+        Self::start_command(command, drops, timing)
+    }
+
+    fn start_command(
+        mut command: Command,
+        drops: Arc<AtomicU64>,
+        timing: Arc<SourceTiming>,
+    ) -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
         let mut source = Self {
-            child: Command::new("/usr/bin/eslogger")
-                .args(events)
+            // 来源各自建立进程组，不改变继承的会话或 TTY。
+            child: command
+                .process_group(0)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .stdin(Stdio::null())
@@ -1556,12 +1568,14 @@ mod tests {
             Ok("yes")
         );
         let _signals = CollectorSignals::install().unwrap();
-        let mut source = CollectorSource {
-            child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
-            receiver: None,
-            stdout_reader: None,
-            stderr_reader: None,
-        };
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut source = CollectorSource::start_command(
+            command,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(SourceTiming::default()),
+        )
+        .unwrap();
         println!(
             "COLLECTOR_READY {} {} {}",
             std::process::id(),
@@ -1651,6 +1665,66 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn owned_sources_isolate_groups_inherit_session_and_tty_and_reap_precisely() {
+        let parent_pid = unsafe { libc::getpid() };
+        let parent_group = unsafe { libc::getpgrp() };
+        let parent_session = unsafe { libc::getsid(0) };
+        let tty = |pid: libc::pid_t| {
+            let output = Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "tty="])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let parent_tty = tty(parent_pid);
+        let start_source = || {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            CollectorSource::start_command(
+                command,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(SourceTiming::default()),
+            )
+            .unwrap()
+        };
+        let mut first = start_source();
+        let mut second = start_source();
+        let mut unrelated = CollectorSource {
+            child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
+            receiver: None,
+            stdout_reader: None,
+            stderr_reader: None,
+        };
+        let pids = [
+            first.child.id() as libc::pid_t,
+            second.child.id() as libc::pid_t,
+        ];
+        for pid in pids {
+            assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+            assert_ne!(unsafe { libc::getpgid(pid) }, parent_group);
+            assert_eq!(unsafe { libc::getsid(pid) }, parent_session);
+            assert_eq!(tty(pid), parent_tty);
+        }
+        assert_ne!(unsafe { libc::getpgid(pids[0]) }, unsafe {
+            libc::getpgid(pids[1])
+        });
+        first.stop().unwrap();
+        assert!(second.child.try_wait().unwrap().is_none());
+        assert!(unrelated.child.try_wait().unwrap().is_none());
+        drop(second);
+        for pid in pids {
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
+        assert_eq!(unsafe { libc::getpgrp() }, parent_group);
+        assert_eq!(unsafe { libc::getsid(0) }, parent_session);
+        assert_eq!(tty(parent_pid), parent_tty);
+        assert!(unrelated.child.try_wait().unwrap().is_none());
+        unrelated.stop().unwrap();
     }
 
     #[test]
