@@ -2,8 +2,10 @@
 """对归档验收裁决器执行反误通过自检。"""
 
 import copy
+import contextlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -175,6 +177,199 @@ def reverse_fixture():
 
 
 class ArchiveValidationSelfTest(unittest.TestCase):
+    def test_runner_preparation_failures_and_interrupts_do_not_echo_private_arguments(self):
+        runner = SCRIPT_PATH.with_name("run-archive-validation.sh").read_text()
+        inline = runner.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        namespace = {"__name__": "runner_selftest"}
+        exec(compile(inline, "synthetic-runner", "exec"), namespace)
+        private_path = Path("/private/tmp/SYNTHETIC_PRIVATE_RUNNER/project")
+        for error, expected in (
+            (OSError("SYNTHETIC_PRIVATE_RUNNER", str(private_path)), 2),
+            (VALIDATOR.subprocess.CalledProcessError(7, [str(private_path)]), 2),
+            (KeyboardInterrupt(), 130),
+        ):
+            stderr = io.StringIO()
+            with mock.patch.object(namespace["os"].path, "lexists", return_value=False), \
+                    mock.patch.object(namespace["subprocess"], "run", side_effect=error), \
+                    contextlib.redirect_stderr(stderr):
+                self.assertEqual(namespace["prepare_collector"](private_path), expected)
+            self.assertNotIn("SYNTHETIC_PRIVATE_RUNNER", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertEqual(json.loads(stderr.getvalue())["failure_code"],
+                             "interrupted" if expected == 130 else "collector_prepare_failed")
+        stderr = io.StringIO()
+        with mock.patch.object(namespace["os"].path, "lexists", return_value=True), \
+                mock.patch.object(namespace["importlib"].util, "spec_from_file_location",
+                                  side_effect=OSError(str(private_path))), \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(namespace["prepare_collector"](private_path), 2)
+        self.assertNotIn("SYNTHETIC_PRIVATE_RUNNER", stderr.getvalue())
+        validation = mock.Mock()
+        validation.trusted_collector.side_effect = RuntimeError(str(private_path))
+        stderr = io.StringIO()
+        with mock.patch.object(namespace["os"].path, "lexists", return_value=True), \
+                mock.patch.object(namespace["importlib"].util, "spec_from_file_location") as spec, \
+                mock.patch.object(namespace["importlib"].util, "module_from_spec", return_value=validation), \
+                mock.patch.object(namespace["subprocess"], "run") as run, \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(namespace["prepare_collector"](private_path), 2)
+            spec.return_value.loader.exec_module.assert_called_once_with(validation)
+            validation.trusted_collector.assert_called_once()
+            run.assert_not_called()
+        self.assertEqual(json.loads(stderr.getvalue())["failure_code"], "collector_untrusted")
+        self.assertNotIn("SYNTHETIC_PRIVATE_RUNNER", stderr.getvalue())
+
+    def test_operation_validation_uses_one_failure_contract(self):
+        case = positive_case(output_path=None)
+        case.stdout_expected = True
+        for execution, failure in (
+            ({"return_code": 1, "stdout_bytes": 1, "failure_code": None}, "tool_exit_nonzero"),
+            ({"return_code": 0, "stdout_bytes": 0, "failure_code": None}, "stdout_empty"),
+            ({"return_code": 0, "stdout_bytes": 1, "failure_code": "case_timeout"}, "case_timeout"),
+            ({"return_code": 0, "stdout_bytes": 1, "failure_code": None}, None),
+        ):
+            VALIDATOR.validate_operation(case, execution)
+            self.assertEqual(execution["failure_code"], failure)
+            self.assertEqual(execution["operation_verified"], failure is None)
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-operation-selftest-",
+                                         dir="/private/tmp") as temporary:
+            root = Path(temporary)
+            case = positive_case(output_path=root / "missing.zip")
+            execution = {"return_code": 0, "stdout_bytes": 0, "failure_code": None}
+            VALIDATOR.validate_operation(case, execution)
+            self.assertEqual(execution["failure_code"], "output_missing")
+            case.outputs = ()
+            case.operation_artifact = root
+            execution["failure_code"] = None
+            VALIDATOR.validate_operation(case, execution)
+            self.assertEqual(execution["failure_code"], "reverse_extract_output_missing")
+
+    def test_exercise_version_failures_cannot_return_success(self):
+        for version_result in ((None, None), ("1.0", 7)):
+            with tempfile.TemporaryDirectory(prefix="codeperimeter-version-selftest-",
+                                             dir="/private/tmp") as temporary:
+                report = Path(temporary) / "report"
+                summary = {"result": "exercise_completed_not_real_validation", "cases": []}
+                with mock.patch.object(sys, "argv", ["validator", "--exercise-only",
+                                                     "--report-dir", str(report)]), \
+                        mock.patch.object(VALIDATOR, "discover_tools",
+                                          return_value={tool: Path("/usr/bin/synthetic")
+                                                        for tool in VALIDATOR.TOOLS}), \
+                        mock.patch.object(VALIDATOR, "version_probe", return_value=version_result), \
+                        mock.patch.object(VALIDATOR, "exercise_only", return_value=summary), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(VALIDATOR.main(), 1)
+                self.assertEqual(json.loads((report / "summary.json").read_text())["result"],
+                                 "exercise_partial")
+
+    def test_unexpected_sidecar_exit_after_the_last_exec_remains_a_failure(self):
+        class ExitedObserver:
+            stdout = io.BytesIO(b"")
+            stderr = io.BytesIO(b"")
+
+            @staticmethod
+            def poll():
+                return 9
+
+            @staticmethod
+            def wait(timeout=None):
+                return 9
+
+        observer = VALIDATOR.EsloggerSidecar()
+        observer.process = ExitedObserver()
+        observer.root_identity_verified = True
+        observer._read_stdout()
+        observer.stop()
+        self.assertIn("sidecar_stream_ended", observer.failure_codes)
+        self.assertIn("sidecar_exit_nonzero", observer.failure_codes)
+        self.assertTrue(observer.summary()["failure_codes"])
+
+    def test_sidecar_repeated_stop_preserves_cleanup_independently_of_collection_failures(self):
+        for cleanup_ok, failures in ((True, {"sidecar_sequence_gap"}), (False, set())):
+            observer = VALIDATOR.EsloggerSidecar()
+            observer.process = mock.Mock(pid=PID, stdout=None, stderr=None)
+            observer.process.poll.return_value = None
+            observer.failure_codes = failures.copy()
+            with mock.patch.object(observer, "_verified_processes", return_value=[]), \
+                    mock.patch.object(VALIDATOR.MVP, "stop_root", return_value=cleanup_ok) as stop:
+                self.assertEqual(observer.stop(), cleanup_ok)
+                self.assertEqual(observer.stop(), cleanup_ok)
+                stop.assert_called_once_with(None, observer.process)
+            self.assertEqual(observer.failure_codes, failures)
+
+    def test_stdin_requires_this_main_stream_gap_identity_before_the_fence(self):
+        case, execution, evidence, barrier = unrelated_fixture()
+        case.mode = "stdin"
+        case.cwd = PROJECT
+        case.inputs = ()
+        barrier["global_seq"] = 21
+        gap = {"component": "eslogger", "code": "archive_input_source_unknown", "source": {
+            "run_id": SOURCE_RUN, "pid": PID, "pid_version": PID_VERSION, "global_seq": 20,
+        }}
+        evidence["health"] = [gap]
+        result = VALIDATOR.analyze_negative(case, execution, evidence, SOURCE_RUN, barrier, True)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["source_unknown_gap_count"], 1)
+        for field, value in (("run_id", "synthetic-other-run"), ("pid", PID + 1),
+                             ("pid_version", PID_VERSION + 1), ("global_seq", None),
+                             ("global_seq", 21), ("global_seq", 22)):
+            wrong = copy.deepcopy(evidence)
+            wrong["health"][0]["source"][field] = value
+            self.assertEqual(VALIDATOR.analyze_negative(
+                case, execution, wrong, SOURCE_RUN, barrier, True
+            )["failure_code"], "stdin_source_gap_missing")
+        isolated = copy.deepcopy(evidence)
+        isolated["health"][0]["source"] = {"run_id": SOURCE_RUN}
+        self.assertEqual(VALIDATOR.analyze_negative(
+            case, execution, isolated, SOURCE_RUN, barrier, True
+        )["failure_code"], "stdin_source_gap_missing")
+        no_gap = dict(evidence, health=[])
+        self.assertEqual(VALIDATOR.analyze_negative(
+            case, execution, no_gap, SOURCE_RUN, barrier, True
+        )["failure_code"], "stdin_source_gap_missing")
+
+    def test_supported_stdin_cases_have_bytes_and_no_explicit_project_paths(self):
+        self.assertEqual(VALIDATOR.STDIN_TOOLS, {
+            "zip", "gzip", "pigz", "bzip2", "pbzip2", "xz", "zstd", "7z", "7zz", "rar",
+        })
+        for tool in VALIDATOR.STDIN_TOOLS:
+            output = UNRELATED / ".archives" / (tool + ".archive")
+            case = VALIDATOR.build_case(tool, "stdin", PROJECT, UNRELATED, {},
+                                        {(tool, "stdin"): output}, {(tool, "stdin"): FENCE})
+            self.assertEqual(case.inputs, ())
+            self.assertEqual(case.cwd, PROJECT)
+            self.assertFalse(case.positive)
+            self.assertIn(VALIDATOR.CONTENT_SENTINEL, case.stdin_payload)
+            self.assertNotIn(str(PROJECT), " ".join(case.argv))
+            self.assertTrue(all(not VALIDATOR.is_within(path, PROJECT) for path in case.outputs))
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-stdin-selftest-",
+                                         dir="/private/tmp") as temporary:
+            payload = VALIDATOR.CONTENT_SENTINEL + b"\nsynthetic stdin bytes"
+            execution = VALIDATOR.execute(Path("/bin/cat"), [], Path(temporary),
+                                          capture_stdout=True, stdin_payload=payload)
+            self.assertEqual(execution["return_code"], 0)
+            self.assertEqual(execution["stdout_bytes"], len(payload))
+            self.assertIsNone(execution["failure_code"])
+
+    def test_invalid_arguments_and_interrupts_use_fixed_output(self):
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", ["validator", "--SYNTHETIC_PRIVATE_UNKNOWN_ARGUMENT"]), \
+                contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as result:
+            VALIDATOR.main()
+        self.assertEqual(result.exception.code, 2)
+        self.assertEqual(json.loads(stderr.getvalue())["failure_code"], "invalid_arguments")
+        self.assertNotIn("SYNTHETIC_PRIVATE_UNKNOWN_ARGUMENT", stderr.getvalue())
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-interrupt-selftest-",
+                                         dir="/private/tmp") as temporary:
+            report = Path(temporary) / "report"
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "argv", ["validator", "--exercise-only", "--report-dir", str(report)]), \
+                    mock.patch.object(VALIDATOR, "discover_tools", side_effect=KeyboardInterrupt()), \
+                    contextlib.redirect_stdout(stdout):
+                self.assertEqual(VALIDATOR.main(), 130)
+            self.assertEqual(json.loads(stdout.getvalue())["failure_codes"], ["interrupted"])
+            self.assertNotIn("Traceback", stdout.getvalue())
+
     def test_positive_requires_a_real_exec_and_exact_archive_metadata(self):
         case, evidence = positive_fixture()
         execution = {"pids": {PID}}
@@ -282,6 +477,55 @@ class ArchiveValidationSelfTest(unittest.TestCase):
         result = VALIDATOR.analyze_positive(case, {"pids": {PID}}, evidence, SOURCE_RUN)
         self.assertTrue(result["passed"])
         self.assertEqual(result["actual_executable"], "7z")
+
+    def test_tar_symlink_identity_keeps_exact_process_metadata_and_gnu_separation(self):
+        case, evidence = positive_fixture(positive_case(tool="tar"))
+        evidence["events"][0]["process"]["executable"] = "/usr/bin/bsdtar"
+        evidence["events"][0]["archive"]["tool"] = "bsdtar"
+        result = VALIDATOR.analyze_positive(case, {"pids": {PID}}, evidence, SOURCE_RUN)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["actual_executable"], "bsdtar")
+        wrong_generation = copy.deepcopy(evidence)
+        wrong_generation["alerts"][0]["process"]["pid_version"] += 1
+        self.assertEqual(VALIDATOR.analyze_positive(
+            case, {"pids": {PID}}, wrong_generation, SOURCE_RUN
+        )["failure_code"], "archive_command_alert_missing")
+        wrong_inputs = copy.deepcopy(evidence)
+        wrong_inputs["events"][0]["archive"]["input_paths"] = [str(UNRELATED / "wrong.bin")]
+        self.assertEqual(VALIDATOR.analyze_positive(
+            case, {"pids": {PID}}, wrong_inputs, SOURCE_RUN
+        )["failure_code"], "archive_metadata_mismatch")
+        wrong_tool = copy.deepcopy(evidence)
+        wrong_tool["events"][0]["process"]["executable"] = "/opt/tools/gtar"
+        wrong_tool["events"][0]["archive"]["tool"] = "gtar"
+        self.assertFalse(VALIDATOR.analyze_positive(
+            case, {"pids": {PID}}, wrong_tool, SOURCE_RUN
+        )["passed"])
+        self.assertEqual(VALIDATOR.expected_tool_names("gtar"), {"gtar"})
+        observer = VALIDATOR.EsloggerSidecar()
+        observer.begin_case("tar")
+        self.assertEqual(observer.active["aliases"], {"tar", "bsdtar"})
+        observer.register_pids({PID})
+        observer._record_exec({"seq_num": 1, "global_seq_num": 1, "event": {"exec": {
+            "target": {"audit_token": {"pid": PID, "pidversion": PID_VERSION},
+                       "ppid": 40000, "executable": {"path": "/usr/bin/bsdtar", "path_truncated": False}},
+        }}})
+        observer.process = mock.Mock()
+        observer.process.poll.return_value = None
+        observed = observer.finish_case({PID}, timeout=0)
+        self.assertEqual(observed["execs"][0]["executable"], "bsdtar")
+        negative_case, execution, negative_evidence, barrier = reverse_fixture()
+        negative_case.tool = "tar"
+        execution["sidecar_execs"][0]["executable"] = "bsdtar"
+        result = VALIDATOR.analyze_negative(
+            negative_case, execution, negative_evidence, SOURCE_RUN, barrier, True
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["actual_executable"], "bsdtar")
+        execution["sidecar_execs"][0]["executable"] = "gtar"
+        self.assertEqual(VALIDATOR.analyze_negative(
+            negative_case, execution, negative_evidence, SOURCE_RUN, barrier, True
+        )["failure_code"], "sidecar_exec_identity_missing")
 
     def test_unrelated_operation_requires_sidecar_identity_and_an_independent_fence(self):
         case, execution, evidence, barrier = unrelated_fixture()

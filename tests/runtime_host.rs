@@ -783,6 +783,103 @@ fn merged_alert_recovers_outbox_across_restart_and_sent_alert_does_not_repeat() 
 }
 
 #[test]
+fn archive_stdin_gap_keeps_the_parsed_identity_without_saving_unrelated_execs() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = fixture();
+    let project = temp.path().join("synthetic-project");
+    fs::create_dir(&project).unwrap();
+    let fence = project.join("fence.bin");
+    fs::write(&fence, b"synthetic fence").unwrap();
+    let runtime = options(temp.path());
+    let control_socket = runtime.control_socket.clone();
+    let source = SyntheticSource::start(&runtime.collector_socket);
+    let host = start_host(runtime);
+    wait_for_socket(&control_socket);
+    let _: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::AddDirectories {
+            entries: vec![DirectoryImport {
+                path: project.clone(),
+                sources: vec!["manual".into()],
+            }],
+        },
+    );
+    source.wait_connected();
+    for sequence in [1, 2] {
+        let CollectorFrame::Line {
+            run_id,
+            line,
+            received_timestamp_ms,
+        } = open_frame(&fence, 990, 20, sequence)
+        else {
+            unreachable!();
+        };
+        let mut value: Value = serde_json::from_str(&line).unwrap();
+        let mut target = value["process"].clone();
+        target["executable"]["path"] = json!("/usr/bin/gzip");
+        if sequence == 2 {
+            target["audit_token"].as_object_mut().unwrap().remove("pid");
+        }
+        value["event_type"] = json!(9);
+        value["event"] = json!({"exec": {
+            "target": target,
+            "cwd": {"path": project, "path_truncated": false},
+            "args": ["gzip", "-c"]
+        }});
+        source.send(CollectorFrame::Line {
+            run_id,
+            line: value.to_string(),
+            received_timestamp_ms,
+        });
+    }
+    source.send(open_frame(&fence, 991, 3, 3));
+    wait_until(
+        || {
+            let events: Vec<Value> = query(
+                &control_socket,
+                ControlRequest::QueryEvents {
+                    filter: EventFilter::default(),
+                },
+            );
+            events.len() == 1
+        },
+        "独立来源屏障应在缺口之后保存",
+    );
+    let health: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryHealth {
+            filter: HealthFilter::default(),
+        },
+    );
+    let gap = health
+        .iter()
+        .find(|row| row["record"]["code"] == "archive_input_source_unknown")
+        .unwrap();
+    assert_eq!(gap["record"]["source"]["run_id"], "synthetic-run-01");
+    assert_eq!(gap["record"]["source"]["pid"], 990);
+    assert_eq!(gap["record"]["source"]["pid_version"], 20);
+    assert_eq!(gap["record"]["source"]["global_seq"], 1);
+    let malformed = health
+        .iter()
+        .find(|row| row["record"]["source"]["field"] == "process.audit_token.pid")
+        .unwrap();
+    assert!(malformed["record"]["source"].get("pid").is_none());
+    assert!(malformed["record"]["source"].get("pid_version").is_none());
+    assert!(malformed["record"]["source"].get("global_seq").is_none());
+    let alerts: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryAlerts {
+            filter: AlertFilter::default(),
+        },
+    );
+    assert!(alerts.is_empty());
+    source.stop();
+    stop_host(&control_socket, host);
+}
+
+#[test]
 fn source_versions_and_structured_gaps_are_queryable_by_run_after_restart() {
     if unsafe { libc::geteuid() } == 0 {
         return;

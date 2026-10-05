@@ -1075,6 +1075,9 @@ impl DaemonState {
                     message_version: outcome.message_version,
                     field: None,
                     missing_events: None,
+                    pid: None,
+                    pid_version: None,
+                    global_seq: None,
                 };
                 if previous_version != Some((outcome.schema_version, outcome.message_version)) {
                     self.write_source_health(
@@ -1092,6 +1095,12 @@ impl DaemonState {
                         SourceContext {
                             field: issue.field.clone(),
                             missing_events: issue.missing_events,
+                            pid: outcome.event.as_ref().map(|event| event.process.pid),
+                            pid_version: outcome
+                                .event
+                                .as_ref()
+                                .and_then(|event| event.process.pid_version),
+                            global_seq: outcome.event.as_ref().and_then(|event| event.global_seq),
                             ..source.clone()
                         },
                     );

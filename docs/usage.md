@@ -23,7 +23,7 @@ python3 -B scripts/validate-archive-selftest.py
 python3 -B scripts/validate-archive-commands.py --exercise-only
 ~~~
 
-无采集演练会对合成文件实际调用本机可用的 tar、bsdtar、gtar、zip、ditto、gzip、pigz、bzip2、pbzip2、xz、zstd、7z、7zz 和 rar，并覆盖创建／更新、支持的标准输出、列表／测试／解包／解压与无关目录场景。它只核对工具自身的执行结果，不能证明 CodePerimeter 收到了系统事件或生成提醒。缺失工具默认从 ~/Library/Application Support/CodePerimeter/validation-tools/bin 与 PATH 查找；RAR 可通过 --rar-binary PATH 显式指定项目外的试用二进制。
+无采集演练会对合成文件实际调用本机可用的 tar、bsdtar、gtar、zip、ditto、gzip、pigz、bzip2、pbzip2、xz、zstd、7z、7zz 和 rar，并覆盖创建／更新、支持的标准输出、纯标准输入、列表／测试／解包／解压与无关目录场景。纯标准输入仅用于支持该模式的 10 个工具，不给 tar／ditto 伪造支持。演练只核对工具自身的执行结果，不能证明 CodePerimeter 收到了系统事件或生成提醒；版本探针缺失、失败或工具操作失败都会返回失败。缺失工具默认从 ~/Library/Application Support/CodePerimeter/validation-tools/bin 与 PATH 查找；RAR 可通过 --rar-binary PATH 显式指定项目外的试用二进制。
 
 完整验收需要 macOS 系统采集授权与 sudo 授权。在仓库根目录运行：
 
@@ -31,7 +31,7 @@ python3 -B scripts/validate-archive-commands.py --exercise-only
 sh scripts/run-archive-validation.sh
 ~~~
 
-脚本只为本次验收准备受保护的 collector 副本，不安装或启动 launchd 服务。root 仅运行 collector 与短暂的系统事件旁路；归档工具、daemon、SQLite 和通知代理以当前普通用户身份运行。负例的旁路只在内存中保留与本次合成进程关联的 exec 身份，用来确认反向操作及无关目录操作确实执行；项目事件、告警、读取屏障与采集健康仍由主 SQLite 证据核对。每个工具与模式会输出一行脱敏进度，结束时给出项目外 summary.json 路径。汇总中记录工具版本、返回码、证据计数、延迟和静态失败代码，不保存命令参数、原始系统事件或真实 executable 路径。
+脚本只为本次验收准备受保护的 collector 副本，不安装或启动 launchd 服务。准备失败和取消使用固定分类，不回显原始异常或命令。root 仅运行 collector 与短暂的系统事件旁路；归档工具、daemon、SQLite 和通知代理以当前普通用户身份运行。负例的旁路只在内存中保留与本次合成进程关联的 exec 身份，用来确认反向、无关目录及纯标准输入操作确实执行；观察器意外结束也会使验收失败。纯标准输入在保护目录内启动，要求主 SQLite 的来源未知缺口匹配实际 PID／代次且早于独立读取屏障，已有其他场景的缺口不能替代。项目事件、告警、读取屏障与采集健康仍由主 SQLite 证据核对。每个工具与模式会输出一行脱敏进度，结束时给出项目外 summary.json 路径。汇总中记录工具版本、返回码、证据计数、延迟和静态失败代码，不保存命令参数、原始系统事件或真实 executable 路径。
 
 可用 --report-dir PATH 指定项目目录外的空目录保存本机证据；脚本会拒绝项目内路径并限制目录权限。验收失败也会保留合成目录、SQLite 和匿名摘要以便回查。组件自检或无采集工具演练通过，均不替代完整系统采集验收。
 
@@ -127,14 +127,7 @@ daemon 的批量访问默认阈值为 50 个不同文件，滚动窗口为 10000
 
 列表文件、未知参数和缺少可关联项目证据的标准输入通过健康记录报告缺口，不猜测项目来源。归档命令和输出仍表示操作线索，不能证明成功压缩或外传。参数与版本范围见 [归档命令验收](validation/archive-command-coverage.md)。
 
-扩展的真实采集验收使用项目外匿名目录。在仓库根目录构建后运行：
-
-~~~sh
-cargo build --release --locked
-sh scripts/run-archive-validation.sh
-~~~
-
-该入口需要本机管理员授权和采集所需 FDA，不安装后台服务；额外工具与 RAR 官方试用包只用于测试，不随项目分发。末尾 `summary` 给出项目外报告路径，系统采集失败不会回退 fixture。工具调用演练和真实采集验收分别报告，全部 14 名称的真实系统结果尚待记录。
+入口见 [逐项归档命令验收](#逐项归档命令验收)，版本、场景与待验结果见 [归档命令验收记录](validation/archive-command-coverage.md)。全部 14 名称的真实系统结果尚待记录。
 
 ### 系统接入
 

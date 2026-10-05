@@ -29,6 +29,7 @@ TOOLS = (
 )
 UPDATE_TOOLS = {"tar", "bsdtar", "gtar", "zip", "7z", "7zz", "rar"}
 STDOUT_TOOLS = set(TOOLS) - {"rar"}
+STDIN_TOOLS = set(TOOLS) - {"tar", "bsdtar", "gtar", "ditto"}
 REVERSE_MODES = {
     "tar": ("reverse_list", "reverse_extract"),
     "bsdtar": ("reverse_list", "reverse_extract"),
@@ -76,6 +77,7 @@ FAILURE_CODES = {
     "sidecar_sequence_gap", "sidecar_sequence_regression", "sidecar_unexpected_event",
     "sidecar_not_root", "sidecar_root_unverified", "sidecar_es_client_denied",
     "sidecar_cleanup_incomplete", "reverse_output_empty", "reverse_extract_output_missing",
+    "stdin_write_failed", "stdin_source_gap_missing", "sidecar_exit_nonzero", "interrupted",
 }
 
 
@@ -89,7 +91,14 @@ def load_mvp_helpers():
     return module
 
 
-MVP = load_mvp_helpers()
+try:
+    MVP = load_mvp_helpers()
+except KeyboardInterrupt:
+    print(json.dumps({"result": "interrupted", "failure_code": "interrupted"}), file=sys.stderr)
+    raise SystemExit(130)
+except Exception:
+    print(json.dumps({"result": "failed", "failure_code": "validation_startup_failed"}), file=sys.stderr)
+    raise SystemExit(2)
 
 
 @dataclass
@@ -106,10 +115,15 @@ class Case:
     fence_path: Path | None = None
     preparation_failure: str | None = None
     operation_artifact: Path | None = None
+    stdin_payload: bytes | None = None
 
 
 def is_reverse(mode):
     return mode.startswith("reverse_")
+
+
+def is_negative(mode):
+    return is_reverse(mode) or mode in ("unrelated", "stdin")
 
 
 def is_within(path, root):
@@ -278,6 +292,7 @@ class EsloggerSidecar:
         self.stderr_es_denied = False
         self.stopping = False
         self.stopped = False
+        self.cleanup_result = None
 
     @staticmethod
     def _ancestry_reaches(pid, launcher_pid):
@@ -354,9 +369,7 @@ class EsloggerSidecar:
 
     def begin_case(self, tool):
         with self.lock:
-            aliases = {tool}
-            if tool in ("7z", "7zz"):
-                aliases.update(("7z", "7zz"))
+            aliases = expected_tool_names(tool)
             self.active = {"aliases": aliases, "known_pids": set(), "candidates": [],
                            "overflow": False}
 
@@ -430,7 +443,7 @@ class EsloggerSidecar:
             while True:
                 line = self.process.stdout.readline(1024 * 1024 + 1)
                 if not line:
-                    if self.process.poll() is None and not self.stopping:
+                    if not self.stopping:
                         self.failure_codes.add("sidecar_stream_ended")
                     return
                 if len(line) > 1024 * 1024 or not line.endswith(b"\n"):
@@ -532,10 +545,16 @@ class EsloggerSidecar:
 
     def stop(self):
         if self.stopped:
-            return not self.failure_codes
+            return self.cleanup_result
         if not self.process:
-            return not self.failure_codes
+            self.stopped = True
+            self.cleanup_result = True
+            return self.cleanup_result
         cleanup_ok = True
+        if not self.stopping and self.process.poll() is not None:
+            self.failure_codes.add("sidecar_stream_ended")
+            if self.process.poll() != 0:
+                self.failure_codes.add("sidecar_exit_nonzero")
         self.stopping = True
         if self.process.poll() is None:
             matches = self._verified_processes()
@@ -599,7 +618,8 @@ class EsloggerSidecar:
         if self.eslogger_pid and MVP.process_info(self.eslogger_pid):
             cleanup_ok = False
         self.stopped = True
-        return cleanup_ok
+        self.cleanup_result = cleanup_ok
+        return self.cleanup_result
 
     def summary(self):
         return {"root_identity_verified": self.root_identity_verified,
@@ -609,11 +629,13 @@ class EsloggerSidecar:
                 "failure_codes": sorted(self.failure_codes)}
 
 
-def execute(binary, argv, cwd, timeout=TOOL_TIMEOUT_SECONDS, capture_stdout=False, observer=None):
+def execute(binary, argv, cwd, timeout=TOOL_TIMEOUT_SECONDS, capture_stdout=False, observer=None,
+            stdin_payload=None):
     started = time.monotonic_ns()
     try:
         process = subprocess.Popen(
-            [str(binary), *map(str, argv)], cwd=str(cwd), stdin=subprocess.DEVNULL,
+            [str(binary), *map(str, argv)], cwd=str(cwd),
+            stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
         )
@@ -636,32 +658,48 @@ def execute(binary, argv, cwd, timeout=TOOL_TIMEOUT_SECONDS, capture_stdout=Fals
 
         stdout_reader = threading.Thread(target=drain_stdout, daemon=True)
         stdout_reader.start()
-    deadline = time.monotonic() + timeout
-    while process.poll() is None and time.monotonic() < deadline:
+    stdin_state = {"failed": False}
+    stdin_writer = None
+    if process.stdin:
+        def provide_stdin():
+            try:
+                process.stdin.write(stdin_payload)
+                process.stdin.close()
+            except OSError:
+                stdin_state["failed"] = True
+
+        stdin_writer = threading.Thread(target=provide_stdin, daemon=True)
+        stdin_writer.start()
+    try:
+        deadline = time.monotonic() + timeout
+        while process.poll() is None and time.monotonic() < deadline:
+            pids.update(descendants(process.pid))
+            if observer:
+                observer.register_pids(pids)
+            time.sleep(0.002)
+        failure = "case_timeout" if process.poll() is None else None
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                process.wait()
         pids.update(descendants(process.pid))
         if observer:
             observer.register_pids(pids)
-        time.sleep(0.002)
-    if process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            process.wait()
-        failure = "case_timeout"
-    else:
-        failure = None
-    pids.update(descendants(process.pid))
-    if observer:
-        observer.register_pids(pids)
-    if stdout_reader:
-        stdout_reader.join(timeout=3)
-    if process.stdout:
-        process.stdout.close()
+        for reader in (stdout_reader, stdin_writer):
+            if reader:
+                reader.join(timeout=3)
+        for stream in (process.stdout, process.stdin):
+            if stream:
+                stream.close()
+    if failure is None and stdin_state["failed"]:
+        failure = "stdin_write_failed"
     result = {
         "return_code": process.returncode,
         "pids": pids,
@@ -736,6 +774,17 @@ def build_case(tool, mode, project, unrelated, source_sets, output_sets, fence_p
         else:
             argv = ["-c", "--", *map(str, inputs)]
         return Case(tool, mode, argv, project, project, inputs, (), True, stdout_expected=True)
+    if mode == "stdin":
+        output = output_sets[(tool, "stdin")]
+        if tool in ("7z", "7zz", "rar"):
+            argv = ["a", "-siSYNTHETIC_STREAM_MEMBER", str(output)]
+            outputs, stdout_expected = (output,), False
+        else:
+            argv = [] if tool == "zip" else ["-c"]
+            outputs, stdout_expected = (), True
+        return Case(tool, mode, argv, project, project, (), outputs, False,
+                    stdout_expected=stdout_expected, fence_path=fence_paths[(tool, mode)],
+                    stdin_payload=CONTENT_SENTINEL + b"\n" + os.urandom(PAYLOAD_BYTES))
     if is_reverse(mode):
         archive = output_sets[(tool, "create")]
         destination = project / ".reverse" / f"{tool}-{mode}-{uuid.uuid4().hex[:8]}"
@@ -826,10 +875,13 @@ def prepare_workspace(report, tools):
         output_sets[(tool, "create")] = output_for(project, tool, "create", token, source_sets[(tool, "create")])
         output_sets[(tool, "unrelated")] = output_for(unrelated, tool, "unrelated", token,
                                                        source_sets[(tool, "unrelated")])
+        if tool in STDIN_TOOLS:
+            output_sets[(tool, "stdin")] = output_for(unrelated, tool, "stdin", token,
+                                                     source_sets[(tool, "unrelated")])
         if tool in UPDATE_TOOLS:
             update_output = output_for(project, tool, "update", token, source_sets[(tool, "update")])
             output_sets[(tool, "update")] = update_output
-        for mode in (*REVERSE_MODES[tool], "unrelated"):
+        for mode in (*REVERSE_MODES[tool], "unrelated", *(("stdin",) if tool in STDIN_TOOLS else ())):
             path = project / ".fences" / f"fence-{tool}-{mode}-{token}.bin"
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             write_payload(path, token, 0)
@@ -856,6 +908,8 @@ def all_cases(project, unrelated, source_sets, output_sets, fence_paths, tools):
             cases.append(update_case)
         if tool in STDOUT_TOOLS:
             cases.append(build_case(tool, "stdout", project, unrelated, source_sets, output_sets, fence_paths))
+        if tool in STDIN_TOOLS:
+            cases.append(build_case(tool, "stdin", project, unrelated, source_sets, output_sets, fence_paths))
         for mode in REVERSE_MODES[tool]:
             cases.append(build_case(tool, mode, project, unrelated, source_sets, output_sets, fence_paths))
         cases.append(build_case(tool, "unrelated", project, unrelated, source_sets, output_sets, fence_paths))
@@ -897,9 +951,7 @@ def exact_inputs(archive, expected):
 def matching_archive_exec(case, evidence, source_run_id, pids):
     matched = []
     actual_tool_names = set()
-    expected_names = {case.tool}
-    if case.tool in ("7z", "7zz"):
-        expected_names.update(("7z", "7zz"))
+    expected_names = expected_tool_names(case.tool)
     for event in evidence["events"]:
         if event.get("kind") != "exec" or event_process_key(event) is None:
             continue
@@ -999,11 +1051,12 @@ def analyze_positive(case, execution, evidence, source_run_id):
     return result
 
 
-def expected_tool_names(case):
-    names = {case.tool}
-    if case.tool in ("7z", "7zz"):
-        names.update(("7z", "7zz"))
-    return names
+def expected_tool_names(tool):
+    if tool in ("tar", "bsdtar"):
+        return {"tar", "bsdtar"}
+    if tool in ("7z", "7zz"):
+        return {"7z", "7zz"}
+    return {tool}
 
 
 def matching_sidecar_alerts(case, evidence, source_run_id, sidecar_exec):
@@ -1065,7 +1118,7 @@ def analyze_negative(case, execution, evidence, source_run_id, barrier, healthy)
             and not related_pids.intersection(execution["pids"])):
         result["failure_code"] = "sidecar_exec_identity_missing"
         return result
-    if actual_tool not in expected_tool_names(case):
+    if actual_tool not in expected_tool_names(case.tool):
         result["failure_code"] = "sidecar_exec_identity_missing"
         return result
     result["actual_executable"] = actual_tool
@@ -1096,6 +1149,21 @@ def analyze_negative(case, execution, evidence, source_run_id, barrier, healthy)
     if not barrier.get("crossed"):
         result["failure_code"] = "negative_fence_missing"
         return result
+    if case.mode == "stdin":
+        fence_seq = barrier.get("global_seq")
+        gaps = [row for row in evidence["health"]
+                if row.get("component") == "eslogger"
+                and row.get("code") == "archive_input_source_unknown"
+                and (row.get("source") or {}).get("run_id") == source_run_id
+                and (row.get("source") or {}).get("pid") == target_pid
+                and (row.get("source") or {}).get("pid_version") == target_version
+                and isinstance((row.get("source") or {}).get("global_seq"), int)
+                and isinstance(fence_seq, int)
+                and 0 <= row["source"]["global_seq"] < fence_seq]
+        if not gaps:
+            result["failure_code"] = "stdin_source_gap_missing"
+            return result
+        result["source_unknown_gap_count"] = len(gaps)
     result["barrier_crossed"] = True
     if not healthy:
         result["failure_code"] = "negative_fence_unhealthy"
@@ -1164,13 +1232,14 @@ def run_fence(script, path, database, source_run_id, timeout=8):
                     and file.get("readable") is True and not file.get("path_truncated")
                     and MVP.canonical_path(file.get("path")) == expected
                     and event.get("global_seq") is not None):
-                return {"pid": metadata["pid"], "pid_version": identity["pid_version"], "crossed": True}
+                return {"pid": metadata["pid"], "pid_version": identity["pid_version"],
+                        "global_seq": event["global_seq"], "crossed": True}
         time.sleep(0.05)
     return {"pid": metadata.get("pid"), "pid_version": None, "crossed": False}
 
 
 def process_case(case, binary, database, source_run_id, script, sidecar=None):
-    negative = is_reverse(case.mode) or case.mode == "unrelated"
+    negative = is_negative(case.mode)
     if case.preparation_failure:
         execution = {"return_code": None, "pids": set(), "duration_ms": None,
                      "stdout_bytes": 0, "failure_code": case.preparation_failure}
@@ -1184,10 +1253,21 @@ def process_case(case, binary, database, source_run_id, script, sidecar=None):
     if observer:
         observer.begin_case(case.tool)
     execution = execute(binary, case.argv, case.cwd, capture_stdout=case.stdout_expected,
-                        observer=observer)
+                        observer=observer, stdin_payload=case.stdin_payload)
     if execution["failure_code"]:
         barrier = run_fence(script, case.fence_path, database, source_run_id) if negative else None
         return execution, barrier
+    validate_operation(case, execution)
+    if negative:
+        barrier = run_fence(script, case.fence_path, database, source_run_id)
+        return execution, barrier
+    return execution, None
+
+
+def validate_operation(case, execution):
+    if execution.get("failure_code"):
+        execution["operation_verified"] = False
+        return
     if execution["return_code"] != 0:
         execution["failure_code"] = "tool_exit_nonzero"
     elif case.stdout_expected and execution["stdout_bytes"] == 0:
@@ -1202,10 +1282,6 @@ def process_case(case, binary, database, source_run_id, script, sidecar=None):
     ):
         execution["failure_code"] = "reverse_extract_output_missing"
     execution["operation_verified"] = execution.get("failure_code") is None
-    if negative:
-        barrier = run_fence(script, case.fence_path, database, source_run_id)
-        return execution, barrier
-    return execution, None
 
 
 def case_summary(case, execution, result, version):
@@ -1219,6 +1295,7 @@ def case_summary(case, execution, result, version):
         "evidence_event_count": result.get("evidence_event_count", 0),
         "archive_exec_count": result.get("archive_exec_count", 0),
         "sidecar_exec_count": result.get("sidecar_exec_count", 0),
+        "source_unknown_gap_count": result.get("source_unknown_gap_count", 0),
         "archive_command_alert_count": result.get("archive_command_alert_count", 0),
         "notification_feedback_count": result.get("notification_feedback_count", 0),
         "generation_latency_ms": result.get("generation_latency_ms"),
@@ -1292,20 +1369,9 @@ def exercise_only(tools, report, version_rows):
             execution = {"return_code": None, "pids": set(), "duration_ms": None,
                          "stdout_bytes": 0, "failure_code": case.preparation_failure}
         else:
-            execution = execute(binary, case.argv, case.cwd, capture_stdout=case.stdout_expected)
-        if execution["failure_code"] is None and execution["return_code"] != 0:
-            execution["failure_code"] = "tool_exit_nonzero"
-        if execution["failure_code"] is None and case.stdout_expected and execution["stdout_bytes"] == 0:
-            execution["failure_code"] = "stdout_empty"
-        if execution["failure_code"] is None and case.outputs and any(
-            not output.is_file() or output.stat().st_size == 0 for output in case.outputs
-        ):
-            execution["failure_code"] = "output_missing"
-        if execution["failure_code"] is None and case.operation_artifact and not any(
-            item.is_file() and item.stat().st_size > 0
-            for item in case.operation_artifact.rglob("*")
-        ):
-            execution["failure_code"] = "reverse_extract_output_missing"
+            execution = execute(binary, case.argv, case.cwd, capture_stdout=case.stdout_expected,
+                                stdin_payload=case.stdin_payload)
+        validate_operation(case, execution)
         summaries.append({
             "tool": case.tool,
             "version": version_rows[case.tool]["version"],
@@ -1561,8 +1627,14 @@ def real_validation(args, report, tools, version_rows):
         save_summary(report / "summary.json", summary)
 
 
+class PrivateArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        print(json.dumps({"result": "rejected", "failure_code": "invalid_arguments"}), file=sys.stderr)
+        raise SystemExit(2)
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = PrivateArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=REPO / "target" / "release" / "codeperimeter")
     parser.add_argument("--collector-binary", type=Path)
     parser.add_argument("--tools-dir", type=Path,
@@ -1612,8 +1684,9 @@ def main():
             } for name in TOOLS]
             missing = len(tools) != len(TOOLS)
             failed_case = any(item.get("failure_code") for item in summary["cases"])
+            failed_version = any(item.get("failure_code") for item in summary["tool_inventory"])
             summary["result"] = (
-                "exercise_partial" if missing or failed_case
+                "exercise_partial" if missing or failed_case or failed_version
                 else "exercise_completed_not_real_validation"
             )
         else:
@@ -1629,8 +1702,10 @@ def main():
                           "failure_codes": summary["failure_codes"],
                           "summary": str(report / "summary.json")}, ensure_ascii=False))
         return 0 if summary["result"] in ("real_run_passed", "exercise_completed_not_real_validation") else 1
-    except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError, sqlite3.Error) as error:
-        code = failure_code_for(error)
+    except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError,
+            sqlite3.Error, KeyboardInterrupt) as error:
+        interrupted = isinstance(error, KeyboardInterrupt)
+        code = "interrupted" if interrupted else failure_code_for(error)
         try:
             summary = json.loads((report / "summary.json").read_text())
         except (OSError, ValueError, json.JSONDecodeError):
@@ -1641,7 +1716,7 @@ def main():
                 "cases": [],
                 "failure_codes": [],
             }
-        summary["result"] = "failed_no_fixture_fallback"
+        summary["result"] = "interrupted" if interrupted else "failed_no_fixture_fallback"
         summary["failure_codes"] = sorted(set(
             summary.get("failure_codes", []) + [code]
         ))
@@ -1650,8 +1725,15 @@ def main():
                           "case_count": len(summary.get("cases", [])),
                           "failure_codes": [code],
                           "summary": str(report / "summary.json")}, ensure_ascii=False))
-        return 2
+        return 130 if interrupted else 2
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print(json.dumps({"result": "interrupted", "failure_code": "interrupted"}), file=sys.stderr)
+        raise SystemExit(130)
+    except Exception:
+        print(json.dumps({"result": "failed", "failure_code": "validation_startup_failed"}), file=sys.stderr)
+        raise SystemExit(2)

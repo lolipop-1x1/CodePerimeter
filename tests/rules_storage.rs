@@ -15,6 +15,25 @@ fn fixture() -> TempDir {
     tempfile::tempdir().expect("临时目录创建成功")
 }
 
+#[test]
+fn legacy_health_source_json_defaults_new_numeric_identity_fields() {
+    let source: SourceContext = serde_json::from_value(serde_json::json!({
+        "run_id": "synthetic-legacy-run",
+        "schema_version": 1,
+        "message_version": 9,
+        "field": "event.exec.args",
+        "missing_events": null
+    }))
+    .unwrap();
+    assert_eq!(source.pid, None);
+    assert_eq!(source.pid_version, None);
+    assert_eq!(source.global_seq, None);
+    let serialized = serde_json::to_value(source).unwrap();
+    assert!(serialized.get("pid").is_none());
+    assert!(serialized.get("pid_version").is_none());
+    assert!(serialized.get("global_seq").is_none());
+}
+
 fn protected_root(temp: &TempDir, name: &str) -> PathBuf {
     let path = temp.path().join(name);
     std::fs::create_dir_all(&path).expect("合成保护目录创建成功");
@@ -1078,6 +1097,9 @@ fn schema_v2_migration_preserves_legacy_rows_statistics_and_new_source_context()
         message_version: Some(9),
         field: Some("global_seq_num".into()),
         missing_events: Some(3),
+        pid: Some(42),
+        pid_version: Some(7),
+        global_seq: Some(11),
     };
     migrated
         .record_health(&HealthRecord {

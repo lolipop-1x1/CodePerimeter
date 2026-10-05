@@ -230,6 +230,12 @@ pub struct SourceContext {
     pub message_version: Option<u64>,
     pub field: Option<String>,
     pub missing_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
