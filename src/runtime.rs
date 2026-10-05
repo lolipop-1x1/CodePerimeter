@@ -1310,17 +1310,11 @@ impl DaemonState {
         }
         if output.matched_directories.is_empty() {
             *self.counters.filtered.entry(kind.clone()).or_default() += 1;
-        } else if self.database_state == "ready" {
-            match self
-                .storage
-                .record_event(&event, &output.matched_directories)
-            {
-                Ok(true) => *self.counters.persisted.entry(kind).or_default() += 1,
-                Ok(false) => {}
-                Err(_) => self.database_write_failed(1),
-            }
         } else {
-            self.database_gap_events = self.database_gap_events.saturating_add(1);
+            self.persist_matched_event(&event, &output.matched_directories);
+        }
+        if let Some((command, directories)) = &output.reassociated_exec {
+            self.persist_matched_event(command, directories);
         }
         for alert in output.alerts {
             if self.database_state == "ready" {
@@ -1335,6 +1329,24 @@ impl DaemonState {
                 self.database_gap_events = self.database_gap_events.saturating_add(1);
                 self.queue_alert(alert);
             }
+        }
+    }
+
+    fn persist_matched_event(&mut self, event: &ActivityEvent, directories: &[PathBuf]) {
+        if self.database_state == "ready" {
+            match self.storage.record_event(event, directories) {
+                Ok(true) => {
+                    *self
+                        .counters
+                        .persisted
+                        .entry(event_kind_name(event.kind).to_owned())
+                        .or_default() += 1
+                }
+                Ok(false) => {}
+                Err(_) => self.database_write_failed(1),
+            }
+        } else {
+            self.database_gap_events = self.database_gap_events.saturating_add(1);
         }
     }
 

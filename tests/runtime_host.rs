@@ -322,6 +322,139 @@ fn split_sources_keep_shared_identity_independent_sequences_and_bounded_exec_rec
     source.stop();
 }
 
+#[test]
+fn late_activity_association_backfills_the_original_exec_before_saving_its_alert() {
+    let temp = fixture();
+    let project = temp.path().join("anonymous-project");
+    fs::create_dir(&project).unwrap();
+    let file = project.join("source.txt");
+    fs::write(&file, b"anonymous source").unwrap();
+    let runtime = options(temp.path());
+    let control_socket = runtime.control_socket.clone();
+    let source = SyntheticSource::start(&runtime.collector_socket);
+    let host = start_host(runtime.clone());
+    wait_for_socket(&control_socket);
+    let _: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::AddDirectories {
+            entries: vec![DirectoryImport {
+                path: project.clone(),
+                sources: vec!["manual".into()],
+            }],
+        },
+    );
+    source.wait_connected();
+    let CollectorFrame::Line { run_id, line, .. } = open_frame(&file, 750, 7, 1) else {
+        unreachable!()
+    };
+    let mut exec: Value = serde_json::from_str(&line).unwrap();
+    let mut target = exec["process"].clone();
+    target["executable"]["path"] = json!("/usr/bin/gzip");
+    exec["event_type"] = json!(9);
+    exec["time"] = json!(
+        DateTime::from_timestamp_millis(BASE_TIME_MS + 1_010)
+            .unwrap()
+            .to_rfc3339()
+    );
+    exec["event"] = json!({"exec": {"target": target, "cwd": {"path": project, "path_truncated": false}, "args": ["gzip", "-c"]}});
+    source.send(CollectorFrame::Line {
+        source_stream: SourceStream::Exec,
+        run_id: run_id.clone(),
+        line: exec.to_string(),
+        received_timestamp_ms: BASE_TIME_MS + 2_000,
+    });
+    wait_until(
+        || {
+            query::<Option<Value>>(
+                &control_socket,
+                ControlRequest::ExecReceipt {
+                    run_id: run_id.clone(),
+                    pid: 750,
+                    pid_version: 7,
+                },
+            )
+            .is_some()
+        },
+        "未关联 exec 应已在规则入口处理",
+    );
+    let events: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryEvents {
+            filter: EventFilter::default(),
+        },
+    );
+    assert!(events.is_empty(), "cwd 不能独自证明 stdin 来自项目");
+    let mut read: Value = serde_json::from_str(&line).unwrap();
+    read["time"] = json!(
+        DateTime::from_timestamp_millis(BASE_TIME_MS + 1_000)
+            .unwrap()
+            .to_rfc3339()
+    );
+    let activity = CollectorFrame::Line {
+        source_stream: SourceStream::Activity,
+        run_id,
+        line: read.to_string(),
+        received_timestamp_ms: BASE_TIME_MS + 5_000,
+    };
+    source.send(activity.clone());
+    wait_until(
+        || {
+            query::<RuntimeStatus>(&control_socket, ControlRequest::Status).persisted_events_by_kind
+                ["exec"]
+                == 1
+        },
+        "迟到的先行读取应补存已解析 exec",
+    );
+    let events: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryEvents {
+            filter: EventFilter::default(),
+        },
+    );
+    assert_eq!(events.len(), 2);
+    let command = events
+        .iter()
+        .find(|row| row["event"]["kind"] == "exec")
+        .unwrap();
+    assert_eq!(
+        command["event"]["source_timestamp_ms"],
+        BASE_TIME_MS + 1_010
+    );
+    assert_eq!(
+        command["event"]["received_timestamp_ms"],
+        BASE_TIME_MS + 2_000
+    );
+    assert_eq!(command["event"]["source_stream"], "exec");
+    assert_eq!(command["event"]["global_seq"], 1);
+    assert_eq!(command["directories"], json!([project]));
+    let alerts: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryAlerts {
+            filter: AlertFilter::default(),
+        },
+    );
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0]["rule"], "archive_command");
+    assert_eq!(alerts[0]["last_timestamp_ms"], BASE_TIME_MS + 1_010);
+    assert_eq!(alerts[0]["first_timestamp_ms"], BASE_TIME_MS + 1_000);
+    source.send(activity);
+    wait_until(
+        || query::<RuntimeStatus>(&control_socket, ControlRequest::Status).duplicate_events == 1,
+        "来源重复记录仍走既有去重",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.observed_events_by_kind["exec"], 1);
+    assert_eq!(status.persisted_events_by_kind["exec"], 1);
+    let connection = Connection::open(&runtime.database_path).unwrap();
+    let (event_count, outbox_count): (i64, i64) = connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM events WHERE kind='exec'), (SELECT COUNT(*) FROM notification_outbox)",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!((event_count, outbox_count), (1, 1));
+    stop_host(&control_socket, host);
+    source.stop();
+}
+
 fn create_files(directory: &Path, prefix: &str) -> Vec<PathBuf> {
     (0..50)
         .map(|index| {

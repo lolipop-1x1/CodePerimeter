@@ -53,6 +53,7 @@ pub struct RuleOutput {
     pub alerts: Vec<Alert>,
     pub health: Vec<RuleHealth>,
     pub matched_directories: Vec<PathBuf>,
+    pub reassociated_exec: Option<(ActivityEvent, Vec<PathBuf>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -100,6 +101,7 @@ struct ProcessState {
     last_read_received_ms: i64,
     bulk_files: HashMap<FileKey, FileTouch>,
     recent_reads: VecDeque<FileTouch>,
+    pending_archive_exec: Option<ActivityEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -219,8 +221,23 @@ impl RuleEngine {
                     .alerts
                     .push(self.emit_alert(&process_key, candidate, &mut output.health));
             }
+            if let Some((command, candidate)) = self.reassociate_archive_exec(event, &process_key) {
+                let roots = candidate.roots.clone();
+                output
+                    .matched_directories
+                    .extend(candidate.roots.iter().cloned());
+                output
+                    .alerts
+                    .push(self.emit_alert(&process_key, candidate, &mut output.health));
+                output.reassociated_exec = Some((command, roots));
+            }
         }
 
+        if event.kind == EventKind::Exec {
+            if let Some(state) = self.process_states.get_mut(&process_key) {
+                state.pending_archive_exec = None;
+            }
+        }
         if let Some(candidate) =
             self.archive_command_candidate(event, &process_key, event_timestamp_ms)
         {
@@ -230,6 +247,26 @@ impl RuleEngine {
             output
                 .alerts
                 .push(self.emit_alert(&process_key, candidate, &mut output.health));
+        } else if event.kind == EventKind::Exec
+            && event.source_stream == SourceStream::Exec
+            && event.process.pid_version.is_some()
+            && event.source_timestamp_ms.is_some()
+            && event
+                .archive
+                .as_ref()
+                .is_some_and(|archive| is_archive_tool(&archive.tool))
+        {
+            // 两路到达顺序不同：只保留一个已解析命令，等待同一代次的先行读取证据。
+            self.ensure_process_state(
+                &process_key,
+                event.received_timestamp_ms,
+                &mut output.health,
+            );
+            if let Some(state) = self.process_states.get_mut(&process_key) {
+                state.last_read_received_ms =
+                    state.last_read_received_ms.max(event.received_timestamp_ms);
+                state.pending_archive_exec = Some(event.clone());
+            }
         }
 
         if let Some(candidate) = self.archive_output_candidate(
@@ -258,6 +295,49 @@ impl RuleEngine {
         }
 
         output
+    }
+
+    fn reassociate_archive_exec(
+        &mut self,
+        read: &ActivityEvent,
+        process_key: &ProcessKey,
+    ) -> Option<(ActivityEvent, AlertCandidate)> {
+        if read.source_stream != SourceStream::Activity {
+            return None;
+        }
+        let read_timestamp = read.source_timestamp_ms?;
+        let file = read.file.as_ref()?;
+        if file.path_truncated || file.readable != Some(true) || file.is_regular == Some(false) {
+            return None;
+        }
+        let path = normalize_path(&file.path)?;
+        if !self
+            .process_states
+            .get(process_key)?
+            .recent_reads
+            .iter()
+            .any(|touch| touch.timestamp_ms == read_timestamp && touch.path == path)
+        {
+            return None;
+        }
+        let command = self
+            .process_states
+            .get(process_key)?
+            .pending_archive_exec
+            .as_ref()?
+            .clone();
+        let command_timestamp = command.source_timestamp_ms?;
+        if read_timestamp > command_timestamp
+            || command_timestamp.saturating_sub(read_timestamp)
+                > self.config.archive_correlation_window_ms
+        {
+            return None;
+        }
+        let candidate = self.archive_command_candidate(&command, process_key, command_timestamp)?;
+        self.process_states
+            .get_mut(process_key)?
+            .pending_archive_exec = None;
+        Some((command, candidate))
     }
 
     fn process_key(&mut self, event: &ActivityEvent, health: &mut Vec<RuleHealth>) -> ProcessKey {

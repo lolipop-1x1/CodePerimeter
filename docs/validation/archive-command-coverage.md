@@ -61,7 +61,7 @@ sh scripts/run-archive-validation.sh --diagnose-source-latency
 
 - 最新 8 项真实来源诊断：3 项及时通过，5 项未完成原有门禁。最终全部 8 个 exec 均已保存，主链路共 12 条告警／12 条 sent 反馈；其中 pbzip2 标准输出的 `exec_missing` 和 zstd 创建的 `notification_feedback_missing` 是场景等待窗口内未到达，不能解释成永久缺失。bzip2 标准输出来源到主 collector 接收为 7308ms，exec 旁路为 680ms；pbzip2 创建分别为 8309ms／465ms。两边的来源时间吻合且处于实际执行窗口，主链路最终无已知序号缺口或丢弃，两侧 root 清理完成。该对照支持优先检查高频共用来源的积压，尚不能确定原生排队、读线程调度或系统负载的具体占比。
 - 修复候选将主来源拆为 exec 与其余八类 activity，各自有界队列、公平转发、独立序号核验与健康；fork／exit 留在 activity，与文件事件保序。模型、持久化与内存去重增加固定 stream，已知 PID／代次仍按共同运行关联，未知代次不跨路猜关联。旧单路 JSON 默认 combined，SQLite schema 保持 3。负例补主 exec 的有界内存处理回执与先确认后屏障门禁，两路都观测到一致来源版本且无已知缺口才能通过。详情见 [实现边界](../../.scratch/archive-command-coverage/source-partition.md)。新版真实 8 项与完整 92 项尚未执行，不能称为延迟已经修复。
-- 当前分流候选的最低支持 Rust 1.88／locked 回归 118 项通过（另 1 项原有监督 helper 忽略）；归档裁决器 45 项、MVP 裁决器 41 项和合成发送器 9 项通过。fmt、严格 clippy、脚本／shell 语法及 diff 检查、release／locked 构建通过。以下原有回归计数和真实结果属于此前版本，保留作为对照。
+- 当前分流候选的最低支持 Rust 1.88／locked 回归 124 项通过（另 1 项原有监督 helper 忽略）；归档裁决器 45 项、MVP 裁决器 41 项和合成发送器 9 项通过。fmt、严格 clippy、脚本／shell 语法及 diff 检查、release／locked 构建通过。定点审查发现的来源结束与迟到关联两项 P2 已完成补修和红绿回归，仍待独立复核；真实系统结果尚未更新。以下原有回归计数和真实结果属于此前版本，保留作为对照。
 
 - 原有 Rust 最终回归：108 项通过，1 项原有忽略；fmt、严格 clippy 与最低支持 Rust 1.88 的 release --locked 构建通过。本轮新增两项真实系统 pipe 对照测试通过，生产采集代码与 release 二进制未改；短行无需等待 EOF 或缓冲区填满，合成的写入前延后与下游背压呈现不同的接收／入队信号。这些对照不能证明真实运行的延迟原因。
 - 既有 Python 验收自测 37 项、合成发送器测试 9 项与新增归档验收自测 41 项通过；Python 语法、shell 语法与 diff 检查通过。新增回归包含普通用户真实 PTY 的 SID／控制终端保留及 PGID 隔离、共享组拒绝、扫描限频与短命／wrapper 身份、超时清理、有界序号诊断和匿名数字摘要；本轮还覆盖纳秒 UTC 解析、精确 exec 配对、缺失时间、未知诊断脱敏、执行窗口、独立结果及默认 92 项范围。这些组件验证不等于系统采集验收。

@@ -13,6 +13,8 @@
 - 平台无关模型增加固定 `SourceStream::{Combined, Exec, Activity}`；旧 JSON／帧默认 Combined。ActivityEvent 与 SourceContext 携带 stream。EsloggerAdapter::new 保留兼容入口，新增 new_with_stream；只在各自客户端内核验序号，并拒绝订阅不匹配的已知事件。
 - 宿主按固定 stream 建立有界 Adapter 表，规则仍按共同 run＋PID／代次关联。内存与 SQLite 的序号去重包含 stream，Combined 保留旧 key；SQLite schema 3 不迁移。健康保守汇总，两路都须有已观察来源版本；任一路停止则整体停止并回收自有来源。
 - 每路独立有界队列，公平转发；两路来源终止及所有 early Err 均回收本次子进程和读取线程。管理员、FDA、PGID、对端 UID 与原始事件不落盘约束不变。
+- 来源停止检查独立于待发送行和队列容量；stdout EOF 与自有 Child 的退出均结束整体采集，socket 背压重试也执行检查。意外退出返回错误，用户停止正常返回；最后诊断发送保留既有短窗口并有截止时间，随后回收自有来源和读取线程。
+- 已知 run＋PID／代次每状态最多保留一个已解析 exec 候选，沿用进程状态容量及归档来源时间窗口。迟到 activity 读取须有有效项目证据、来源时间不晚于 exec；未知代次、缺少来源时间与 Combined 不增加这种关联。关联后补存原 exec 的规范化事件及该候选实际根目录，不重跑规则或重复统计观察数；告警触发仍使用 exec 来源时间，迟到读取不重置 3 秒计时。Exit 按 activity 顺序清除状态；不保存原始参数。
 - 宿主增加有界内存 exec 处理回执，仅含 run、stream、PID／代次，供已有可信控制连接按精确身份查询；在规则／持久化处理之后生成，不持久化、无路径或参数。ControlRequest::ExecReceipt 返回匹配的可选回执，用于证明主 exec 路已处理本轮负例。
 - 负例先确认精确主 exec 回执，stdin 再确认本次精确来源缺口已持久化，随后启动独立文件屏障；不跨路比较 global_seq。两路均健康、无本进程项目告警才能通过。缺少回执／缺口保持失败。
 - 8 项诊断与默认 92 项继续分开，真实验收沿用来源发生时间计算，所有新组件证据不能替代真实通过。
@@ -27,4 +29,6 @@
 
 ## 组件验证
 
-Rust 1.88／locked 完整回归 118 项通过，另 1 项原有信号 helper 忽略、由监督用例调用；归档裁决器 45 项、MVP 裁决器 41 项、合成发送器 9 项通过。fmt、严格 all-target clippy、4 个脚本 AST、shell 与 diff 检查通过；最低支持版本 release／locked 构建通过。新增内容的真实 home 路径、个人标识与非示例邮箱扫描通过。组件与普通用户 IPC 用例未启动 ES，仍需新版 8 项诊断及完整 92 项真实链路裁决。
+Rust 1.88／locked 完整回归 124 项通过，另 1 项原有信号 helper 忽略、由监督用例调用；归档裁决器 45 项、MVP 裁决器 41 项、合成发送器 9 项通过。fmt、严格 all-target clippy、4 个脚本 AST、shell 与 diff 检查通过；最低支持版本 release／locked 构建通过。新增内容的真实 home 路径、个人标识与非示例邮箱扫描通过。组件与普通用户 IPC 用例未启动 ES，仍需新版 8 项诊断及完整 92 项真实链路裁决。
+
+定点审查在初版发现两项 P2：pending／socket 背压隐藏来源结束，以及迟到 activity 不能重新关联 exec。单一实现者完成红绿回归和补修；停止用例实际驱动转发循环、匿名 pipe／socket 与自有子进程，关联用例核对单条原 exec、准确根目录、来源时间与单 outbox。首次被过滤的 exec 仍计入该处理阶段的 filtered，后续补存只增加 persisted，不重复 observed；既有健康缺口不回删。两项补修独立复核及新版真实系统效果仍待确认。

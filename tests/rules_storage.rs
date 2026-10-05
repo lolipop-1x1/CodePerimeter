@@ -97,6 +97,165 @@ fn rules_share_known_generations_but_keep_unknown_observation_instances_in_their
     }
 }
 
+#[test]
+fn partitioned_archive_association_uses_source_order_when_the_read_arrives_late() {
+    let temp = fixture();
+    let root = protected_root(&temp, "anonymous-order-project");
+    for exec_first in [false, true] {
+        let mut engine = RuleEngine::new(vec![root.clone()], rule_config(50)).unwrap();
+        let mut read = read_event(root.join("source.rs"), 1_000, 5_000, 30, Some(7));
+        read.source_stream = SourceStream::Activity;
+        let mut command = event(EventKind::Exec, None, Some(1_010), 2_000, 30, Some(7));
+        command.source_stream = SourceStream::Exec;
+        command.archive = Some(ArchiveCommand {
+            tool: "gzip".into(),
+            input_paths: Vec::new(),
+            output_path: None,
+            output_paths: Vec::new(),
+            cwd: None,
+        });
+        let output = if exec_first {
+            assert!(engine.process(&command).alerts.is_empty());
+            engine.process(&read)
+        } else {
+            assert!(engine.process(&read).alerts.is_empty());
+            engine.process(&command)
+        };
+        assert_eq!(output.alerts.len(), 1, "已知进程关联不应依赖两路到达顺序");
+        assert_eq!(output.alerts[0].rule, AlertRule::ArchiveCommand);
+        assert_eq!(output.alerts[0].last_timestamp_ms, 1_010);
+        assert_eq!(output.alerts[0].roots, vec![root.clone()]);
+        if exec_first {
+            assert_eq!(
+                output.reassociated_exec,
+                Some((command.clone(), vec![root.clone()]))
+            );
+        } else {
+            assert!(output.reassociated_exec.is_none());
+        }
+        let repeated = engine.process(&read);
+        assert!(repeated.reassociated_exec.is_none());
+        assert!(
+            !repeated
+                .alerts
+                .iter()
+                .any(|alert| alert.rule == AlertRule::ArchiveCommand)
+        );
+    }
+}
+
+#[test]
+fn late_archive_association_rejects_unproven_identity_time_and_read_evidence() {
+    let temp = fixture();
+    let root = protected_root(&temp, "anonymous-late-project");
+    for case in 0..14 {
+        let mut config = rule_config(50);
+        if case == 13 {
+            config.max_process_states = 1;
+        }
+        let mut engine = RuleEngine::new(vec![root.clone()], config).unwrap();
+        let mut read = read_event(root.join("source.rs"), 1_000, 5_000, 30, Some(7));
+        read.source_stream = SourceStream::Activity;
+        let mut command = event(EventKind::Exec, None, Some(1_010), 2_000, 30, Some(7));
+        command.source_stream = SourceStream::Exec;
+        command.archive = Some(ArchiveCommand {
+            tool: "gzip".into(),
+            input_paths: Vec::new(),
+            output_path: None,
+            output_paths: Vec::new(),
+            cwd: None,
+        });
+        match case {
+            0 => read.source_timestamp_ms = Some(1_020),
+            1 => command.source_timestamp_ms = Some(100_000),
+            2 => read.source_timestamp_ms = None,
+            3 => command.source_timestamp_ms = None,
+            4 => {
+                read.process.pid_version = None;
+                command.process.pid_version = None;
+            }
+            5 => read.process.pid_version = Some(8),
+            6 => read.process.pid = 31,
+            7 => read.source_run_id = "anonymous-other-run".into(),
+            8 => {
+                read.source_stream = SourceStream::Combined;
+                command.source_stream = SourceStream::Combined;
+            }
+            9 => read.source_stream = SourceStream::Combined,
+            10 => read.file.as_mut().unwrap().readable = Some(false),
+            11 => read.file.as_mut().unwrap().path_truncated = true,
+            12 | 13 => {}
+            _ => unreachable!(),
+        }
+        assert!(engine.process(&command).alerts.is_empty());
+        if case == 12 {
+            let mut exit = event(EventKind::Exit, None, Some(1_030), 3_000, 30, Some(7));
+            exit.source_stream = SourceStream::Activity;
+            engine.process(&exit);
+        } else if case == 13 {
+            let mut other = read_event(root.join("other.rs"), 1_000, 4_000, 31, Some(8));
+            other.source_stream = SourceStream::Activity;
+            engine.process(&other);
+        }
+        let result = engine.process(&read);
+        assert!(result.reassociated_exec.is_none(), "case={case}");
+        assert!(
+            !result
+                .alerts
+                .iter()
+                .any(|alert| alert.rule == AlertRule::ArchiveCommand),
+            "case={case}"
+        );
+    }
+}
+
+#[test]
+fn late_archive_candidate_is_single_and_keeps_only_prior_project_roots() {
+    let temp = fixture();
+    let root = protected_root(&temp, "anonymous-prior-project");
+    let future_root = protected_root(&temp, "anonymous-future-project");
+    let mut engine =
+        RuleEngine::new(vec![root.clone(), future_root.clone()], rule_config(2)).unwrap();
+    let mut command = event(EventKind::Exec, None, Some(1_010), 2_000, 30, Some(7));
+    command.source_stream = SourceStream::Exec;
+    command.archive = Some(ArchiveCommand {
+        tool: "gzip".into(),
+        input_paths: Vec::new(),
+        output_path: None,
+        output_paths: Vec::new(),
+        cwd: None,
+    });
+    engine.process(&command);
+    command.source_timestamp_ms = Some(1_015);
+    command.received_timestamp_ms = 2_005;
+    command.global_seq = Some(2);
+    engine.process(&command);
+    let mut future = read_event(future_root.join("future.rs"), 1_020, 3_000, 30, Some(7));
+    future.source_stream = SourceStream::Activity;
+    assert!(engine.process(&future).reassociated_exec.is_none());
+    let mut prior = read_event(root.join("source.rs"), 1_000, 5_000, 30, Some(7));
+    prior.source_stream = SourceStream::Activity;
+    let result = engine.process(&prior);
+    assert_eq!(
+        result.reassociated_exec,
+        Some((command, vec![root.clone()]))
+    );
+    let alert = result
+        .alerts
+        .iter()
+        .find(|alert| alert.rule == AlertRule::ArchiveCommand)
+        .unwrap();
+    assert_eq!(alert.last_timestamp_ms, 1_015);
+    assert_eq!(alert.roots, vec![root]);
+    assert!(
+        result
+            .alerts
+            .iter()
+            .any(|alert| alert.rule == AlertRule::BulkFileAccess)
+    );
+    assert!(result.matched_directories.contains(&future_root));
+}
+
 fn protected_root(temp: &TempDir, name: &str) -> PathBuf {
     let path = temp.path().join(name);
     std::fs::create_dir_all(&path).expect("合成保护目录创建成功");
