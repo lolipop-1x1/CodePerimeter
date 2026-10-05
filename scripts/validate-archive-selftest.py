@@ -387,7 +387,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
     def test_fence_uses_narrow_sql_and_waits_for_late_readable_evidence(self):
         with tempfile.TemporaryDirectory(prefix="codeperimeter-fence-query-", dir="/private/tmp") as directory:
             database = Path(directory) / "events.sqlite"
-            with sqlite3.connect(database) as connection:
+            with contextlib.closing(sqlite3.connect(database)) as connection, connection:
                 connection.executescript("PRAGMA user_version=3; CREATE TABLE events "
                                          "(source_run_id TEXT,pid INTEGER,file_path TEXT,kind TEXT,event_json TEXT);")
             clock = [0.0]
@@ -401,7 +401,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
             def advance(seconds):
                 clock[0] += seconds
                 if clock[0] >= arrival[0] and not inserted[0]:
-                    with sqlite3.connect(database) as connection:
+                    with contextlib.closing(sqlite3.connect(database)) as connection, connection:
                         connection.execute("INSERT INTO events VALUES(?,?,?,?,?)", (
                             SOURCE_RUN, PID + 20, str(FENCE), "open", json.dumps(fence_event),
                         ))
@@ -418,7 +418,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
             self.assertEqual(result["timeout_seconds"], 60)
             self.assertGreaterEqual(result["wait_duration_ms"], 9000)
             self.assertEqual(result["source_to_receive_ms"], 9000)
-            with sqlite3.connect(database) as connection:
+            with contextlib.closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute("DELETE FROM events")
             clock[0], inserted[0], arrival[0] = 0.0, False, 61
             with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker), \
@@ -432,7 +432,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
     def test_fence_timeout_and_invalid_evidence_are_distinct_and_anonymous(self):
         with tempfile.TemporaryDirectory(prefix="codeperimeter-fence-invalid-", dir="/private/tmp") as directory:
             database = Path(directory) / "events.sqlite"
-            with sqlite3.connect(database) as connection:
+            with contextlib.closing(sqlite3.connect(database)) as connection, connection:
                 connection.executescript("PRAGMA user_version=3; CREATE TABLE events "
                                          "(source_run_id TEXT,pid INTEGER,file_path TEXT,kind TEXT,event_json TEXT);")
             worker = mock.Mock(returncode=0, stdout=json.dumps({"pid": PID + 20, "success": True}).encode())
@@ -440,7 +440,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
                                 ("process", {"pid_version": None}), ("process", {"pid_version": True}),
                                 ("event", {"source_stream": "exec"}), ("event", {"global_seq": None}),
                                 ("event", {"global_seq": True}), ("event", {"source_run_id": "other-run"})):
-                with sqlite3.connect(database) as connection:
+                with contextlib.closing(sqlite3.connect(database)) as connection, connection:
                     connection.execute("DELETE FROM events")
                     if replacement:
                         invalid = event("open", identity=process(PID + 20, 23), file={
@@ -462,6 +462,57 @@ class ArchiveValidationSelfTest(unittest.TestCase):
                 self.assertEqual(summary["fence_failure_code"], result["failure_code"])
                 self.assertNotIn(str(FENCE), json.dumps(summary))
                 self.assertNotIn(str(PID + 20), json.dumps(summary))
+
+    def test_fence_closes_database_on_returns_and_exceptions(self):
+        connect = sqlite3.connect
+        worker = mock.Mock(returncode=0, stdout=json.dumps({"pid": PID + 20, "success": True}).encode())
+        fence_event = event("open", identity=process(PID + 20, 23), file={
+            "path": str(FENCE), "readable": True, "path_truncated": False,
+        })
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-fence-close-", dir="/private/tmp") as directory:
+            database = Path(directory) / "events.sqlite"
+            for scenario in ("success", "timeout", "unsupported_schema", "query_failure", "authorization_failure"):
+                with self.subTest(scenario=scenario):
+                    with contextlib.closing(connect(database)) as connection, connection:
+                        connection.executescript("DROP TABLE IF EXISTS events; PRAGMA user_version=3; "
+                                                 "CREATE TABLE events (source_run_id TEXT,pid INTEGER,"
+                                                 "file_path TEXT,kind TEXT,event_json TEXT);")
+                        if scenario == "success":
+                            connection.execute("INSERT INTO events VALUES(?,?,?,?,?)", (
+                                SOURCE_RUN, PID + 20, str(FENCE), "open", json.dumps(fence_event),
+                            ))
+                        elif scenario == "unsupported_schema":
+                            connection.execute("PRAGMA user_version=2")
+                        elif scenario == "query_failure":
+                            connection.execute("DROP TABLE events")
+                    connections = []
+
+                    def track_connection(*args, **kwargs):
+                        opened = connect(*args, **kwargs)
+                        connections.append(opened)
+                        return opened
+
+                    authorization = mock.Mock() if scenario == "authorization_failure" else None
+                    if authorization:
+                        authorization.require.side_effect = RuntimeError("synthetic_authorization_failure")
+                    with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker), \
+                            mock.patch.object(VALIDATOR.sqlite3, "connect", side_effect=track_connection):
+                        if authorization:
+                            with self.assertRaises(RuntimeError):
+                                VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN,
+                                                    timeout=0, authorization=authorization)
+                        else:
+                            result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN, timeout=0.1)
+                            expected = {"success": None, "timeout": "negative_fence_timeout",
+                                        "unsupported_schema": "negative_fence_query_failed",
+                                        "query_failure": "negative_fence_query_failed"}[scenario]
+                            self.assertEqual(result["failure_code"], expected)
+                    self.assertEqual(len(connections), 1)
+                    try:
+                        with self.assertRaises(sqlite3.ProgrammingError):
+                            connections[0].execute("SELECT 1")
+                    finally:
+                        connections[0].close()
 
     def test_negative_requires_exact_main_exec_receipt_before_the_file_fence(self):
         case, execution, evidence, barrier = unrelated_fixture()

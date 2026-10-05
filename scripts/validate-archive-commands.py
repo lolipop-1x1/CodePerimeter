@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib.util
@@ -1521,7 +1522,7 @@ def run_fence(script, path, database, source_run_id, timeout=FENCE_TIMEOUT_SECON
     invalid_observed = False
     try:
         # 屏障只读取本轮独立 worker 的目标文件，不反复装载全部业务证据。
-        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1) as connection:
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1)) as connection:
             if connection.execute("PRAGMA user_version").fetchone()[0] != 3:
                 return finished("negative_fence_query_failed")
             first_query = True
