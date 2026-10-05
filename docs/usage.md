@@ -14,6 +14,27 @@ cargo clippy --locked --all-targets -- -D warnings
 
 二进制位于 target/release/codeperimeter。运行 codeperimeter --help 或 codeperimeter <命令> --help 查看参数。查询和目录配置命令通过普通用户宿主的 Unix socket 工作；可以在全局参数中指定 --host-socket PATH。默认位置为当前用户的 ~/Library/Application Support/CodePerimeter/host.sock。
 
+## 逐项归档命令验收
+
+先运行脚本裁决器的无采集自检，再可选地做本机工具演练：
+
+~~~sh
+python3 -B scripts/validate-archive-selftest.py
+python3 -B scripts/validate-archive-commands.py --exercise-only
+~~~
+
+无采集演练会对合成文件实际调用本机可用的 tar、bsdtar、gtar、zip、ditto、gzip、pigz、bzip2、pbzip2、xz、zstd、7z、7zz 和 rar，并覆盖创建／更新、支持的标准输出、列表／测试／解包／解压与无关目录场景。它只核对工具自身的执行结果，不能证明 CodePerimeter 收到了系统事件或生成提醒。缺失工具默认从 ~/Library/Application Support/CodePerimeter/validation-tools/bin 与 PATH 查找；RAR 可通过 --rar-binary PATH 显式指定项目外的试用二进制。
+
+完整验收需要 macOS 系统采集授权与 sudo 授权。在仓库根目录运行：
+
+~~~sh
+sh scripts/run-archive-validation.sh
+~~~
+
+脚本只为本次验收准备受保护的 collector 副本，不安装或启动 launchd 服务。root 仅运行 collector 与短暂的系统事件旁路；归档工具、daemon、SQLite 和通知代理以当前普通用户身份运行。负例的旁路只在内存中保留与本次合成进程关联的 exec 身份，用来确认反向操作及无关目录操作确实执行；项目事件、告警、读取屏障与采集健康仍由主 SQLite 证据核对。每个工具与模式会输出一行脱敏进度，结束时给出项目外 summary.json 路径。汇总中记录工具版本、返回码、证据计数、延迟和静态失败代码，不保存命令参数、原始系统事件或真实 executable 路径。
+
+可用 --report-dir PATH 指定项目目录外的空目录保存本机证据；脚本会拒绝项目内路径并限制目录权限。验收失败也会保留合成目录、SQLite 和匿名摘要以便回查。组件自检或无采集工具演练通过，均不替代完整系统采集验收。
+
 ## 选择保护目录
 
 可以一次添加多个本地目录。加入时路径会解析为规范路径：
@@ -99,6 +120,23 @@ notify --control-socket PATH
 daemon 的批量访问默认阈值为 50 个不同文件，滚动窗口为 10000 毫秒；可通过这两个参数调整，status 会回显实际配置。ServicePlan 生成的 daemon argv 不指定这两个可选参数，因此采用以上默认值。不要以 root 身份启动 daemon；它是普通用户宿主，也是 SQLite 的唯一写入者。root collector 只负责启动系统 eslogger 并通过受限 socket 转发事件。配置、查询、历史导入和通知代理不另开数据库写入通道。计划中的参数只描述本服务生成的固定角色，不采集或回显观察到的进程完整命令行或环境变量。
 
 ## 权限与覆盖边界
+
+### 归档与压缩命令
+
+选定目录后，程序默认自动识别 tar、bsdtar、gtar、zip、ditto、gzip、pigz、bzip2、pbzip2、xz、zstd、7z、7zz、rar；无需逐工具配置。常见直接路径、适用的压缩级别与输出选项，以及明确输入到标准输出的模式均使用同一事件链路。解压、列表、测试等非压缩操作不产生对应的归档命令告警。
+
+列表文件、未知参数和缺少可关联项目证据的标准输入通过健康记录报告缺口，不猜测项目来源。归档命令和输出仍表示操作线索，不能证明成功压缩或外传。参数与版本范围见 [归档命令验收](validation/archive-command-coverage.md)。
+
+扩展的真实采集验收使用项目外匿名目录。在仓库根目录构建后运行：
+
+~~~sh
+cargo build --release --locked
+sh scripts/run-archive-validation.sh
+~~~
+
+该入口需要本机管理员授权和采集所需 FDA，不安装后台服务；额外工具与 RAR 官方试用包只用于测试，不随项目分发。末尾 `summary` 给出项目外报告路径，系统采集失败不会回退 fixture。工具调用演练和真实采集验收分别报告，全部 14 名称的真实系统结果尚待记录。
+
+### 系统接入
 
 安装服务、系统采集和完全磁盘访问权限需要按 macOS 提示完成必要授权。本仓库的 CLI 命令不会修改 SIP、AMFI、sudoers，也不会自动重启机器。service install/start 返回 launchd 操作结果；操作成功不等于 FDA 已授予、采集器已取得有效事件、系统通知已到屏或 3 秒目标已经通过。完整安装、开机运行、注销恢复和真实事件验收需要单独记录。
 

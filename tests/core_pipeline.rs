@@ -490,3 +490,267 @@ fn native_archive_exec_and_temporary_output_persist_correlated_paths_without_raw
         );
     }
 }
+
+fn archive_args(tool: &str, stdout: bool, first: &str, second: &str) -> Vec<String> {
+    let mut args = vec!["SYNTHETIC_PRIVATE_ARGV0"];
+    match tool {
+        "tar" | "bsdtar" | "gtar" => {
+            args.extend([
+                "-czf",
+                if stdout { "-" } else { "snapshot.tar.gz" },
+                "--",
+                first,
+                second,
+            ]);
+        }
+        "zip" => {
+            args.extend([
+                "-q",
+                "-P",
+                "SYNTHETIC_PRIVATE_PASSWORD",
+                if stdout { "-" } else { "snapshot.zip" },
+                "--",
+                first,
+                second,
+            ]);
+        }
+        "ditto" => {
+            args.extend([
+                "-c",
+                "-k",
+                "--keepParent",
+                first,
+                if stdout { "-" } else { "snapshot.zip" },
+            ]);
+        }
+        "7z" | "7zz" => {
+            args.extend(["a", "-pSYNTHETIC_PRIVATE_PASSWORD"]);
+            if stdout {
+                args.extend(["-ttar", "-so", "snapshot.tar"]);
+            } else {
+                args.push("snapshot.7z");
+            }
+            args.extend(["--", first, second]);
+        }
+        "rar" => {
+            assert!(!stdout);
+            args.extend([
+                "a",
+                "-pSYNTHETIC_PRIVATE_PASSWORD",
+                "snapshot.rar",
+                "--",
+                first,
+                second,
+            ]);
+        }
+        _ => {
+            args.push(if stdout { "-c" } else { "-k" });
+            args.extend(["--", first, second]);
+        }
+    }
+    args.into_iter().map(str::to_owned).collect()
+}
+
+#[test]
+fn all_archive_families_reach_project_rules_sqlite_and_outbox_without_raw_parameters() {
+    let temp = fixture();
+    let root_a = root(&temp, "project-a");
+    let root_b = root(&temp, "project-b");
+    let unrelated = root(&temp, "project-a-neighbor");
+    let first = source(&root_a, "file name.rs");
+    let second = source(&root_b, "second.rs");
+    let database = temp.path().join("archive-families.sqlite");
+    let mut pipeline = Pipeline::new(&database, vec![root_a.clone(), root_b.clone()]);
+    let tools = [
+        "tar", "bsdtar", "gtar", "zip", "ditto", "gzip", "pigz", "bzip2", "pbzip2", "xz", "zstd",
+        "7z", "7zz", "rar",
+    ];
+    for (index, tool) in tools.iter().enumerate() {
+        let target = process(600 + index as u32, 8, tool);
+        let args = archive_args(
+            tool,
+            false,
+            first.to_str().unwrap(),
+            second.to_str().unwrap(),
+        );
+        let output = pipeline.feed_as(
+            9,
+            json!({"exec": {
+                "target": target,
+                "args": args,
+                "env": ["SYNTHETIC_PRIVATE_ENV=hidden"],
+                "cwd": {"path": root_a, "path_truncated": false},
+            }}),
+            index as i64 * 100,
+            process(600 + index as u32, 7, "synthetic-client"),
+        );
+        assert_eq!(output.alerts.len(), 1, "{tool}");
+        assert_eq!(output.alerts[0].rule, AlertRule::ArchiveCommand, "{tool}");
+        let roots = if *tool == "ditto" {
+            vec![root_a.clone()]
+        } else {
+            vec![root_a.clone(), root_b.clone()]
+        };
+        assert_eq!(output.alerts[0].roots, roots, "{tool}");
+        assert!(output.alerts[0].evidence_paths.contains(&first), "{tool}");
+        if *tool != "ditto" {
+            assert!(output.alerts[0].evidence_paths.contains(&second), "{tool}");
+        }
+        if *tool != "rar" {
+            let stdout = pipeline.feed_as(
+                9,
+                json!({"exec": {
+                    "target": process(700 + index as u32, 8, tool),
+                    "args": archive_args(tool, true, "file name.rs", second.to_str().unwrap()),
+                    "cwd": {"path": root_a, "path_truncated": false},
+                }}),
+                3_000 + index as i64 * 100,
+                process(700 + index as u32, 7, "synthetic-client"),
+            );
+            assert_eq!(stdout.alerts.len(), 1, "{tool}");
+            assert_eq!(stdout.alerts[0].rule, AlertRule::ArchiveCommand, "{tool}");
+            assert_eq!(stdout.alerts[0].roots, roots, "{tool}");
+        }
+        // 明确输入和输出都在无关目录，不得归属项目。
+        let outside = pipeline.feed_as(
+            9,
+            json!({"exec": {
+                "target": process(800 + index as u32, 8, tool),
+                "args": archive_args(tool, false,
+                    unrelated.join("outside-a.rs").to_str().unwrap(),
+                    unrelated.join("outside-b.rs").to_str().unwrap()),
+                "cwd": {"path": unrelated, "path_truncated": false},
+            }}),
+            5_000 + index as i64 * 100,
+            process(800 + index as u32, 7, "synthetic-client"),
+        );
+        assert!(outside.alerts.is_empty(), "{tool}");
+        assert!(outside.matched_directories.is_empty(), "{tool}");
+    }
+    let merged = pipeline.feed_as(
+        9,
+        json!({"exec": {
+            "target": process(605, 8, "gzip"),
+            "args": archive_args("gzip", false, "file name.rs", second.to_str().unwrap()),
+            "cwd": {"path": root_a, "path_truncated": false},
+        }}),
+        10_000,
+        process(605, 7, "synthetic-client"),
+    );
+    assert_eq!(merged.alerts.len(), 1);
+    assert!(!merged.alerts[0].is_new);
+    assert_eq!(merged.alerts[0].activity_count, 2);
+    drop(pipeline);
+    let reopened = Storage::open(&database).unwrap();
+    let events = reopened
+        .query_events(&EventFilter {
+            limit: 100,
+            ..EventFilter::default()
+        })
+        .unwrap();
+    assert_eq!(events.len(), 28);
+    let gzip = events
+        .iter()
+        .find(|row| row.event.process.pid == 605)
+        .unwrap();
+    let archive = gzip.event.archive.as_ref().unwrap();
+    assert!(archive.output_path.is_none());
+    assert_eq!(archive.output_paths.len(), 2);
+    assert!(
+        archive
+            .output_paths
+            .contains(&root_a.join("file name.rs.gz"))
+    );
+    assert!(archive.output_paths.contains(&root_b.join("second.rs.gz")));
+    for row in events
+        .iter()
+        .filter(|row| (700..714).contains(&row.event.process.pid))
+    {
+        let archive = row.event.archive.as_ref().unwrap();
+        assert!(archive.output_path.is_none());
+        assert!(archive.output_paths.is_empty());
+    }
+    let alerts = reopened
+        .query_alerts(&AlertFilter {
+            limit: 100,
+            ..AlertFilter::default()
+        })
+        .unwrap();
+    let pending = reopened.pending_notifications(100).unwrap();
+    assert_eq!(alerts.len(), 27);
+    assert_eq!(pending.len(), 27);
+    let persisted = serde_json::to_string(&(events, alerts, pending)).unwrap();
+    let bytes = fs::read(database).unwrap();
+    for marker in [
+        "SYNTHETIC_PRIVATE_ARGV0",
+        "SYNTHETIC_PRIVATE_PASSWORD",
+        "SYNTHETIC_PRIVATE_ENV",
+        "SYNTHETIC_PRIVATE_RAW_BODY",
+    ] {
+        assert!(!persisted.contains(marker), "标准事件包含隐私标记");
+        assert!(
+            !bytes
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes()),
+            "SQLite 包含隐私标记"
+        );
+    }
+}
+
+#[test]
+fn stdin_archive_members_do_not_fabricate_disk_project_inputs_or_pending_alerts() {
+    let temp = fixture();
+    let protected = root(&temp, "project");
+    let outside = root(&temp, "outside");
+    let disk = source(&protected, "disk.rs");
+    let mut pipeline = Pipeline::new(
+        &temp.path().join("stdin-members.sqlite"),
+        vec![protected.clone()],
+    );
+    for (index, tool) in ["7z", "7zz", "rar"].iter().enumerate() {
+        let extension = if *tool == "rar" { "rar" } else { "7z" };
+        let output_path = outside.join(format!("snapshot-{index}.{extension}"));
+        let native = json!({
+            "schema_version": 1, "version": 9, "action_type": 1,
+            "event_type": 9, "seq_num": index, "global_seq_num": index,
+            "time": DateTime::from_timestamp_millis(SOURCE_EPOCH + index as i64).unwrap().to_rfc3339(),
+            "process": process(900 + index as u32, 7, "synthetic-client"),
+            "event": {"exec": {
+                "target": process(900 + index as u32, 8, tool),
+                "args": ["SYNTHETIC_PRIVATE_ARGV0", "a", output_path, disk, "-siSYNTHETIC_PRIVATE_STREAM"],
+                "cwd": {"path": protected, "path_truncated": false},
+            }},
+        });
+        let parsed = pipeline
+            .adapter
+            .parse_line(&native.to_string(), RECEIVE_EPOCH + index as i64);
+        let event = parsed.event.as_ref().unwrap();
+        let archive = event.archive.as_ref().unwrap();
+        assert!(archive.input_paths.is_empty(), "{tool}");
+        assert_eq!(archive.output_path, Some(output_path), "{tool}");
+        assert!(
+            parsed
+                .issues
+                .iter()
+                .any(|issue| issue.code == "archive_input_source_unknown"),
+            "{tool}"
+        );
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("SYNTHETIC_PRIVATE_STREAM")
+        );
+        let rules = pipeline.rules.process(event);
+        assert!(rules.alerts.is_empty(), "{tool}");
+        assert!(rules.matched_directories.is_empty(), "{tool}");
+    }
+    assert_eq!(
+        pipeline
+            .storage
+            .query_events(&EventFilter::default())
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(pipeline.storage.pending_notifications(10).unwrap().len(), 0);
+}

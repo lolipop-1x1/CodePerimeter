@@ -21,6 +21,7 @@ Type: grilling
 - Q4 已确认 A：先覆盖常见直接路径、适用的递归／压缩级别／输出模式；列表文件与未知参数报告缺口，不读取列表补全输入。
 - Q5 已确认 A：采用官方 RAR 试用包，仅用于本机合成验收，不随开源项目分发；试用期与系统执行限制按实际结果记录。
 - Q6 已确认 A：共享理解达成，[最小规格](spec.md)定稿；后续任务见 [02 命令解析与规则](issues/02-command-parsers-and-rules.md)、[03 工具准备与真实验收](issues/03-tools-and-real-validation.md)。
+- 实施进展：[02](issues/02-command-parsers-and-rules.md) 已 resolved，默认 14 名称解析与多输出兼容模型完成，组件回归通过；[03](issues/03-tools-and-real-validation.md) 已 claimed，全部工具准备完成，正在补齐真实采集验收证据。全部规格尚未 resolved。
 
 ## 设计树
 
@@ -39,7 +40,7 @@ Type: grilling
   - 最终共享理解（Q6，已确认 A）
     - 最小规格作为后续实现依据。
 
-## 事实核查
+## 事实核查（讨论时基线）
 
 - [实时事件解析](../../src/eslogger.rs)：目前仅为 tar、bsdtar、zip 生成归档命令元信息；tar 与 bsdtar 共用解析。
 - [规则](../../src/rules.rs)：工具名单另含 gtar、ditto、gzip、pigz、bzip2、pbzip2、xz、zstd、7z、7zz、rar，但名单本身不启用实时参数解析。

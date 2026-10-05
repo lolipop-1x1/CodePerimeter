@@ -343,6 +343,7 @@ fn archive_candidates_require_project_association_and_output_correlation() {
         tool: "/usr/bin/zip".into(),
         input_paths: vec![PathBuf::from("/tmp/unrelated.txt")],
         output_path: Some(PathBuf::from("/tmp/unrelated.zip")),
+        output_paths: Vec::new(),
         cwd: Some(PathBuf::from("/tmp")),
     });
     assert!(engine.process(&unrelated).alerts.is_empty());
@@ -352,6 +353,7 @@ fn archive_candidates_require_project_association_and_output_correlation() {
         tool: "/usr/bin/zip".into(),
         input_paths: vec![PathBuf::from("source.rs")],
         output_path: Some(temp.path().join("synthetic.zip")),
+        output_paths: Vec::new(),
         cwd: Some(root_alias),
     });
     let command_output = engine.process(&command);
@@ -393,6 +395,94 @@ fn archive_candidates_require_project_association_and_output_correlation() {
     let output_result = output_engine.process(&output);
     assert_eq!(output_result.alerts[0].rule, AlertRule::ArchiveOutput);
     assert_eq!(output_result.alerts[0].roots, vec![root]);
+}
+
+#[test]
+fn stdin_cwd_alone_is_not_project_evidence_but_explicit_outputs_and_reads_are() {
+    let temp = fixture();
+    let root = protected_root(&temp, "project");
+    let mut engine = RuleEngine::new(vec![root.clone()], rule_config(50)).unwrap();
+    let mut command = event(EventKind::Exec, None, Some(1_000), 1_000, 50, Some(1));
+    command.archive = Some(ArchiveCommand {
+        tool: "gzip".into(),
+        input_paths: Vec::new(),
+        output_path: None,
+        output_paths: Vec::new(),
+        cwd: Some(root.clone()),
+    });
+    let unknown_source = engine.process(&command);
+    assert!(unknown_source.alerts.is_empty());
+    assert!(unknown_source.matched_directories.is_empty());
+    command.archive.as_mut().unwrap().output_path = Some(root.join("stdin-result.gz"));
+    let output_evidence = engine.process(&command);
+    assert_eq!(output_evidence.alerts[0].rule, AlertRule::ArchiveCommand);
+    assert_eq!(output_evidence.alerts[0].roots, [root.clone()]);
+    command.archive.as_mut().unwrap().output_path = None;
+    engine.process(&read_event(
+        root.join("source.rs"),
+        2_000,
+        2_000,
+        51,
+        Some(1),
+    ));
+    command.process.pid = 51;
+    command.source_timestamp_ms = Some(2_001);
+    command.received_timestamp_ms = 2_001;
+    let observed_input = engine.process(&command);
+    assert_eq!(observed_input.alerts[0].roots, [root]);
+}
+
+#[test]
+fn multiple_output_paths_associate_all_roots_and_legacy_archive_json_remains_readable() {
+    let temp = fixture();
+    let root_a = protected_root(&temp, "project-a");
+    let root_b = protected_root(&temp, "project-b");
+    let outputs = vec![root_a.join("first.rs.gz"), root_b.join("second.rs.gz")];
+    let mut engine =
+        RuleEngine::new(vec![root_a.clone(), root_b.clone()], rule_config(50)).unwrap();
+    let mut command = event(EventKind::Exec, None, Some(1_000), 1_000, 50, Some(1));
+    command.archive = Some(ArchiveCommand {
+        tool: "gzip".into(),
+        input_paths: vec![
+            PathBuf::from("/private/tmp/unrelated-first.rs"),
+            PathBuf::from("/private/tmp/unrelated-second.rs"),
+        ],
+        output_path: None,
+        output_paths: outputs.clone(),
+        cwd: None,
+    });
+    let output = engine.process(&command);
+    assert_eq!(output.alerts[0].roots, [root_a.clone(), root_b.clone()]);
+    assert_eq!(output.matched_directories, [root_a.clone(), root_b.clone()]);
+    for path in outputs {
+        assert!(output.alerts[0].evidence_paths.contains(&path));
+    }
+    let database = temp.path().join("multi-output.sqlite");
+    let mut storage = Storage::open(&database).unwrap();
+    storage
+        .record_event(&command, &output.matched_directories)
+        .unwrap();
+    storage.record_alert(&output.alerts[0]).unwrap();
+    let mut legacy = command.clone();
+    legacy.received_timestamp_ms = 2_000;
+    legacy.archive.as_mut().unwrap().output_paths.clear();
+    legacy.archive.as_mut().unwrap().output_path = Some(root_a.join("legacy.gz"));
+    let old_json = serde_json::to_string(&legacy).unwrap();
+    assert!(!old_json.contains("output_paths"));
+    let decoded: ActivityEvent = serde_json::from_str(&old_json).unwrap();
+    assert!(decoded.archive.as_ref().unwrap().output_paths.is_empty());
+    storage.record_event(&decoded, &[root_a]).unwrap();
+    drop(storage);
+    let reopened = Storage::open(&database).unwrap();
+    let events = reopened.query_events(&EventFilter::default()).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().any(|row| row.event == command));
+    assert!(events.iter().any(|row| row.event == legacy));
+    let saved = reopened.query_alerts(&AlertFilter::default()).unwrap();
+    let mut expected = output.alerts;
+    expected[0].is_new = false;
+    assert_eq!(saved, expected);
+    assert_eq!(reopened.pending_notifications(10).unwrap().len(), 1);
 }
 
 fn sample_alert(id: &str, root: &Path, pid: u32, timestamp_ms: i64) -> Alert {

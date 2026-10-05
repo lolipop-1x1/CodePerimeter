@@ -18,5 +18,6 @@ jobs:
       - run: cargo test --locked
       - run: python3 -B -m unittest discover -s tests -p test_synthetic_sender.py -v
       - run: python3 -B scripts/validate-selftest.py
+      - run: python3 -B scripts/validate-archive-selftest.py
       - name: Validation entry syntax
         run: python3 -B -c "import ast,pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('scripts').glob('validate-*.py')]"

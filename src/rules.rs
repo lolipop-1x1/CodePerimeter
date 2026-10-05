@@ -518,21 +518,13 @@ impl RuleEngine {
             }
         }
 
-        let resolved_cwd = archive.cwd.as_deref().and_then(normalize_path);
-        if archive.input_paths.is_empty() {
-            if let Some(cwd) = resolved_cwd.as_ref() {
-                roots.extend(self.matching_roots(cwd));
-                if self.roots.iter().any(|root| root == cwd) {
-                    evidence_paths.push(cwd.clone());
-                }
-            }
-        }
-
-        let resolved_output = archive
+        let resolved_outputs: Vec<_> = archive
             .output_path
-            .as_deref()
-            .and_then(|path| resolve_archive_path(path, archive.cwd.as_deref()));
-        if let Some(output) = resolved_output.as_ref() {
+            .iter()
+            .chain(&archive.output_paths)
+            .filter_map(|path| resolve_archive_path(path, archive.cwd.as_deref()))
+            .collect();
+        for output in &resolved_outputs {
             roots.extend(self.matching_roots(output));
         }
 
@@ -547,10 +539,10 @@ impl RuleEngine {
         if roots.is_empty() {
             return None;
         }
-        if let Some(output) = resolved_output
-            && (!self.matching_roots(&output).is_empty() || is_temporary_path(&output))
-        {
-            evidence_paths.push(output);
+        for output in resolved_outputs {
+            if !self.matching_roots(&output).is_empty() || is_temporary_path(&output) {
+                evidence_paths.push(output);
+            }
         }
         sort_dedup_paths(&mut evidence_paths);
         evidence_paths.truncate(self.config.max_evidence_paths);
@@ -762,15 +754,13 @@ impl RuleEngine {
                     directories.extend(self.matching_roots(&path));
                 }
             }
-            if let Some(output) = archive
+            for output in archive
                 .output_path
-                .as_deref()
-                .and_then(|path| resolve_archive_path(path, archive.cwd.as_deref()))
+                .iter()
+                .chain(&archive.output_paths)
+                .filter_map(|path| resolve_archive_path(path, archive.cwd.as_deref()))
             {
                 directories.extend(self.matching_roots(&output));
-            }
-            if let Some(cwd) = archive.cwd.as_deref().and_then(normalize_path) {
-                directories.extend(self.matching_roots(&cwd));
             }
         }
         sort_dedup_paths(&mut directories);

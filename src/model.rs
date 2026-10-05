@@ -53,6 +53,8 @@ pub struct ArchiveCommand {
     pub tool: String,
     pub input_paths: Vec<PathBuf>,
     pub output_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_paths: Vec<PathBuf>,
     pub cwd: Option<PathBuf>,
 }
 

@@ -8,6 +8,8 @@ macOS 本机项目文件活动观察工具。当前 MVP 用 Rust CLI 配置多�
 
 CLI、窄事件适配、规则、SQLite、历史目录发现、权限分离和 launchd 管理已实现。2026-10-05 在 macOS 15.6.1 完成真实 eslogger → Rust → SQLite／通知发送验收：16 个合成场景全部通过，22 条告警生成与通知发送均在 3 秒内，最大分别为 2.255 秒和 2.541 秒，本轮已知丢弃及保存缺口为 0。桌面通知到屏、后台 FDA、注销／登录补发、重启和持续性能仍待按 [MVP 验收](docs/validation/activity-monitor-mvp.md) 单独验证；sent 回执不代表到屏，短时通过不保证长期覆盖。
 
+归档命令解析已扩展为默认识别 tar、bsdtar、gtar、zip、ditto、gzip、pigz、bzip2、pbzip2、xz、zstd、7z、7zz、rar 共 14 个名称。用户只选择监控目录，无需逐工具配置。支持常见直接路径及工具允许的标准输出模式；未知参数、列表文件与缺少项目来源的标准输入保留覆盖缺口。扩展的真实系统验收进展见 [归档命令验收](docs/validation/archive-command-coverage.md)。
+
 系统采集使用 macOS 自带 `/usr/bin/eslogger`，需要管理员权限与责任进程的完全磁盘访问。root 仅运行采集／转发；分析、SQLite 和通知使用普通用户。原始全系统 JSON、完整命令行、环境变量和文件正文不落盘。当前订阅 NOTIFY 事件，支持本机观察，不提供压缩或网络拦截。
 
 ## 构建与运行
@@ -53,6 +55,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 python3 -B -m unittest discover -s tests -p test_synthetic_sender.py -v
 python3 -B scripts/validate-selftest.py
+python3 -B scripts/validate-archive-selftest.py
 ```
 
 真实完整验收使用新建的匿名项目和独立普通用户数据库，不导入真实历史或触碰既有服务配置。先阅读 [运行步骤与证据口径](docs/validation/activity-monitor-mvp.md)，在自己的终端授权后显式运行：
@@ -73,6 +76,7 @@ python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
 | [MVP 规格](.scratch/activity-monitor-mvp/spec.md) | 当前观察版本范围与完成条件 |
 | [技术基线](.scratch/activity-monitor-mvp/technical-design.md) | 已确认技术选择与覆盖边界 |
 | [MVP 验收](docs/validation/activity-monitor-mvp.md) | 组件、真实事件、时延与后台验证 |
+| [归档命令验收](docs/validation/archive-command-coverage.md) | 14 个命令的参数、工具与真实采集验证 |
 | [核心可行性](docs/research/feasibility.md) | 文件、打包、网络、加密、权限和分发 |
 | [现有项目与复用](docs/research/existing-projects.md) | 开源参考和待核查项 |
 | [整体架构](docs/architecture/technical-options.md) | 后续核心防护、接口和平台候选 |
