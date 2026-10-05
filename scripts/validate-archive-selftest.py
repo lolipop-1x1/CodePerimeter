@@ -6,9 +6,13 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import pty
+import select
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -296,6 +300,131 @@ class ArchiveValidationSelfTest(unittest.TestCase):
                 self.assertEqual(observer.stop(), cleanup_ok)
                 stop.assert_called_once_with(None, observer.process)
             self.assertEqual(observer.failure_codes, failures)
+
+    def test_sidecar_start_preserves_the_authorized_terminal_session(self):
+        observer = VALIDATOR.EsloggerSidecar()
+        process_mock = mock.Mock(pid=PID)
+        process_mock.poll.return_value = None
+        with mock.patch.object(VALIDATOR.subprocess, "Popen", return_value=process_mock) as launch, \
+                mock.patch.object(VALIDATOR.threading, "Thread"), \
+                mock.patch.object(observer, "_verified_processes", return_value=[PID]), \
+                mock.patch.object(VALIDATOR.MVP, "process_info",
+                                  return_value=(0, PID - 1, PID - 1, "/usr/bin/eslogger")):
+            observer.start()
+        self.assertEqual(launch.call_args.args[0],
+                         ["/usr/bin/sudo", "-n", "/usr/bin/eslogger", "exec"])
+        self.assertEqual(launch.call_args.kwargs["stdin"], VALIDATOR.subprocess.DEVNULL)
+        self.assertFalse(launch.call_args.kwargs.get("start_new_session", False))
+        self.assertTrue(observer.root_identity_verified)
+
+    @unittest.skipIf(os.geteuid() == 0, "无特权终端回归要求普通用户运行")
+    def test_sidecar_session_inheritance_keeps_a_real_unprivileged_control_terminal(self):
+        child, terminal = pty.fork()
+        if child == 0:
+            try:
+                session = os.getsid(0)
+                real_popen = VALIDATOR.subprocess.Popen
+                probe_code = (
+                    "import json, os, sys, time; "
+                    "tty = os.open('/dev/tty', os.O_RDONLY); os.close(tty); "
+                    "print(json.dumps({'same_session': os.getsid(0) == int(sys.argv[1]), "
+                    "'control_terminal': True}), flush=True); time.sleep(0.1)"
+                )
+
+                def launch_probe(_command, **kwargs):
+                    # 使用旁路的真实启动参数，仅将 sudo 换成无特权终端探针。
+                    return real_popen([sys.executable, "-B", "-c", probe_code, str(session)],
+                                      **kwargs)
+
+                observer = VALIDATOR.EsloggerSidecar()
+                with mock.patch.object(VALIDATOR.subprocess, "Popen", side_effect=launch_probe), \
+                        mock.patch.object(VALIDATOR.threading, "Thread"), \
+                        mock.patch.object(observer, "_verified_processes", return_value=[PID]), \
+                        mock.patch.object(VALIDATOR.MVP, "process_info",
+                                          return_value=(0, PID - 1, PID - 1, "/usr/bin/eslogger")):
+                    observer.start()
+                state = json.loads(observer.process.stdout.read())
+                successful = (observer.process.wait(timeout=5) == 0
+                              and state == {"same_session": True, "control_terminal": True})
+                observer.process.stdout.close()
+                observer.process.stderr.close()
+            except Exception:
+                successful = False
+            os._exit(0 if successful else 1)
+        deadline = time.monotonic() + 8
+        status = None
+        try:
+            while time.monotonic() < deadline:
+                finished, result = os.waitpid(child, os.WNOHANG)
+                if finished:
+                    status = result
+                    break
+                ready, _, _ = select.select([terminal], [], [], 0.05)
+                if ready:
+                    try:
+                        os.read(terminal, 4096)
+                    except OSError:
+                        pass
+            if status is None:
+                os.kill(child, VALIDATOR.signal.SIGKILL)
+                _, status = os.waitpid(child, 0)
+        finally:
+            os.close(terminal)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0,
+                         "旁路启动必须继承 SID 与控制终端，stdin 仍为 DEVNULL")
+
+    def test_sidecar_stderr_classifies_split_sudo_and_es_errors_without_raw_data(self):
+        private_marker = b"SYNTHETIC_PRIVATE_PATH_MARKER"
+
+        class ChunkStream:
+            def __init__(self, chunks):
+                self.chunks = iter(chunks)
+
+            def read(self, size):
+                return next(self.chunks, b"")
+
+        scenarios = (
+            ([b"sudo: a pass", b"word is requ", b"ired " + private_marker],
+             ["sudo_authorization_required"]),
+            ([b"ES_NEW_CLIENT_RESULT_ERR_NOT_", b"PERMITTED " + private_marker],
+             ["es_client_denied"]),
+            ([b"ES_NEW_CLIENT_RESULT_ERR_INTERNAL " + private_marker],
+             ["source_startup_failed"]),
+            ([b"unexpected " + private_marker], ["unclassified_stderr"]),
+            ([], []),
+        )
+        for chunks, expected in scenarios:
+            observer = VALIDATOR.EsloggerSidecar()
+            observer.process = mock.Mock(stderr=ChunkStream(chunks))
+            observer.process.poll.return_value = 1 if chunks else 0
+            observer._read_stderr()
+            summary = observer.summary()
+            self.assertEqual(summary["diagnostic_codes"], expected)
+            self.assertTrue(summary["stderr_complete"])
+            self.assertEqual(summary["exit_code"], 1 if chunks else 0)
+            self.assertNotIn(private_marker.decode(), json.dumps(summary))
+            self.assertNotIn(private_marker, repr(vars(observer)).encode())
+
+    def test_sidecar_failed_start_consumes_stderr_and_prioritizes_sudo_authorization(self):
+        for stderr, code in (
+            (b"sudo: a password is required\nES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED\n",
+             "sidecar_sudo_authorization_required"),
+            (b"ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED\n", "sidecar_es_client_denied"),
+            (b"SYNTHETIC_PRIVATE_PATH_MARKER\n", "sidecar_root_unverified"),
+        ):
+            observer = VALIDATOR.EsloggerSidecar()
+            process_mock = mock.Mock(pid=PID, stdout=io.BytesIO(b""), stderr=io.BytesIO(stderr))
+            process_mock.poll.return_value = 1
+            process_mock.wait.return_value = 1
+            with mock.patch.object(VALIDATOR.subprocess, "Popen", return_value=process_mock):
+                with self.assertRaisesRegex(RuntimeError, "^" + code + "$"):
+                    observer.start()
+                self.assertTrue(observer.stop())
+            summary = observer.summary()
+            self.assertTrue(summary["stderr_complete"])
+            self.assertIn(code, summary["failure_codes"])
+            self.assertEqual(summary["exit_code"], 1)
+            self.assertNotIn("SYNTHETIC_PRIVATE_PATH_MARKER", json.dumps(summary))
 
     def test_stdin_requires_this_main_stream_gap_identity_before_the_fence(self):
         case, execution, evidence, barrier = unrelated_fixture()

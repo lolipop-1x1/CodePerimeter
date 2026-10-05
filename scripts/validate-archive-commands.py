@@ -76,6 +76,7 @@ FAILURE_CODES = {
     "sidecar_stream_failed", "sidecar_stream_ended", "sidecar_sequence_missing",
     "sidecar_sequence_gap", "sidecar_sequence_regression", "sidecar_unexpected_event",
     "sidecar_not_root", "sidecar_root_unverified", "sidecar_es_client_denied",
+    "sidecar_sudo_authorization_required",
     "sidecar_cleanup_incomplete", "reverse_output_empty", "reverse_extract_output_missing",
     "stdin_write_failed", "stdin_source_gap_missing", "sidecar_exit_nonzero", "interrupted",
 }
@@ -289,7 +290,8 @@ class EsloggerSidecar:
         self.global_seq = None
         self.event_seq = None
         self.root_identity_verified = False
-        self.stderr_es_denied = False
+        self.diagnostic_codes = set()
+        self.stderr_complete = False
         self.stopping = False
         self.stopped = False
         self.cleanup_result = None
@@ -333,10 +335,10 @@ class EsloggerSidecar:
 
     def start(self, timeout=8):
         try:
+            # 继承授权终端的 sudo 会话；清理只控制本轮核验后的精确 PID。
             self.process = subprocess.Popen(
                 ["/usr/bin/sudo", "-n", "/usr/bin/eslogger", "exec"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                start_new_session=True,
             )
         except OSError as error:
             raise RuntimeError("sidecar_stream_failed") from error
@@ -359,8 +361,11 @@ class EsloggerSidecar:
                 raise RuntimeError("sidecar_root_unverified")
             time.sleep(0.05)
         if self.process.poll() is not None and self.stderr_reader:
-            self.stderr_reader.join(timeout=0.2)
-        if self.stderr_es_denied:
+            self.stderr_reader.join(timeout=3)
+        if "sudo_authorization_required" in self.diagnostic_codes:
+            self.failure_codes.add("sidecar_sudo_authorization_required")
+            raise RuntimeError("sidecar_sudo_authorization_required")
+        if "es_client_denied" in self.diagnostic_codes:
             self.failure_codes.add("sidecar_es_client_denied")
             raise RuntimeError("sidecar_es_client_denied")
         if not self.root_identity_verified:
@@ -465,15 +470,35 @@ class EsloggerSidecar:
             self.failure_codes.add("sidecar_stream_failed")
 
     def _read_stderr(self):
+        # 原文只保留有界内存尾部，以识别跨 read 分片的固定诊断。
+        tail = b""
+        observed = False
+        source_error = False
         try:
             while True:
                 chunk = self.process.stderr.read(4096)
                 if not chunk:
+                    if observed and not self.diagnostic_codes:
+                        self.diagnostic_codes.add("source_startup_failed" if source_error
+                                                  else "unclassified_stderr")
+                    self.stderr_complete = True
                     return
-                text = chunk.decode("utf-8", errors="ignore").lower()
-                if "not permitted" in text or "es_new_client_result_err_not_permitted" in text:
-                    self.stderr_es_denied = True
-        except OSError:
+                observed = observed or bool(chunk.strip())
+                text = (tail + chunk).lower()
+                source_error = source_error or b"es_new_client_result_err" in text
+                if any(pattern in text for pattern in (
+                    b"password is required", b"a terminal is required to read the password",
+                    b"no tty present and no askpass program specified",
+                )):
+                    self.diagnostic_codes.add("sudo_authorization_required")
+                if (b"es_new_client_result_err_not_permitted" in text
+                        or b"es_new_client_result_err_not_entitled" in text
+                        or (b"eslogger" in text and b"not permitted" in text)):
+                    self.diagnostic_codes.add("es_client_denied")
+                elif b"unable to execute" in text or b"no such file or directory" in text:
+                    self.diagnostic_codes.add("source_startup_failed")
+                tail = text[-256:]
+        except (OSError, ValueError):
             self.failure_codes.add("sidecar_stream_failed")
 
     @staticmethod
@@ -624,6 +649,9 @@ class EsloggerSidecar:
     def summary(self):
         return {"root_identity_verified": self.root_identity_verified,
                 "record_count": self.record_count,
+                "exit_code": self.process.poll() if self.process else None,
+                "diagnostic_codes": sorted(self.diagnostic_codes),
+                "stderr_complete": self.stderr_complete,
                 "sequence_gap_or_regression": any(code in self.failure_codes for code in (
                     "sidecar_sequence_gap", "sidecar_sequence_regression")),
                 "failure_codes": sorted(self.failure_codes)}
