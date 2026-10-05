@@ -1322,7 +1322,20 @@ fn render_plist(label: &str, argv: &[String], username: Option<&str>, agent: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Cursor;
+    use std::os::fd::FromRawFd;
+
+    fn synthetic_source_pipe() -> (File, File) {
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        unsafe {
+            (
+                File::from_raw_fd(descriptors[0]),
+                File::from_raw_fd(descriptors[1]),
+            )
+        }
+    }
 
     #[test]
     #[ignore = "由受控子进程信号测试调用，不在测试宿主中改信号处理器"]
@@ -1460,6 +1473,120 @@ mod tests {
             timing.send_total_us.load(Ordering::Relaxed)
                 >= timing.send_max_us.load(Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn source_pipe_delivers_a_sparse_line_before_eof_or_full_buffer() {
+        let (read_end, mut write_end) = synthetic_source_pipe();
+        let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let drops = Arc::new(AtomicU64::new(0));
+        let timing = Arc::new(SourceTiming::default());
+        let producer = produce_stdout(read_end, sender, Arc::clone(&drops), Arc::clone(&timing));
+        let started = Instant::now();
+        write_end.write_all(b"anonymous sparse\n").unwrap();
+        let SourceItem::Line(line, _) = receiver.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("pipe 保持打开时，完整的稀疏行应已传递");
+        };
+        let arrival_us = started.elapsed().as_micros() as u64;
+        assert_eq!(line, "anonymous sparse");
+        assert!(!producer.is_finished());
+        drop(write_end);
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SourceItem::End
+        ));
+        producer.join().unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        println!(
+            "ANONYMOUS_PIPE_DIAGNOSTIC {}",
+            serde_json::json!({
+                "scenario": "sparse_open_pipe",
+                "records": timing.lines.load(Ordering::Relaxed),
+                "arrival_us": arrival_us,
+                "source_send_max_us": timing.send_max_us.load(Ordering::Relaxed),
+            })
+        );
+    }
+
+    #[test]
+    fn source_pipe_separates_producer_delay_from_downstream_backpressure() {
+        for scenario in ["immediate", "producer_delay", "consumer_backpressure"] {
+            let (read_end, mut write_end) = synthetic_source_pipe();
+            let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+            let drops = Arc::new(AtomicU64::new(0));
+            let timing = Arc::new(SourceTiming::default());
+            let producer =
+                produce_stdout(read_end, sender, Arc::clone(&drops), Arc::clone(&timing));
+            let writer = thread::spawn(move || {
+                let padding = "x".repeat(2033);
+                let mut write_total_us = 0;
+                let mut write_max_us = 0;
+                let mut prewrite_max_ms = 0;
+                for index in 0..128 {
+                    let source_ms = now_ms();
+                    let line = format!("{source_ms}|{padding}\n");
+                    if scenario == "producer_delay" && index == 0 {
+                        thread::sleep(Duration::from_millis(120));
+                    }
+                    prewrite_max_ms = prewrite_max_ms.max(now_ms() - source_ms);
+                    let started = Instant::now();
+                    write_end.write_all(line.as_bytes()).unwrap();
+                    let elapsed = started.elapsed().as_micros() as u64;
+                    write_total_us += elapsed;
+                    write_max_us = write_max_us.max(elapsed);
+                }
+                (write_total_us, write_max_us, prewrite_max_ms)
+            });
+            if scenario == "consumer_backpressure" {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while timing.lines.load(Ordering::Relaxed) <= QUEUE_CAPACITY as u64 {
+                    assert!(Instant::now() < deadline, "读取线程应开始等待队列容量");
+                    thread::yield_now();
+                }
+                thread::sleep(Duration::from_millis(120));
+            }
+            let mut receive_lag_max_ms = 0;
+            for _ in 0..128 {
+                let SourceItem::Line(line, received_ms) =
+                    receiver.recv_timeout(Duration::from_secs(1)).unwrap()
+                else {
+                    panic!("合成 pipe 数据应保序传递");
+                };
+                let (source_ms, padding) = line.split_once('|').unwrap();
+                assert_eq!(padding.len(), 2033);
+                receive_lag_max_ms =
+                    receive_lag_max_ms.max(received_ms - source_ms.parse::<i64>().unwrap());
+            }
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                SourceItem::End
+            ));
+            let (write_total_us, write_max_us, prewrite_max_ms) = writer.join().unwrap();
+            producer.join().unwrap();
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            assert_eq!(timing.lines.load(Ordering::Relaxed), 128);
+            if scenario == "producer_delay" {
+                assert!(prewrite_max_ms >= 100);
+                assert!(receive_lag_max_ms >= 100);
+            }
+            if scenario == "consumer_backpressure" {
+                assert!(timing.send_max_us.load(Ordering::Relaxed) >= 100_000);
+            }
+            println!(
+                "ANONYMOUS_PIPE_DIAGNOSTIC {}",
+                serde_json::json!({
+                    "scenario": scenario,
+                    "records": timing.lines.load(Ordering::Relaxed),
+                    "source_to_receive_max_ms": receive_lag_max_ms,
+                    "producer_prewrite_max_ms": prewrite_max_ms,
+                    "producer_write_total_us": write_total_us,
+                    "producer_write_max_us": write_max_us,
+                    "source_send_total_us": timing.send_total_us.load(Ordering::Relaxed),
+                    "source_send_max_us": timing.send_max_us.load(Ordering::Relaxed),
+                })
+            );
+        }
     }
 
     #[test]

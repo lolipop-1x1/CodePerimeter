@@ -182,6 +182,163 @@ def reverse_fixture():
 
 
 class ArchiveValidationSelfTest(unittest.TestCase):
+    def test_source_latency_utc_parser_keeps_nine_digit_precision_and_rejects_unknown_time(self):
+        self.assertEqual(VALIDATOR.parse_utc_timestamp_ns("1970-01-01T00:00:01.123456789Z"),
+                         1_123_456_789)
+        self.assertEqual(VALIDATOR.parse_utc_timestamp_ns("1970-01-01T00:00:01.1+00:00"),
+                         1_100_000_000)
+        for value in (None, True, "SYNTHETIC_PRIVATE_TIMESTAMP", "1970-01-01T00:00:01+01:00",
+                      "1970-01-01T00:00:01.1234567890Z"):
+            self.assertIsNone(VALIDATOR.parse_utc_timestamp_ns(value))
+
+    def test_source_latency_pairing_requires_exact_pid_generation_and_executable(self):
+        case, evidence = positive_fixture()
+        observed = dict(sidecar_exec(), source_timestamp_ns=1_000_000_000,
+                        received_timestamp_ns=1_004_000_000)
+        execution = {"pids": {PID}, "sidecar_execs": [observed],
+                     "started_timestamp_ns": 999_000_000, "finished_timestamp_ns": 1_002_000_000}
+        result = VALIDATOR.source_latency_comparison(case, execution, evidence, SOURCE_RUN)
+        self.assertTrue(result["complete"])
+        self.assertTrue(result["source_timestamp_match"])
+        self.assertEqual(result["main_minus_sidecar_receive_ms"], 1)
+        self.assertEqual(result["sidecar_source_to_receive_ms"], 4)
+        for field, value in (("target_pid", PID + 1), ("target_pid_version", PID_VERSION + 1),
+                             ("executable", "gzip")):
+            wrong = copy.deepcopy(execution)
+            wrong["sidecar_execs"][0][field] = value
+            result = VALIDATOR.source_latency_comparison(case, wrong, evidence, SOURCE_RUN)
+            self.assertFalse(result["complete"])
+            self.assertEqual(result["failure_code"], "source_latency_exec_pair_missing")
+        wrong = dict(execution, sidecar_failure_code="SYNTHETIC_PRIVATE_FAILURE")
+        result = VALIDATOR.source_latency_comparison(case, wrong, evidence, SOURCE_RUN)
+        self.assertEqual(result["failure_code"], "source_latency_exec_pair_missing")
+        self.assertNotIn("SYNTHETIC_PRIVATE_FAILURE", json.dumps(result))
+        marker = "SYNTHETIC_PRIVATE_TIMESTAMP"
+        for container, field in (("sidecar", "source_timestamp_ns"),
+                                 ("sidecar", "received_timestamp_ns"),
+                                 ("execution", "started_timestamp_ns"),
+                                 ("event", "received_timestamp_ms")):
+            for value in (None, True, marker):
+                changed = copy.deepcopy(execution)
+                changed_evidence = copy.deepcopy(evidence)
+                target = (changed["sidecar_execs"][0] if container == "sidecar" else changed
+                          if container == "execution" else changed_evidence["events"][0])
+                target[field] = value
+                result = VALIDATOR.source_latency_comparison(case, changed, changed_evidence, SOURCE_RUN)
+                self.assertFalse(result["complete"])
+                self.assertEqual(result["failure_code"], "source_latency_timestamp_missing")
+                self.assertNotIn(marker, json.dumps(result))
+
+    def test_source_latency_comparison_does_not_relax_main_latency_or_guess_time_window(self):
+        case, evidence = positive_fixture()
+        evidence["events"][0]["received_timestamp_ms"] = 5000
+        evidence["outbox"][ALERT_ID] = 5001
+        evidence["notifications"][0]["observed_timestamp_ms"] = 5200
+        observed = dict(sidecar_exec(), source_timestamp_ns=1_000_000_000,
+                        received_timestamp_ns=1_004_000_000)
+        execution = {"pids": {PID}, "sidecar_execs": [observed],
+                     "started_timestamp_ns": 999_000_000, "finished_timestamp_ns": 1_002_000_000}
+        diagnostic = VALIDATOR.source_latency_comparison(case, execution, evidence, SOURCE_RUN)
+        self.assertTrue(diagnostic["complete"])
+        self.assertEqual(diagnostic["main_minus_sidecar_receive_ms"], 3996)
+        self.assertEqual(VALIDATOR.analyze_positive(case, execution, evidence, SOURCE_RUN)["failure_code"],
+                         "generation_latency_over_3000ms")
+        execution["started_timestamp_ns"] = 1_001_000_000
+        diagnostic = VALIDATOR.source_latency_comparison(case, execution, evidence, SOURCE_RUN)
+        self.assertFalse(diagnostic["complete"])
+        self.assertFalse(diagnostic["main_source_in_execution_window"])
+        self.assertFalse(diagnostic["sidecar_source_in_execution_window"])
+        self.assertEqual(diagnostic["failure_code"], "source_latency_execution_window_mismatch")
+        execution["started_timestamp_ns"] = 999_000_000
+        observed["source_timestamp_ns"] += 2_000_000
+        diagnostic = VALIDATOR.source_latency_comparison(case, execution, evidence, SOURCE_RUN)
+        self.assertFalse(diagnostic["source_timestamp_match"])
+        self.assertFalse(diagnostic["complete"])
+
+    def test_source_latency_subset_and_result_cannot_claim_full_validation(self):
+        def build(tool, mode, *_):
+            return positive_case(tool=tool, mode=mode)
+
+        with mock.patch.object(VALIDATOR, "build_case", side_effect=build):
+            cases = VALIDATOR.all_cases(PROJECT, UNRELATED, {}, {}, {}, dict.fromkeys(VALIDATOR.TOOLS))
+        self.assertEqual(len(VALIDATOR.validation_cases(cases, False)), 92)
+        subset = VALIDATOR.validation_cases(cases, True)
+        self.assertEqual({(case.tool, case.mode) for case in subset}, {
+            (tool, mode) for tool in ("ditto", "bzip2", "pbzip2", "zstd")
+            for mode in ("create", "stdout")
+        })
+        self.assertEqual(len(subset), 8)
+        self.assertEqual(VALIDATOR.validation_result(True, True), "source_latency_diagnostic_passed")
+        self.assertEqual(VALIDATOR.validation_result(True, False),
+                         "source_latency_diagnostic_failed_or_partial")
+        self.assertEqual(VALIDATOR.validation_result(False, True), "real_run_passed")
+
+    def test_incomplete_source_latency_diagnostic_cannot_mark_the_case_verified(self):
+        case, evidence = positive_fixture()
+        execution = {"pids": {PID}, "return_code": 0, "failure_code": None}
+        result = VALIDATOR.analyze_positive(case, execution, evidence, SOURCE_RUN)
+        self.assertTrue(result["passed"])
+        result["source_latency_diagnostic"] = {"complete": False,
+                                               "failure_code": "source_latency_exec_pair_missing"}
+        summary = VALIDATOR.case_summary(case, execution, result, "1.0")
+        self.assertFalse(summary["passed"])
+        self.assertEqual(summary["failure_code"], "source_latency_exec_pair_missing")
+        result.update(passed=False, failure_code="generation_latency_over_3000ms")
+        summary = VALIDATOR.case_summary(case, execution, result, "1.0")
+        self.assertEqual(summary["failure_code"], "generation_latency_over_3000ms")
+
+    def test_source_latency_startup_failure_keeps_the_four_tool_diagnostic_scope(self):
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-diagnostic-selftest-",
+                                         dir="/private/tmp") as temporary:
+            report = Path(temporary) / "report"
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "argv", ["validator", "--diagnose-source-latency",
+                                                 "--report-dir", str(report)]), \
+                    mock.patch.object(VALIDATOR, "discover_tools",
+                                      side_effect=RuntimeError("SYNTHETIC_PRIVATE_FAILURE")), \
+                    contextlib.redirect_stdout(stdout):
+                self.assertEqual(VALIDATOR.main(), 2)
+            summary = json.loads((report / "summary.json").read_text())
+            self.assertEqual(summary["mode"], "source_latency_diagnostic")
+            self.assertEqual(summary["result"], "source_latency_diagnostic_failed_or_partial")
+            self.assertEqual({row["tool"] for row in summary["tools"]},
+                             set(VALIDATOR.SOURCE_LATENCY_TOOLS))
+            self.assertEqual(json.loads(stdout.getvalue())["tool_count"], 4)
+            self.assertNotIn("SYNTHETIC_PRIVATE_FAILURE", stdout.getvalue())
+
+    def test_positive_sidecar_observation_is_opt_in_and_only_retains_parsed_numeric_time(self):
+        case = positive_case(mode="stdout", output_path=None)
+        observer = mock.Mock()
+        execution = {"pids": {PID}, "return_code": 0, "failure_code": None, "stdout_bytes": 1}
+        for enabled in (False, True):
+            observer.reset_mock()
+            with mock.patch.object(VALIDATOR, "execute", return_value=dict(execution)) as execute:
+                VALIDATOR.process_case(case, Path("/usr/bin/synthetic"), None, SOURCE_RUN,
+                                       SCRIPT_PATH, sidecar=observer, observe_positive=enabled)
+            self.assertIs(execute.call_args.kwargs["observer"], observer if enabled else None)
+            if enabled:
+                observer.begin_case.assert_called_once_with("zip", observe_timing=True)
+            else:
+                observer.begin_case.assert_not_called()
+        sidecar = VALIDATOR.EsloggerSidecar()
+        sidecar.begin_case("zip", observe_timing=True)
+        sidecar.register_pids({PID})
+        record = {"seq_num": 1, "global_seq_num": 1, "time": "1970-01-01T00:00:01.123456789Z",
+                  "event": {"exec": {"target": {
+                      "audit_token": {"pid": PID, "pidversion": PID_VERSION}, "ppid": 40000,
+                      "executable": {"path": "/usr/bin/zip"},
+                  }}}}
+        sidecar._record_exec(record, received_timestamp_ns=1_124_000_000)
+        candidate = sidecar.active["candidates"][0]
+        self.assertEqual(candidate["source_timestamp_ns"], 1_123_456_789)
+        self.assertEqual(candidate["received_timestamp_ns"], 1_124_000_000)
+        self.assertNotIn(record["time"], json.dumps(candidate))
+        sidecar.active["candidates"].clear()
+        record.update(seq_num=2, global_seq_num=2, time="SYNTHETIC_PRIVATE_TIMESTAMP")
+        sidecar._record_exec(record, received_timestamp_ns=1_124_000_000)
+        self.assertIsNone(sidecar.active["candidates"][0]["source_timestamp_ns"])
+        self.assertNotIn("SYNTHETIC_PRIVATE_TIMESTAMP", json.dumps(sidecar.active["candidates"]))
+
     def test_runner_preparation_failures_and_interrupts_do_not_echo_private_arguments(self):
         runner = SCRIPT_PATH.with_name("run-archive-validation.sh").read_text()
         inline = runner.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]

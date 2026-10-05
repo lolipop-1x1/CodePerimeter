@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import importlib.util
 import json
 import os
@@ -36,6 +37,7 @@ TOOLS = (
 UPDATE_TOOLS = {"tar", "bsdtar", "gtar", "zip", "7z", "7zz", "rar"}
 STDOUT_TOOLS = set(TOOLS) - {"rar"}
 STDIN_TOOLS = set(TOOLS) - {"tar", "bsdtar", "gtar", "ditto"}
+SOURCE_LATENCY_TOOLS = ("ditto", "bzip2", "pbzip2", "zstd")
 REVERSE_MODES = {
     "tar": ("reverse_list", "reverse_extract"),
     "bsdtar": ("reverse_list", "reverse_extract"),
@@ -88,6 +90,8 @@ FAILURE_CODES = {
     "sidecar_cleanup_incomplete", "reverse_output_empty", "reverse_extract_output_missing",
     "stdin_write_failed", "stdin_source_gap_missing", "sidecar_exit_nonzero", "interrupted",
     "python_version_unsupported",
+    "source_latency_exec_pair_missing", "source_latency_timestamp_missing",
+    "source_latency_source_time_mismatch", "source_latency_execution_window_mismatch",
 }
 
 
@@ -134,6 +138,21 @@ def is_reverse(mode):
 
 def is_negative(mode):
     return is_reverse(mode) or mode in ("unrelated", "stdin")
+
+
+def parse_utc_timestamp_ns(value):
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
+                         r"(?:\.([0-9]{1,9}))?(?:Z|\+00:00)", value)
+    if not match:
+        return None
+    try:
+        instant = datetime.strptime(match[1], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    delta = instant - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (delta.days * 86400 + delta.seconds) * 1_000_000_000 + int((match[2] or "").ljust(9, "0"))
 
 
 def is_within(path, root):
@@ -284,7 +303,7 @@ def descendants(pid):
 
 
 class EsloggerSidecar:
-    """短暂旁路观察本轮负例的 exec 身份，不保存原始事件。"""
+    """短暂旁路观察 exec 身份；显式诊断时增加数值时间，不保存原始事件。"""
 
     def __init__(self):
         self.process = None
@@ -395,18 +414,18 @@ class EsloggerSidecar:
             self.failure_codes.add("sidecar_root_unverified")
             raise RuntimeError("sidecar_root_unverified")
 
-    def begin_case(self, tool):
+    def begin_case(self, tool, observe_timing=False):
         with self.lock:
             aliases = expected_tool_names(tool)
             self.active = {"aliases": aliases, "known_pids": set(), "candidates": [],
-                           "overflow": False}
+                           "overflow": False, "observe_timing": observe_timing}
 
     def register_pids(self, pids):
         with self.lock:
             if self.active is not None:
                 self.active["known_pids"].update(pids)
 
-    def _record_exec(self, record):
+    def _record_exec(self, record, received_timestamp_ns=None):
         with self.lock:
             self.record_count += 1
             try:
@@ -473,6 +492,12 @@ class EsloggerSidecar:
                 "pre_exec_pid_version": top_version if isinstance(top_version, int) else None,
                 "executable": tool_name,
             })
+            if self.active["observe_timing"]:
+                self.active["candidates"][-1].update(
+                    source_timestamp_ns=parse_utc_timestamp_ns(record.get("time")),
+                    received_timestamp_ns=(received_timestamp_ns
+                                           if type(received_timestamp_ns) is int else None),
+                )
 
     def _read_stdout(self):
         try:
@@ -482,6 +507,7 @@ class EsloggerSidecar:
                     if not self.stopping:
                         self.failure_codes.add("sidecar_stream_ended")
                     return
+                received_timestamp_ns = time.time_ns()
                 if len(line) > 1024 * 1024 or not line.endswith(b"\n"):
                     self.failure_codes.add("sidecar_stream_malformed")
                     continue
@@ -496,7 +522,7 @@ class EsloggerSidecar:
                 if record.get("event_type") != 9:
                     self.failure_codes.add("sidecar_unexpected_event")
                     continue
-                self._record_exec(record)
+                self._record_exec(record, received_timestamp_ns=received_timestamp_ns)
         except (OSError, ValueError):
             self.failure_codes.add("sidecar_stream_failed")
 
@@ -696,6 +722,7 @@ class EsloggerSidecar:
 def execute(binary, argv, cwd, timeout=TOOL_TIMEOUT_SECONDS, capture_stdout=False, observer=None,
             stdin_payload=None):
     started = time.monotonic_ns()
+    started_timestamp_ns = time.time_ns()
     try:
         process = subprocess.Popen(
             [str(binary), *map(str, argv)], cwd=str(cwd),
@@ -749,6 +776,7 @@ def execute(binary, argv, cwd, timeout=TOOL_TIMEOUT_SECONDS, capture_stdout=Fals
             time.sleep(0.002)
         failure = "case_timeout" if process.poll() is None else None
     finally:
+        finished_timestamp_ns = time.time_ns()
         if process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -776,6 +804,8 @@ def execute(binary, argv, cwd, timeout=TOOL_TIMEOUT_SECONDS, capture_stdout=Fals
         "duration_ms": round((time.monotonic_ns() - started) / 1_000_000),
         "stdout_bytes": stdout_state["bytes"],
         "failure_code": failure,
+        "started_timestamp_ns": started_timestamp_ns,
+        "finished_timestamp_ns": finished_timestamp_ns,
     }
     if observer:
         result["sidecar"] = observer.finish_case(pids)
@@ -986,6 +1016,17 @@ def all_cases(project, unrelated, source_sets, output_sets, fence_paths, tools):
     return cases
 
 
+def validation_cases(cases, diagnose_source_latency):
+    return ([case for case in cases if case.tool in SOURCE_LATENCY_TOOLS
+             and case.mode in ("create", "stdout")] if diagnose_source_latency else cases)
+
+
+def validation_result(diagnose_source_latency, passed):
+    if diagnose_source_latency:
+        return "source_latency_diagnostic_passed" if passed else "source_latency_diagnostic_failed_or_partial"
+    return "real_run_passed" if passed else "real_run_failed_or_partial"
+
+
 def archive_outputs(archive):
     values = []
     if archive.get("output_path"):
@@ -1125,6 +1166,50 @@ def analyze_positive(case, execution, evidence, source_run_id):
         result["failure_code"] = "notification_latency_over_3000ms"
     else:
         result["passed"] = True
+    return result
+
+
+def source_latency_comparison(case, execution, evidence, source_run_id):
+    result = {"complete": False, "failure_code": None, "source_timestamp_match": None,
+              "main_source_in_execution_window": None, "sidecar_source_in_execution_window": None,
+              "main_minus_sidecar_source_ns": None, "sidecar_source_to_receive_ms": None,
+              "main_minus_sidecar_receive_ms": None}
+    matched, _ = matching_archive_exec(case, evidence, source_run_id, execution["pids"])
+    if len(matched) != 1:
+        result["failure_code"] = "source_latency_exec_pair_missing"
+        return result
+    event = matched[0]
+    _, pid, generation = event_process_key(event)
+    paired = [row for row in execution.get("sidecar_execs", [])
+              if type(row.get("target_pid")) is int and row["target_pid"] == pid
+              and type(row.get("target_pid_version")) is int and row["target_pid_version"] == generation
+              and row.get("executable") == executable_name(event)]
+    if len(paired) != 1 or execution.get("sidecar_failure_code"):
+        code = execution.get("sidecar_failure_code")
+        result["failure_code"] = code if code in FAILURE_CODES else "source_latency_exec_pair_missing"
+        return result
+    observed = paired[0]
+    values = (event.get("source_timestamp_ms"), event.get("received_timestamp_ms"),
+              observed.get("source_timestamp_ns"), observed.get("received_timestamp_ns"),
+              execution.get("started_timestamp_ns"), execution.get("finished_timestamp_ns"))
+    if any(type(value) is not int or value < 0 for value in values):
+        result["failure_code"] = "source_latency_timestamp_missing"
+        return result
+    main_source_ms, main_received_ms, side_source_ns, side_received_ns, started_ns, finished_ns = values
+    result.update(
+        source_timestamp_match=main_source_ms == side_source_ns // 1_000_000,
+        main_source_in_execution_window=started_ns // 1_000_000 <= main_source_ms <= finished_ns // 1_000_000,
+        sidecar_source_in_execution_window=started_ns <= side_source_ns <= finished_ns,
+        main_minus_sidecar_source_ns=main_source_ms * 1_000_000 - side_source_ns,
+        sidecar_source_to_receive_ms=(side_received_ns - side_source_ns) // 1_000_000,
+        main_minus_sidecar_receive_ms=(main_received_ms * 1_000_000 - side_received_ns) // 1_000_000,
+    )
+    if not result["source_timestamp_match"]:
+        result["failure_code"] = "source_latency_source_time_mismatch"
+    elif not result["main_source_in_execution_window"] or not result["sidecar_source_in_execution_window"]:
+        result["failure_code"] = "source_latency_execution_window_mismatch"
+    else:
+        result["complete"] = True
     return result
 
 
@@ -1334,7 +1419,7 @@ def run_fence(script, path, database, source_run_id, timeout=8):
     return {"pid": metadata.get("pid"), "pid_version": None, "crossed": False}
 
 
-def process_case(case, binary, database, source_run_id, script, sidecar=None):
+def process_case(case, binary, database, source_run_id, script, sidecar=None, observe_positive=False):
     negative = is_negative(case.mode)
     if case.preparation_failure:
         execution = {"return_code": None, "pids": set(), "duration_ms": None,
@@ -1345,9 +1430,9 @@ def process_case(case, binary, database, source_run_id, script, sidecar=None):
     if case.mode == "update" and not case.outputs[0].is_file():
         return {"return_code": None, "pids": set(), "duration_ms": None, "stdout_bytes": 0,
                 "failure_code": "update_seed_failed"}, None
-    observer = sidecar if negative else None
+    observer = sidecar if negative or observe_positive else None
     if observer:
-        observer.begin_case(case.tool)
+        observer.begin_case(case.tool, observe_timing=True) if observe_positive else observer.begin_case(case.tool)
     execution = execute(binary, case.argv, case.cwd, capture_stdout=case.stdout_expected,
                         observer=observer, stdin_payload=case.stdin_payload)
     if execution["failure_code"]:
@@ -1381,8 +1466,9 @@ def validate_operation(case, execution):
 
 
 def case_summary(case, execution, result, version):
-    failure = execution.get("failure_code") or result.get("failure_code")
-    return {
+    failure = (execution.get("failure_code") or result.get("failure_code")
+               or result.get("source_latency_diagnostic", {}).get("failure_code"))
+    summary = {
         "mode": case.mode,
         "version": version,
         "return_code": execution.get("return_code"),
@@ -1404,6 +1490,9 @@ def case_summary(case, execution, result, version):
         "passed": bool(result.get("passed")) and failure is None,
         "failure_code": failure,
     }
+    if "source_latency_diagnostic" in result:
+        summary["source_latency_diagnostic"] = result["source_latency_diagnostic"]
+    return summary
 
 
 def save_summary(path, summary):
@@ -1443,7 +1532,7 @@ def failure_code_for(error):
     return "tool_start_failed"
 
 
-def summarize_tools(tools, version_rows, cases):
+def summarize_tools(tools, version_rows, cases, names=TOOLS):
     return [{
         "tool": name,
         "version": version_rows[name]["version"],
@@ -1455,7 +1544,7 @@ def summarize_tools(tools, version_rows, cases):
             "version_probe_failed" if version_rows[name]["version_return_code"] not in (0, None) else
             "version_unavailable" if version_rows[name]["version"] is None else None
         ),
-    } for name in TOOLS]
+    } for name in names]
 
 
 def exercise_only(tools, report, version_rows):
@@ -1496,8 +1585,11 @@ def exercise_only(tools, report, version_rows):
 
 
 def real_validation(args, report, tools, version_rows):
-    summary = {"mode": "real_eslogger", "result": "not_started",
-               "tools": summarize_tools(tools, version_rows, []), "cases": [],
+    diagnostic = args.diagnose_source_latency
+    required_tools = SOURCE_LATENCY_TOOLS if diagnostic else TOOLS
+    selected_tools = {name: tools[name] for name in required_tools if name in tools}
+    summary = {"mode": "source_latency_diagnostic" if diagnostic else "real_eslogger", "result": "not_started",
+               "tools": summarize_tools(tools, version_rows, [], required_tools), "cases": [],
                "failure_codes": [], "collector_health": None}
     save_summary(report / "summary.json", summary)
     binary = args.binary.resolve()
@@ -1510,9 +1602,9 @@ def real_validation(args, report, tools, version_rows):
         if key in preflight
     }
     summary["collector_preflight"] = "passed"
-    missing = set(TOOLS) - set(tools)
-    workspace, project, unrelated, sources, outputs, fences = prepare_workspace(report, tools)
-    cases = all_cases(project, unrelated, sources, outputs, fences, tools)
+    missing = set(required_tools) - set(tools)
+    workspace, project, unrelated, sources, outputs, fences = prepare_workspace(report, selected_tools)
+    cases = validation_cases(all_cases(project, unrelated, sources, outputs, fences, selected_tools), diagnostic)
     host_directory = report / "host"
     host_directory.mkdir(mode=0o700)
     database = host_directory / "events.sqlite"
@@ -1581,7 +1673,8 @@ def real_validation(args, report, tools, version_rows):
                 }, ensure_ascii=False), flush=True)
                 continue
             execution, barrier = process_case(case, tools[tool], database, source_run_id,
-                                              Path(__file__).resolve(), sidecar=sidecar)
+                                              Path(__file__).resolve(), sidecar=sidecar,
+                                              observe_positive=diagnostic)
             deadline = time.monotonic() + REAL_CASE_TIMEOUT_SECONDS
             result = {"passed": False, "failure_code": None, "evidence_event_count": 0,
                       "archive_exec_count": 0, "archive_command_alert_count": 0,
@@ -1599,6 +1692,11 @@ def real_validation(args, report, tools, version_rows):
                     ):
                         break
                     time.sleep(0.05)
+                if diagnostic:
+                    comparison = source_latency_comparison(case, execution, evidence, source_run_id)
+                    result["source_latency_diagnostic"] = comparison
+                    if comparison["failure_code"]:
+                        summary["failure_codes"].append(comparison["failure_code"])
             else:
                 evidence = MVP.load_evidence(database)
                 status = MVP.control(control_socket, "status")
@@ -1612,7 +1710,7 @@ def real_validation(args, report, tools, version_rows):
             case_result["tool"] = tool
             case_results.append(case_result)
             summary["cases"] = case_results
-            summary["tools"] = summarize_tools(tools, version_rows, case_results)
+            summary["tools"] = summarize_tools(tools, version_rows, case_results, required_tools)
             save_summary(report / "summary.json", summary)
             print(json.dumps({
                 "case": case_number, "case_count": len(cases), "tool": tool,
@@ -1646,23 +1744,27 @@ def real_validation(args, report, tools, version_rows):
             "failure_code": None if healthy and privacy_ok else (health_code or "privacy_marker_persisted"),
             "static_coverage_issues": static_coverage,
         }
-        summary["tools"] = summarize_tools(tools, version_rows, case_results)
+        summary["tools"] = summarize_tools(tools, version_rows, case_results, required_tools)
         summary["cases"] = case_results
         if not healthy:
             summary["failure_codes"].append(health_code or "collector_unhealthy")
         if not privacy_ok:
             summary["failure_codes"].append("privacy_marker_persisted")
-        summary["result"] = "real_run_passed" if (
+        passed = (
             not missing and healthy and privacy_ok and case_results
             and sidecar_cleanup_ok and not sidecar.failure_codes
             and all(row.get("passed") for row in case_results)
-        ) else "real_run_failed_or_partial"
+            and (not diagnostic or (len(case_results) == 8 and all(
+                row.get("source_latency_diagnostic", {}).get("complete") for row in case_results
+            )))
+        )
+        summary["result"] = validation_result(diagnostic, passed)
         return summary
     except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError, sqlite3.Error) as error:
         summary["failure_codes"].append(failure_code_for(error))
-        summary["result"] = "real_run_failed_or_partial"
+        summary["result"] = validation_result(diagnostic, False)
         summary["cases"] = case_results
-        summary["tools"] = summarize_tools(tools, version_rows, case_results)
+        summary["tools"] = summarize_tools(tools, version_rows, case_results, required_tools)
         return summary
     finally:
         try:
@@ -1675,7 +1777,7 @@ def real_validation(args, report, tools, version_rows):
             summary["failure_codes"].append("sidecar_cleanup_incomplete")
         summary["failure_codes"].extend(sidecar.failure_codes)
         if sidecar.failure_codes or not sidecar_cleanup_ok:
-            summary["result"] = "real_run_failed_or_partial"
+            summary["result"] = validation_result(diagnostic, False)
         if notifier and notifier.poll() is None:
             notifier.terminate()
             try:
@@ -1703,7 +1805,7 @@ def real_validation(args, report, tools, version_rows):
         summary["root_startup_diagnostic_codes"] = startup_codes[:8]
         if not cleanup_ok:
             summary["failure_codes"].append("collector_cleanup_incomplete")
-            summary["result"] = "failed_root_cleanup_incomplete"
+            summary["result"] = validation_result(True, False) if diagnostic else "failed_root_cleanup_incomplete"
         if database.exists():
             try:
                 evidence = MVP.load_evidence(database)
@@ -1720,7 +1822,7 @@ def real_validation(args, report, tools, version_rows):
             except OSError:
                 pass
         summary["cases"] = case_results
-        summary["tools"] = summarize_tools(tools, version_rows, case_results)
+        summary["tools"] = summarize_tools(tools, version_rows, case_results, required_tools)
         summary["failure_codes"] = sorted(set(summary["failure_codes"] + [
             row["failure_code"] for row in case_results if row.get("failure_code")
         ] + [row["failure_code"] for row in summary["tools"] if row.get("failure_code")]))
@@ -1743,10 +1845,14 @@ def main():
                         help="外部 RAR 试用二进制；不会复制到项目")
     parser.add_argument("--report-dir", type=Path,
                         help="项目目录外的空目录；省略时在 /private/tmp 创建私有目录")
-    parser.add_argument("--exercise-only", action="store_true",
-                        help="执行本机合成工具调用但不启动采集器，不构成监控验收")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--exercise-only", action="store_true",
+                       help="执行本机合成工具调用但不启动采集器，不构成监控验收")
+    modes.add_argument("--diagnose-source-latency", action="store_true",
+                       help="仅用 8 个正例对照主旁路来源延迟，不构成完整工具验收")
     parser.add_argument("--fence-worker", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    required_tools = SOURCE_LATENCY_TOOLS if args.diagnose_source_latency else TOOLS
     os.umask(0o077)
     default_tools_dir = Path.home() / "Library" / "Application Support" / "CodePerimeter" / "validation-tools" / "bin"
     if args.tools_dir is None and default_tools_dir.is_dir():
@@ -1762,7 +1868,7 @@ def main():
     try:
         tools = discover_tools(args.tools_dir, args.rar_binary)
         version_rows = {}
-        for name in TOOLS:
+        for name in required_tools:
             if name not in tools:
                 version_rows[name] = {"version": None, "version_return_code": None}
                 continue
@@ -1797,11 +1903,12 @@ def main():
         ] + [item.get("failure_code") for item in summary.get("tool_inventory", [])
              if item.get("failure_code")]))
         save_summary(report / "summary.json", summary)
-        print(json.dumps({"result": summary["result"], "tool_count": len(TOOLS),
+        print(json.dumps({"result": summary["result"], "tool_count": len(required_tools),
                           "case_count": len(summary.get("cases", summary.get("tools", []))),
                           "failure_codes": summary["failure_codes"],
                           "summary": str(report / "summary.json")}, ensure_ascii=False))
-        return 0 if summary["result"] in ("real_run_passed", "exercise_completed_not_real_validation") else 1
+        return 0 if summary["result"] in ("real_run_passed", "exercise_completed_not_real_validation",
+                                         "source_latency_diagnostic_passed") else 1
     except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError,
             sqlite3.Error, KeyboardInterrupt) as error:
         interrupted = isinstance(error, KeyboardInterrupt)
@@ -1810,18 +1917,20 @@ def main():
             summary = json.loads((report / "summary.json").read_text())
         except (OSError, ValueError, json.JSONDecodeError):
             summary = {
-                "mode": "exercise_only" if args.exercise_only else "real_eslogger",
+                "mode": ("exercise_only" if args.exercise_only else "source_latency_diagnostic"
+                         if args.diagnose_source_latency else "real_eslogger"),
                 "tools": [{"tool": name, "version": None, "available": False,
-                           "cases": [], "failure_code": "not_started"} for name in TOOLS],
+                           "cases": [], "failure_code": "not_started"} for name in required_tools],
                 "cases": [],
                 "failure_codes": [],
             }
-        summary["result"] = "interrupted" if interrupted else "failed_no_fixture_fallback"
+        summary["result"] = ("interrupted" if interrupted else validation_result(True, False)
+                             if args.diagnose_source_latency else "failed_no_fixture_fallback")
         summary["failure_codes"] = sorted(set(
             summary.get("failure_codes", []) + [code]
         ))
         save_summary(report / "summary.json", summary)
-        print(json.dumps({"result": summary["result"], "tool_count": len(TOOLS),
+        print(json.dumps({"result": summary["result"], "tool_count": len(required_tools),
                           "case_count": len(summary.get("cases", [])),
                           "failure_codes": [code],
                           "summary": str(report / "summary.json")}, ensure_ascii=False))
