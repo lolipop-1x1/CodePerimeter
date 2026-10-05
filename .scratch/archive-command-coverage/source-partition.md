@@ -31,4 +31,6 @@
 
 Rust 1.88／locked 完整回归 124 项通过，另 1 项原有信号 helper 忽略、由监督用例调用；归档裁决器 45 项、MVP 裁决器 41 项、合成发送器 9 项通过。fmt、严格 all-target clippy、4 个脚本 AST、shell 与 diff 检查通过；最低支持版本 release／locked 构建通过。新增内容的真实 home 路径、个人标识与非示例邮箱扫描通过。组件与普通用户 IPC 用例未启动 ES，仍需新版 8 项诊断及完整 92 项真实链路裁决。
 
-定点审查在初版发现两项 P2：pending／socket 背压隐藏来源结束，以及迟到 activity 不能重新关联 exec。单一实现者完成红绿回归和补修；停止用例实际驱动转发循环、匿名 pipe／socket 与自有子进程，关联用例核对单条原 exec、准确根目录、来源时间与单 outbox。首次被过滤的 exec 仍计入该处理阶段的 filtered，后续补存只增加 persisted，不重复 observed；既有健康缺口不回删。两项补修独立复核及新版真实系统效果仍待确认。
+定点审查在初版发现两项 P2：pending／socket 背压隐藏来源结束，以及迟到 activity 不能重新关联 exec。单一实现者完成红绿回归和补修；停止用例实际驱动转发循环、匿名 pipe／socket 与自有子进程，关联用例核对单条原 exec、准确根目录、来源时间与单 outbox。首次被过滤的 exec 仍计入该处理阶段的 filtered，后续补存只增加 persisted，不重复 observed；既有健康缺口不回删。独立复核已关闭两项 P2：Standards 硬违反／heuristic 均 0，Spec 无可证新缺陷，6 项窄回归及原反例对照通过。新版真实系统效果仍待确认。
+
+当前普通工作区 release SHA256 为 `491e0793ab9a511fa846b47e3d5b944e06aa2cf11c24301d08850885381c15e0`；受保护副本尚未更新。持久验收入口会核验并准备新版副本，不安装后台任务；真实 8 项及时通过后仍须完整 92 项通过才 push。
