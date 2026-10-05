@@ -8,6 +8,12 @@ cd "$TASK_REPO"
 export PYTHONDONTWRITEBYTECODE=1
 trap 'printf "%s\n" "{\"result\":\"interrupted\",\"failure_code\":\"interrupted\"}" >&2; exit 130' INT
 
+if ! python3 -B -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 2)' 2>/dev/null; then
+    printf '%s\n' '此归档验收入口需要 Python 3.11 或更新版本。' >&2
+    printf '%s\n' '{"result":"failed","failure_code":"python_version_unsupported"}' >&2
+    exit 2
+fi
+
 if [ ! -x target/release/codeperimeter ]; then
     printf '%s\n' '{"result":"failed","failure_code":"binary_missing"}' >&2
     exit 2

@@ -44,6 +44,7 @@ def event(kind="exec", identity=None, archive=None, file=None):
     return {
         "source_run_id": SOURCE_RUN,
         "source_timestamp_ms": 1000,
+        "received_timestamp_ms": 1005,
         "global_seq": 10,
         "kind": kind,
         "process": identity or process(),
@@ -309,13 +310,38 @@ class ArchiveValidationSelfTest(unittest.TestCase):
                 mock.patch.object(VALIDATOR.threading, "Thread"), \
                 mock.patch.object(observer, "_verified_processes", return_value=[PID]), \
                 mock.patch.object(VALIDATOR.MVP, "process_info",
-                                  return_value=(0, PID - 1, PID - 1, "/usr/bin/eslogger")):
+                                  return_value=(0, PID - 1, os.getpgrp() + 1, "/usr/bin/eslogger")):
             observer.start()
         self.assertEqual(launch.call_args.args[0],
                          ["/usr/bin/sudo", "-n", "/usr/bin/eslogger", "exec"])
         self.assertEqual(launch.call_args.kwargs["stdin"], VALIDATOR.subprocess.DEVNULL)
         self.assertFalse(launch.call_args.kwargs.get("start_new_session", False))
+        self.assertEqual(launch.call_args.kwargs["process_group"], 0)
         self.assertTrue(observer.root_identity_verified)
+        self.assertTrue(observer.summary()["isolated_process_group"])
+
+    def test_sidecar_rejects_a_shared_process_group_or_missing_root_identity(self):
+        for info, expected in (
+            ((0, PID - 1, 9000, "/usr/bin/eslogger"), "sidecar_process_group_unverified"),
+            (None, "sidecar_root_unverified"),
+            ((501, PID - 1, 9001, "/usr/bin/eslogger"), "sidecar_root_unverified"),
+            ((0, PID - 1, 9001, "/usr/bin/other"), "sidecar_root_unverified"),
+        ):
+            observer = VALIDATOR.EsloggerSidecar()
+            target = mock.Mock(pid=PID)
+            target.poll.return_value = None
+            with mock.patch.object(VALIDATOR.subprocess, "Popen", return_value=target), \
+                    mock.patch.object(VALIDATOR.threading, "Thread"), \
+                    mock.patch.object(observer, "_verified_processes", return_value=[PID]), \
+                    mock.patch.object(VALIDATOR.MVP, "process_info", return_value=info), \
+                    mock.patch.object(VALIDATOR.os, "getpgrp", return_value=9000), \
+                    mock.patch.object(VALIDATOR.subprocess, "run") as control:
+                with self.assertRaisesRegex(RuntimeError, "^" + expected + "$"):
+                    observer.start()
+            control.assert_not_called()
+            self.assertFalse(observer.root_identity_verified)
+            self.assertFalse(observer.summary()["isolated_process_group"])
+            self.assertIn(expected, observer.failure_codes)
 
     @unittest.skipIf(os.geteuid() == 0, "无特权终端回归要求普通用户运行")
     def test_sidecar_session_inheritance_keeps_a_real_unprivileged_control_terminal(self):
@@ -323,17 +349,19 @@ class ArchiveValidationSelfTest(unittest.TestCase):
         if child == 0:
             try:
                 session = os.getsid(0)
+                group = os.getpgrp()
                 real_popen = VALIDATOR.subprocess.Popen
                 probe_code = (
                     "import json, os, sys, time; "
                     "tty = os.open('/dev/tty', os.O_RDONLY); os.close(tty); "
                     "print(json.dumps({'same_session': os.getsid(0) == int(sys.argv[1]), "
-                    "'control_terminal': True}), flush=True); time.sleep(0.1)"
+                    "'control_terminal': True, 'separate_group': os.getpgrp() == os.getpid() "
+                    "and os.getpgrp() != int(sys.argv[2])}), flush=True); time.sleep(0.1)"
                 )
 
                 def launch_probe(_command, **kwargs):
                     # 使用旁路的真实启动参数，仅将 sudo 换成无特权终端探针。
-                    return real_popen([sys.executable, "-B", "-c", probe_code, str(session)],
+                    return real_popen([sys.executable, "-B", "-c", probe_code, str(session), str(group)],
                                       **kwargs)
 
                 observer = VALIDATOR.EsloggerSidecar()
@@ -341,11 +369,12 @@ class ArchiveValidationSelfTest(unittest.TestCase):
                         mock.patch.object(VALIDATOR.threading, "Thread"), \
                         mock.patch.object(observer, "_verified_processes", return_value=[PID]), \
                         mock.patch.object(VALIDATOR.MVP, "process_info",
-                                          return_value=(0, PID - 1, PID - 1, "/usr/bin/eslogger")):
+                                          return_value=(0, PID - 1, group + 1, "/usr/bin/eslogger")):
                     observer.start()
                 state = json.loads(observer.process.stdout.read())
                 successful = (observer.process.wait(timeout=5) == 0
-                              and state == {"same_session": True, "control_terminal": True})
+                              and state == {"same_session": True, "control_terminal": True,
+                                            "separate_group": True})
                 observer.process.stdout.close()
                 observer.process.stderr.close()
             except Exception:
@@ -371,7 +400,189 @@ class ArchiveValidationSelfTest(unittest.TestCase):
         finally:
             os.close(terminal)
         self.assertEqual(os.waitstatus_to_exitcode(status), 0,
-                         "旁路启动必须继承 SID 与控制终端，stdin 仍为 DEVNULL")
+                         "旁路启动必须保留 SID／控制终端并隔离 PGID，stdin 仍为 DEVNULL")
+
+    def test_old_python_is_rejected_before_runner_authorization_or_direct_startup(self):
+        runner_path = SCRIPT_PATH.with_name("run-archive-validation.sh")
+        runner = runner_path.read_text()
+        self.assertIn("python_version_unsupported", runner)
+        self.assertLess(runner.index("python_version_unsupported"), runner.index("sudo -v"))
+        prefix = runner.split("printf '%s\\n' '请输入本机管理员密码", 1)[0]
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-version-selftest-",
+                                         dir="/private/tmp") as temporary:
+            fake_python = Path(temporary) / "python3"
+            fake_python.write_text("#!/bin/sh\nexit 2\n")
+            fake_python.chmod(0o700)
+            environment = dict(os.environ, PATH=temporary + ":/usr/bin:/bin")
+            execution = VALIDATOR.subprocess.run(
+                ["/bin/sh", "-c", prefix, str(runner_path)], env=environment,
+                stdin=VALIDATOR.subprocess.DEVNULL, stdout=VALIDATOR.subprocess.PIPE,
+                stderr=VALIDATOR.subprocess.PIPE, check=False, timeout=5,
+            )
+        self.assertEqual(execution.returncode, 2)
+        self.assertIn(b"python_version_unsupported", execution.stderr)
+        self.assertNotIn("管理员密码", execution.stdout.decode())
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "version_info", (3, 10, 0)), \
+                contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as rejected:
+            exec(compile(SCRIPT_PATH.read_text(), "synthetic-validator", "exec"),
+                 {"__name__": "synthetic_validator", "__file__": str(SCRIPT_PATH)})
+        self.assertEqual(rejected.exception.code, 2)
+        self.assertEqual(json.loads(stderr.getvalue())["failure_code"],
+                         "python_version_unsupported")
+
+    def test_descendant_scans_are_limited_but_keep_short_process_identity_and_end_scan(self):
+        for lifetime in (0.008, 0.2):
+            clock = [0.0]
+            scans = []
+            target = mock.Mock(pid=PID, stdout=None, stdin=None, returncode=0)
+            target.poll.side_effect = lambda: None if clock[0] < lifetime else 0
+
+            def scan(pid):
+                scans.append(clock[0])
+                return {PID + 1}
+
+            def advance(seconds):
+                clock[0] += seconds
+
+            with mock.patch.object(VALIDATOR.subprocess, "Popen", return_value=target), \
+                    mock.patch.object(VALIDATOR, "descendants", side_effect=scan), \
+                    mock.patch.object(VALIDATOR.time, "monotonic", side_effect=lambda: clock[0]), \
+                    mock.patch.object(VALIDATOR.time, "monotonic_ns",
+                                      side_effect=lambda: int(clock[0] * 1_000_000_000)), \
+                    mock.patch.object(VALIDATOR.time, "sleep", side_effect=advance):
+                result = VALIDATOR.execute(Path("/usr/bin/synthetic"), [], PROJECT)
+            self.assertEqual(result["pids"], {PID, PID + 1})
+            self.assertEqual(scans[0], 0)
+            self.assertGreaterEqual(scans[-1], lifetime)
+            self.assertLessEqual(len(scans), 2 if lifetime < 0.05 else 6)
+            self.assertTrue(all(right - left >= 0.05 - 0.000001
+                                for left, right in zip(scans[:-2], scans[1:-1])))
+            self.assertLess(result["duration_ms"], lifetime * 1000 + 5)
+            self.assertIsNone(result["failure_code"])
+
+    def test_wrapper_negative_keeps_exact_exec_identity_and_parent_association(self):
+        case, execution, evidence, barrier = unrelated_fixture()
+        launcher = PID - 1
+        record = {"seq_num": 1, "global_seq_num": 1, "event": {"exec": {"target": {
+            "audit_token": {"pid": PID, "pidversion": PID_VERSION}, "ppid": launcher,
+            "executable": {"path": "/usr/bin/zip", "path_truncated": False},
+        }}}}
+        for parent, passed in ((launcher, True), (launcher - 99, False)):
+            observer = VALIDATOR.EsloggerSidecar()
+            observer.process = mock.Mock()
+            observer.process.poll.return_value = None
+            observer.begin_case("zip")
+            observer.register_pids({launcher})
+            actual = copy.deepcopy(record)
+            actual["event"]["exec"]["target"]["ppid"] = parent
+            observer._record_exec(actual)
+            observation = observer.finish_case({launcher}, timeout=0)
+            execution.update(pids={launcher}, sidecar=observation,
+                             sidecar_execs=observation["execs"])
+            result = VALIDATOR.analyze_negative(
+                case, execution, evidence, SOURCE_RUN, barrier, True
+            )
+            self.assertEqual(result["passed"], passed)
+            if passed:
+                self.assertEqual(observation["execs"][0]["target_pid_version"], PID_VERSION)
+                self.assertEqual(observation["execs"][0]["related_pid_chain"], [PID, launcher])
+                with_alert = dict(evidence, alerts=[command_alert()])
+                self.assertEqual(VALIDATOR.analyze_negative(
+                    case, execution, with_alert, SOURCE_RUN, barrier, True
+                )["failure_code"], "unrelated_project_alert")
+            else:
+                self.assertEqual(result["failure_code"], "unrelated_exec_missing")
+
+    def test_descendant_scan_limit_does_not_disable_owned_process_timeout_cleanup(self):
+        result = VALIDATOR.execute(Path("/bin/sleep"), ["1"], Path("/private/tmp"), timeout=0.04)
+        self.assertEqual(result["failure_code"], "case_timeout")
+        self.assertNotEqual(result["return_code"], 0)
+        self.assertLess(result["duration_ms"], 1000)
+        for pid in result["pids"]:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_sidecar_sequence_diagnostics_are_bounded_numeric_and_preserve_regression_failures(self):
+        observer = VALIDATOR.EsloggerSidecar()
+        observer._record_exec({"seq_num": 10, "global_seq_num": 100})
+        for index in range(1, 11):
+            observer._record_exec({"seq_num": 10 + index * 4,
+                                   "global_seq_num": 100 + index * 10})
+        summary = observer.summary()
+        self.assertEqual(summary["sequence_gap_count"], 10)
+        self.assertEqual(summary["sequence_missing_total"], 30)
+        self.assertEqual(len(summary["sequence_gaps"]), 8)
+        self.assertEqual(summary["sequence_gaps"][0], {
+            "previous_event_seq": 10, "next_event_seq": 14,
+            "previous_global_seq": 100, "next_global_seq": 110, "missing_events": 3,
+        })
+        self.assertTrue(all(type(value) is int for row in summary["sequence_gaps"]
+                            for value in row.values()))
+        observer._record_exec({"seq_num": 50, "global_seq_num": 201})
+        observer._record_exec({"seq_num": 49, "global_seq_num": 202})
+        observer._record_exec({"seq_num": True, "global_seq_num": 203})
+        summary = observer.summary()
+        self.assertEqual(summary["sequence_gap_count"], 10)
+        self.assertEqual(summary["sequence_missing_total"], 30)
+        self.assertEqual(summary["sequence_regression_count"], 2)
+        self.assertIn("sidecar_sequence_regression", summary["failure_codes"])
+        self.assertIn("sidecar_sequence_missing", summary["failure_codes"])
+
+    def test_pipeline_timing_summary_keeps_only_known_numeric_fields(self):
+        marker = "SYNTHETIC_PRIVATE_METRIC_MARKER"
+        status = {"pipeline_timing": {
+            "host_frames": True, "host_processing_total_us": 10,
+            "host_processing_max_us": marker, "source_to_collector_receive_max_ms": 4234,
+            "argv": marker, "collector": {
+                "sampled_timestamp_ms": 1000, "source_lines": 12,
+                "source_bytes": 999, "source_send_total_us": 15, "source_send_max_us": False,
+                "bridge_line_write_attempts": 12, "bridge_write_total_us": 20,
+                "bridge_write_max_us": 7, "pid": PID, "path": marker, "unknown": marker,
+            },
+        }}
+        result = VALIDATOR.numeric_pipeline_timing(status)
+        self.assertIsNone(result["host_frames"])
+        self.assertEqual(result["host_processing_total_us"], 10)
+        self.assertIsNone(result["host_processing_max_us"])
+        self.assertEqual(result["source_to_collector_receive_max_ms"], 4234)
+        self.assertEqual(result["collector"]["source_lines"], 12)
+        self.assertIsNone(result["collector"]["source_send_max_us"])
+        self.assertNotIn("pid", result["collector"])
+        self.assertNotIn(marker, json.dumps(result))
+        self.assertIsNone(VALIDATOR.numeric_pipeline_timing({}))
+        self.assertIsNone(VALIDATOR.numeric_pipeline_timing({"pipeline_timing": marker}))
+        status.update(database_state="ready", collector_state="connected", reader_dropped_frames=1)
+        self.assertEqual(VALIDATOR.healthy_status(status, {"health": []})[:2],
+                         (False, "collector_dropped_events"))
+
+    def test_positive_latency_breakdown_preserves_the_source_based_three_second_gate(self):
+        case, evidence = positive_fixture()
+        execution = {"pids": {PID}, "return_code": 0, "duration_ms": 10}
+        result = VALIDATOR.analyze_positive(case, execution, evidence, SOURCE_RUN)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["source_to_receive_ms"], 5)
+        self.assertEqual(result["receive_to_outbox_ms"], 5)
+        self.assertEqual(result["outbox_to_sent_ms"], 10)
+        summary = VALIDATOR.case_summary(case, execution, result, "synthetic-version")
+        self.assertEqual(summary["source_to_receive_ms"], 5)
+        delayed = copy.deepcopy(evidence)
+        delayed["events"][0]["received_timestamp_ms"] = 5000
+        delayed["outbox"][ALERT_ID] = 5001
+        delayed["notifications"][0]["observed_timestamp_ms"] = 5200
+        result = VALIDATOR.analyze_positive(case, execution, delayed, SOURCE_RUN)
+        self.assertEqual(result["source_to_receive_ms"], 4000)
+        self.assertEqual(result["receive_to_outbox_ms"], 1)
+        self.assertEqual(result["outbox_to_sent_ms"], 199)
+        self.assertEqual(result["failure_code"], "generation_latency_over_3000ms")
+        for received in (None, True, "SYNTHETIC_PRIVATE_METRIC_MARKER"):
+            no_received = copy.deepcopy(evidence)
+            no_received["events"][0]["received_timestamp_ms"] = received
+            result = VALIDATOR.analyze_positive(case, execution, no_received, SOURCE_RUN)
+            self.assertTrue(result["passed"])
+            self.assertIsNone(result["source_to_receive_ms"])
+            self.assertIsNone(result["receive_to_outbox_ms"])
+            self.assertEqual(result["outbox_to_sent_ms"], 10)
 
     def test_sidecar_stderr_classifies_split_sudo_and_es_errors_without_raw_data(self):
         private_marker = b"SYNTHETIC_PRIVATE_PATH_MARKER"

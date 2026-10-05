@@ -21,6 +21,12 @@ import time
 import uuid
 
 
+if sys.version_info < (3, 11):
+    print(json.dumps({"result": "failed", "failure_code": "python_version_unsupported"}),
+          file=sys.stderr)
+    raise SystemExit(2)
+
+
 REPO = Path(__file__).resolve().parent.parent
 VALIDATE_MVP_PATH = REPO / "scripts" / "validate-mvp.py"
 TOOLS = (
@@ -55,6 +61,7 @@ ARCHIVE_STATIC_COVERAGE_CODES = {
 PAYLOAD_BYTES = 1024 * 1024
 REAL_CASE_TIMEOUT_SECONDS = 8
 TOOL_TIMEOUT_SECONDS = 60
+DESCENDANT_SCAN_INTERVAL_SECONDS = 0.05
 FAILURE_CODES = {
     "tool_missing", "version_probe_failed", "version_unavailable", "tool_start_failed",
     "tool_exit_nonzero", "output_missing", "stdout_empty", "exec_missing",
@@ -77,8 +84,10 @@ FAILURE_CODES = {
     "sidecar_sequence_gap", "sidecar_sequence_regression", "sidecar_unexpected_event",
     "sidecar_not_root", "sidecar_root_unverified", "sidecar_es_client_denied",
     "sidecar_sudo_authorization_required",
+    "sidecar_process_group_unverified",
     "sidecar_cleanup_incomplete", "reverse_output_empty", "reverse_extract_output_missing",
     "stdin_write_failed", "stdin_source_gap_missing", "sidecar_exit_nonzero", "interrupted",
+    "python_version_unsupported",
 }
 
 
@@ -289,7 +298,12 @@ class EsloggerSidecar:
         self.record_count = 0
         self.global_seq = None
         self.event_seq = None
+        self.sequence_gap_count = 0
+        self.sequence_missing_total = 0
+        self.sequence_regression_count = 0
+        self.sequence_gaps = []
         self.root_identity_verified = False
+        self.isolated_process_group = False
         self.diagnostic_codes = set()
         self.stderr_complete = False
         self.stopping = False
@@ -335,10 +349,11 @@ class EsloggerSidecar:
 
     def start(self, timeout=8):
         try:
-            # 继承授权终端的 sudo 会话；清理只控制本轮核验后的精确 PID。
+            # 保留 sudo 的授权 SID／TTY，隔离 PGID 以避免压制调用方事件。
             self.process = subprocess.Popen(
                 ["/usr/bin/sudo", "-n", "/usr/bin/eslogger", "exec"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                process_group=0,
             )
         except OSError as error:
             raise RuntimeError("sidecar_stream_failed") from error
@@ -352,8 +367,16 @@ class EsloggerSidecar:
                 break
             matches = self._verified_processes()
             if len(matches) == 1:
+                info = MVP.process_info(matches[0])
+                if not info or info[0] != 0 or Path(info[3]) != Path("/usr/bin/eslogger"):
+                    self.failure_codes.add("sidecar_root_unverified")
+                    raise RuntimeError("sidecar_root_unverified")
+                if type(info[2]) is not int or info[2] <= 0 or info[2] == os.getpgrp():
+                    self.failure_codes.add("sidecar_process_group_unverified")
+                    raise RuntimeError("sidecar_process_group_unverified")
                 self.eslogger_pid = matches[0]
-                self.eslogger_pgid = MVP.process_info(matches[0])[2]
+                self.eslogger_pgid = info[2]
+                self.isolated_process_group = True
                 self.root_identity_verified = True
                 return
             if len(matches) > 1:
@@ -392,19 +415,27 @@ class EsloggerSidecar:
             except AttributeError:
                 self.failure_codes.add("sidecar_stream_malformed")
                 return
-            if not isinstance(seq, int) or seq < 0:
+            if type(seq) is not int or seq < 0:
                 self.failure_codes.add("sidecar_sequence_missing")
                 return
-            if not isinstance(global_seq, int) or global_seq < 0:
+            if type(global_seq) is not int or global_seq < 0:
                 self.failure_codes.add("sidecar_sequence_missing")
                 return
-            if self.event_seq is not None:
-                if seq == self.event_seq:
-                    self.failure_codes.add("sidecar_sequence_regression")
-                elif seq != self.event_seq + 1:
-                    self.failure_codes.add("sidecar_sequence_gap")
-            if self.global_seq is not None and global_seq <= self.global_seq:
+            if ((self.event_seq is not None and seq <= self.event_seq)
+                    or (self.global_seq is not None and global_seq <= self.global_seq)):
                 self.failure_codes.add("sidecar_sequence_regression")
+                self.sequence_regression_count += 1
+            if self.event_seq is not None and seq > self.event_seq + 1:
+                self.failure_codes.add("sidecar_sequence_gap")
+                missing = seq - self.event_seq - 1
+                self.sequence_gap_count += 1
+                self.sequence_missing_total += missing
+                if len(self.sequence_gaps) < 8:
+                    self.sequence_gaps.append({
+                        "previous_event_seq": self.event_seq, "next_event_seq": seq,
+                        "previous_global_seq": self.global_seq, "next_global_seq": global_seq,
+                        "missing_events": missing,
+                    })
             self.event_seq = seq
             self.global_seq = global_seq
             if self.active is None:
@@ -648,10 +679,15 @@ class EsloggerSidecar:
 
     def summary(self):
         return {"root_identity_verified": self.root_identity_verified,
+                "isolated_process_group": self.isolated_process_group,
                 "record_count": self.record_count,
                 "exit_code": self.process.poll() if self.process else None,
                 "diagnostic_codes": sorted(self.diagnostic_codes),
                 "stderr_complete": self.stderr_complete,
+                "sequence_gap_count": self.sequence_gap_count,
+                "sequence_missing_total": self.sequence_missing_total,
+                "sequence_regression_count": self.sequence_regression_count,
+                "sequence_gaps": list(self.sequence_gaps),
                 "sequence_gap_or_regression": any(code in self.failure_codes for code in (
                     "sidecar_sequence_gap", "sidecar_sequence_regression")),
                 "failure_codes": sorted(self.failure_codes)}
@@ -700,10 +736,16 @@ def execute(binary, argv, cwd, timeout=TOOL_TIMEOUT_SECONDS, capture_stdout=Fals
         stdin_writer.start()
     try:
         deadline = time.monotonic() + timeout
+        pids.update(descendants(process.pid))
+        if observer:
+            observer.register_pids(pids)
+        next_scan = time.monotonic() + DESCENDANT_SCAN_INTERVAL_SECONDS
         while process.poll() is None and time.monotonic() < deadline:
-            pids.update(descendants(process.pid))
-            if observer:
-                observer.register_pids(pids)
+            if time.monotonic() >= next_scan:
+                pids.update(descendants(process.pid))
+                if observer:
+                    observer.register_pids(pids)
+                next_scan = time.monotonic() + DESCENDANT_SCAN_INTERVAL_SECONDS
             time.sleep(0.002)
         failure = "case_timeout" if process.poll() is None else None
     finally:
@@ -1009,7 +1051,9 @@ def analyze_positive(case, execution, evidence, source_run_id):
     result = {"passed": False, "failure_code": None, "evidence_event_count": 0,
               "archive_exec_count": 0, "archive_command_alert_count": 0,
               "notification_feedback_count": 0, "generation_latency_ms": None,
-              "notification_latency_ms": None, "actual_executable": None}
+              "notification_latency_ms": None, "actual_executable": None,
+              "source_to_receive_ms": None, "receive_to_outbox_ms": None,
+              "outbox_to_sent_ms": None}
     matched, names = matching_archive_exec(case, evidence, source_run_id, execution["pids"])
     result["actual_executable"] = sorted(names)[0] if names else None
     result["archive_exec_count"] = len(matched)
@@ -1066,6 +1110,11 @@ def analyze_positive(case, execution, evidence, source_run_id):
     notification_latency = notified - trigger
     result["generation_latency_ms"] = generation_latency
     result["notification_latency_ms"] = notification_latency
+    received = event.get("received_timestamp_ms")
+    if type(received) is int:
+        result["source_to_receive_ms"] = received - trigger
+        result["receive_to_outbox_ms"] = generated - received
+    result["outbox_to_sent_ms"] = notified - generated
     if generation_latency < 0:
         result["failure_code"] = "generation_latency_negative"
     elif notification_latency < 0:
@@ -1223,6 +1272,25 @@ def healthy_status(status, evidence):
     return True, None, static_coverage
 
 
+def numeric_pipeline_timing(status):
+    timing = status.get("pipeline_timing")
+    if not isinstance(timing, dict):
+        return None
+    result = {name: timing.get(name) if type(timing.get(name)) is int else None for name in (
+        "host_frames", "host_processing_total_us", "host_processing_max_us",
+        "source_to_collector_receive_max_ms",
+    )}
+    collector = timing.get("collector")
+    result["collector"] = {
+        name: collector.get(name) if type(collector.get(name)) is int else None for name in (
+            "sampled_timestamp_ms", "source_lines", "source_bytes", "source_send_total_us",
+            "source_send_max_us", "bridge_line_write_attempts", "bridge_write_total_us",
+            "bridge_write_max_us",
+        )
+    } if isinstance(collector, dict) else None
+    return result
+
+
 def fence_worker(path):
     try:
         with Path(path).open("rb") as stream:
@@ -1328,6 +1396,9 @@ def case_summary(case, execution, result, version):
         "notification_feedback_count": result.get("notification_feedback_count", 0),
         "generation_latency_ms": result.get("generation_latency_ms"),
         "notification_latency_ms": result.get("notification_latency_ms"),
+        "source_to_receive_ms": result.get("source_to_receive_ms"),
+        "receive_to_outbox_ms": result.get("receive_to_outbox_ms"),
+        "outbox_to_sent_ms": result.get("outbox_to_sent_ms"),
         "actual_executable": result.get("actual_executable"),
         "barrier_crossed": result.get("barrier_crossed", False),
         "passed": bool(result.get("passed")) and failure is None,
@@ -1561,6 +1632,7 @@ def real_validation(args, report, tools, version_rows):
         serialized_evidence = json.dumps(final_evidence, ensure_ascii=False, sort_keys=True)
         privacy_ok = CONTENT_SENTINEL.decode("ascii") not in serialized_evidence and PASSWORD_SENTINEL not in serialized_evidence
         summary["collector_health"] = {
+            "pipeline_timing": numeric_pipeline_timing(final_status),
             "database_state": final_status.get("database_state"),
             "collector_state": final_status.get("collector_state"),
             "collector_dropped_lines": final_status.get("collector_dropped_lines"),

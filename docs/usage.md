@@ -25,7 +25,7 @@ python3 -B scripts/validate-archive-commands.py --exercise-only
 
 无采集演练会对合成文件实际调用本机可用的 tar、bsdtar、gtar、zip、ditto、gzip、pigz、bzip2、pbzip2、xz、zstd、7z、7zz 和 rar，并覆盖创建／更新、支持的标准输出、纯标准输入、列表／测试／解包／解压与无关目录场景。纯标准输入仅用于支持该模式的 10 个工具，不给 tar／ditto 伪造支持。演练只核对工具自身的执行结果，不能证明 CodePerimeter 收到了系统事件或生成提醒；版本探针缺失、失败或工具操作失败都会返回失败。缺失工具默认从 ~/Library/Application Support/CodePerimeter/validation-tools/bin 与 PATH 查找；RAR 可通过 --rar-binary PATH 显式指定项目外的试用二进制。
 
-完整验收需要 macOS 系统采集授权与 sudo 授权。在仓库根目录运行：
+完整验收需要 Python 3.11 或以上、macOS 系统采集授权与 sudo 授权。Python 版本要求仅用于验收脚本，监控程序仍是 Rust 二进制；入口会在管理员授权前检查版本。在仓库根目录运行：
 
 ~~~sh
 sh scripts/run-archive-validation.sh
@@ -34,6 +34,8 @@ sh scripts/run-archive-validation.sh
 脚本只为本次验收准备受保护的 collector 副本，不安装或启动 launchd 服务。准备失败和取消使用固定分类，不回显原始异常或命令。root 仅运行 collector 与短暂的系统事件旁路；归档工具、daemon、SQLite 和通知代理以当前普通用户身份运行。负例的旁路只在内存中保留与本次合成进程关联的 exec 身份，用来确认反向、无关目录及纯标准输入操作确实执行；观察器意外结束也会使验收失败。纯标准输入在保护目录内启动，要求主 SQLite 的来源未知缺口匹配实际 PID／代次且早于独立读取屏障，已有其他场景的缺口不能替代。项目事件、告警、读取屏障与采集健康仍由主 SQLite 证据核对。每个工具与模式会输出一行脱敏进度，结束时给出项目外 summary.json 路径。汇总中记录工具版本、返回码、证据计数、延迟和静态失败代码，不保存命令参数、原始系统事件或真实 executable 路径。
 
 可用 --report-dir PATH 指定项目目录外的空目录保存本机证据；脚本会拒绝项目内路径并限制目录权限。验收失败也会保留合成目录、SQLite 和匿名摘要以便回查。组件自检或无采集工具演练通过，均不替代完整系统采集验收。
+
+独立采集旁路保留授权终端的会话和控制终端，并使用独立进程组，避免 eslogger 抑制测试程序的同组活动。序号缺口仍使验收失败；摘要只增加有界的数值序号诊断、现有链路耗时指标及告警延迟拆分，不保存原始事件。子进程扫描限制频率以减少测试脚本自身负载；3 秒门槛仍从系统事件发生时计算，不扣除采集延迟。
 
 ## 选择保护目录
 
