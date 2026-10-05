@@ -2,7 +2,7 @@
 
 use crate::Result;
 use crate::eslogger::{MAX_LINE_BYTES, SUBSCRIBED_EVENTS};
-use crate::model::now_ms;
+use crate::model::{SourceStream, now_ms};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
@@ -45,6 +45,8 @@ pub struct CollectorTiming {
 pub enum CollectorFrame {
     Line {
         run_id: String,
+        #[serde(default)]
+        source_stream: SourceStream,
         line: String,
         received_timestamp_ms: i64,
     },
@@ -588,9 +590,50 @@ impl Drop for CollectorSignals {
 
 struct CollectorSource {
     child: Child,
+    receiver: Option<mpsc::Receiver<SourceItem>>,
+    stdout_reader: Option<thread::JoinHandle<()>>,
+    stderr_reader: Option<thread::JoinHandle<()>>,
 }
 
 impl CollectorSource {
+    fn start(
+        events: &[&str],
+        drops: Arc<AtomicU64>,
+        timing: Arc<SourceTiming>,
+    ) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let mut source = Self {
+            child: Command::new("/usr/bin/eslogger")
+                .args(events)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null())
+                .spawn()?,
+            receiver: Some(receiver),
+            stdout_reader: None,
+            stderr_reader: None,
+        };
+        source.stdout_reader = Some(produce_stdout(
+            source
+                .child
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("采集 stdout 未建立"))?,
+            sender.clone(),
+            drops,
+            timing,
+        ));
+        source.stderr_reader = Some(produce_stderr(
+            source
+                .child
+                .stderr
+                .take()
+                .ok_or_else(|| io::Error::other("采集 stderr 未建立"))?,
+            sender,
+        ));
+        Ok(source)
+    }
+
     fn stop(&mut self) -> io::Result<ExitStatus> {
         if self.child.try_wait()?.is_none() {
             let _ = self.child.kill();
@@ -603,7 +646,34 @@ impl Drop for CollectorSource {
     fn drop(&mut self) {
         // 正常停止和每一条 early Err 都只回收本次启动的来源，不按名称杀进程。
         let _ = self.stop();
+        // 先释放有界接收端，解除读取线程可能正在等待的 send。
+        self.receiver.take();
+        for reader in [self.stdout_reader.take(), self.stderr_reader.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = reader.join();
+        }
     }
+}
+
+fn next_source_item(
+    receivers: [&mpsc::Receiver<SourceItem>; 2],
+    next: &mut usize,
+) -> Option<(usize, SourceItem)> {
+    // 两路均有数据时轮流处理；空路不会让另一条高频来源等待超时。
+    for offset in 0..2 {
+        let index = (*next + offset) % 2;
+        match receivers[index].try_recv() {
+            Ok(item) => {
+                *next = (index + 1) % 2;
+                return Some((index, item));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => return Some((index, SourceItem::End)),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    None
 }
 
 pub fn run_collector(options: CollectorOptions) -> Result<()> {
@@ -611,37 +681,24 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
     let _signals = CollectorSignals::install()?;
     let listener = bind_collector(&options.socket_path, options.allowed_uid)?;
     let run_id = format!("eslogger-{}-{}", std::process::id(), now_ms());
-    let mut source = CollectorSource {
-        child: Command::new("/usr/bin/eslogger")
-            .args(SUBSCRIBED_EVENTS)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .spawn()?,
-    };
-    let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
     let drops = Arc::new(AtomicU64::new(0));
     let source_timing = Arc::new(SourceTiming::default());
     let mut timing = CollectorTiming::default();
-    let stdout_reader = produce_stdout(
-        source
-            .child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("采集 stdout 未建立"))?,
-        sender.clone(),
-        Arc::clone(&drops),
-        Arc::clone(&source_timing),
-    );
-    let stderr_reader = produce_stderr(
-        source
-            .child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("采集 stderr 未建立"))?,
-        sender.clone(),
-    );
-    drop(sender);
+    let activity_events: Vec<_> = SUBSCRIBED_EVENTS
+        .iter()
+        .copied()
+        .filter(|event| *event != "exec")
+        .collect();
+    let mut sources = Vec::new();
+    for events in [&["exec"][..], activity_events.as_slice()] {
+        sources.push(CollectorSource::start(
+            events,
+            Arc::clone(&drops),
+            Arc::clone(&source_timing),
+        )?);
+    }
+    let streams = [SourceStream::Exec, SourceStream::Activity];
+    let mut next_source = 0;
     let mut client = None;
     let mut last_heartbeat = Instant::now();
     let mut last_diagnostic = None;
@@ -667,16 +724,25 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
         if pending.is_none() {
-            match receiver.recv_timeout(Duration::from_millis(20)) {
-                Ok(item) => pending = Some(item),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            pending = next_source_item(
+                [
+                    sources[0].receiver.as_ref().expect("来源接收端已建立"),
+                    sources[1].receiver.as_ref().expect("来源接收端已建立"),
+                ],
+                &mut next_source,
+            )
+            .map(|(index, item)| (streams[index], item));
+            if pending.is_none() {
+                thread::sleep(Duration::from_millis(2));
             }
         }
         match pending.as_ref() {
-            Some(SourceItem::Line(line, received_timestamp_ms)) if client.is_some() => {
+            Some((source_stream, SourceItem::Line(line, received_timestamp_ms)))
+                if client.is_some() =>
+            {
                 let frame = CollectorFrame::Line {
                     run_id: run_id.clone(),
+                    source_stream: *source_stream,
                     line: line.clone(),
                     received_timestamp_ms: *received_timestamp_ms,
                 };
@@ -692,7 +758,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
                     pending = None;
                 }
             }
-            Some(SourceItem::Status(state, message)) => {
+            Some((_, SourceItem::Status(state, message))) => {
                 last_diagnostic = Some((*state, *message));
                 if deliver(
                     &mut client,
@@ -706,8 +772,8 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
                     pending = None;
                 }
             }
-            Some(SourceItem::End) => break,
-            Some(SourceItem::Line(_, _)) | None => {}
+            Some((_, SourceItem::End)) => break,
+            Some((_, SourceItem::Line(_, _))) | None => {}
         }
         // 没有消费者时只保留一个待发送项，队列与管道持续有界，不消费后丢弃。
         if pending.is_some() && client.is_none() {
@@ -737,15 +803,18 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
             last_heartbeat = Instant::now();
         }
     }
-    let status = source.stop()?;
+    // 任一路结束即整体结束；不把剩余一路伪装成完整监控。
+    let mut exit_code = None;
+    for source in &mut sources {
+        let status = source.stop()?;
+        exit_code = exit_code.or(status.code());
+    }
     let stopped = CollectorFrame::Status {
         run_id: run_id.clone(),
         state: "stopped".into(),
         message: format!(
             "eslogger 已退出，exit_code={}",
-            status
-                .code()
-                .map_or_else(|| "signal".into(), |code| code.to_string())
+            exit_code.map_or_else(|| "signal".into(), |code| code.to_string())
         ),
         dropped_lines: drops.load(Ordering::Relaxed),
     };
@@ -753,7 +822,13 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
     // 退出前保留短暂状态窗口，让启动顺序较后的普通用户宿主看到 FDA／源故障。
     let diagnostic_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < diagnostic_deadline && !COLLECTOR_STOP.load(Ordering::Relaxed) {
-        for item in receiver.try_iter() {
+        for item in sources.iter().flat_map(|source| {
+            source
+                .receiver
+                .as_ref()
+                .expect("来源接收端已建立")
+                .try_iter()
+        }) {
             if let SourceItem::Status(state, message) = item {
                 last_diagnostic = Some((state, message));
                 deliver(
@@ -788,9 +863,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
         thread::sleep(Duration::from_millis(20));
     }
     // 先终止自有来源，再关闭接收端，释放满队列中的生产线程后回收。
-    drop(receiver);
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    drop(sources);
     let _ = fs::remove_file(&options.socket_path);
     if COLLECTOR_STOP.load(Ordering::Relaxed) {
         Ok(())
@@ -1347,6 +1420,9 @@ mod tests {
         let _signals = CollectorSignals::install().unwrap();
         let mut source = CollectorSource {
             child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
+            receiver: None,
+            stdout_reader: None,
+            stderr_reader: None,
         };
         println!(
             "COLLECTOR_READY {} {} {}",
@@ -1378,6 +1454,9 @@ mod tests {
                     .stdout(Stdio::piped())
                     .spawn()
                     .unwrap(),
+                receiver: None,
+                stdout_reader: None,
+                stderr_reader: None,
             };
             let stdout = worker.child.stdout.take().unwrap();
             let (sender, receiver) = mpsc::channel();
@@ -1424,6 +1503,9 @@ mod tests {
         let result = (|| -> io::Result<()> {
             let source = CollectorSource {
                 child: Command::new("/bin/sleep").arg("30").spawn()?,
+                receiver: None,
+                stdout_reader: None,
+                stderr_reader: None,
             };
             pid = source.child.id() as libc::pid_t;
             Err(io::Error::other("合成 early Err"))
@@ -1431,6 +1513,76 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn two_source_queues_are_fair_and_do_not_wait_on_the_empty_lane() {
+        let (first_sender, first_receiver) = mpsc::sync_channel(4);
+        let (second_sender, second_receiver) = mpsc::sync_channel(4);
+        for text in ["first-1", "first-2", "first-3"] {
+            first_sender.send(SourceItem::Line(text.into(), 1)).unwrap();
+        }
+        second_sender
+            .send(SourceItem::Line("second-1".into(), 1))
+            .unwrap();
+        let mut next = 0;
+        for (expected_index, expected_text) in [
+            (0, "first-1"),
+            (1, "second-1"),
+            (0, "first-2"),
+            (0, "first-3"),
+        ] {
+            let (index, item) =
+                next_source_item([&first_receiver, &second_receiver], &mut next).unwrap();
+            let SourceItem::Line(text, _) = item else {
+                panic!("两路应保序转发完整行")
+            };
+            assert_eq!((index, text.as_str()), (expected_index, expected_text));
+        }
+        assert!(next_source_item([&first_receiver, &second_receiver], &mut next).is_none());
+        drop(second_sender);
+        assert!(matches!(
+            next_source_item([&first_receiver, &second_receiver], &mut next),
+            Some((1, SourceItem::End))
+        ));
+    }
+
+    #[test]
+    fn two_sources_drop_reaps_only_owned_children_and_releases_full_queues() {
+        let mut unrelated = CollectorSource {
+            child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
+            receiver: None,
+            stdout_reader: None,
+            stderr_reader: None,
+        };
+        let mut pids = Vec::new();
+        let mut sources = Vec::new();
+        for _ in 0..2 {
+            let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+            pids.push(child.id() as libc::pid_t);
+            let (sender, receiver) = mpsc::sync_channel(1);
+            sources.push(CollectorSource {
+                child,
+                receiver: Some(receiver),
+                stdout_reader: Some(produce_stdout(
+                    Cursor::new(b"anonymous\n".repeat(128)),
+                    sender.clone(),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(SourceTiming::default()),
+                )),
+                stderr_reader: Some(produce_stderr(
+                    Cursor::new(b"anonymous diagnostic\n".repeat(128)),
+                    sender,
+                )),
+            });
+        }
+        drop(sources);
+        for pid in pids {
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
+        assert!(unrelated.child.try_wait().unwrap().is_none());
+        unrelated.stop().unwrap();
     }
 
     #[test]
@@ -1666,6 +1818,7 @@ mod tests {
             (writer, reader)
         };
         let frame = CollectorFrame::Line {
+            source_stream: SourceStream::Combined,
             run_id: "anonymous-run".into(),
             line: "x".repeat(512 * 1024),
             received_timestamp_ms: 100,

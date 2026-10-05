@@ -1,8 +1,8 @@
 //! 普通用户宿主：独占 SQLite、分析受保护目录活动，并通过本地 IPC 服务 CLI 与通知进程。
 
 use crate::Result;
-use crate::eslogger::EsloggerAdapter;
-use crate::model::{ActivityEvent, Alert, EventKind, now_ms};
+use crate::eslogger::{AdapterHealth, EsloggerAdapter};
+use crate::model::{ActivityEvent, Alert, EventKind, SourceStream, now_ms};
 use crate::rules::{RuleConfig, RuleEngine};
 use crate::service::{
     CollectorClient, CollectorFrame, CollectorTiming, read_bounded_line, verify_peer_uid,
@@ -31,6 +31,7 @@ const CONTROL_LINE_LIMIT: usize = 256 * 1024;
 const CONTROL_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const COLLECTOR_QUEUE_CAPACITY: usize = 64;
 const DEDUP_CAPACITY: usize = 8_192;
+const EXEC_RECEIPT_CAPACITY: usize = 256;
 const MEMORY_ALERT_CAPACITY: usize = 256;
 const MAX_QUERY_LIMIT: usize = 100;
 const MAX_NOTIFY_BURST: usize = 8;
@@ -73,6 +74,11 @@ pub struct DirectoryImport {
 #[serde(tag = "operation", content = "payload", rename_all = "snake_case")]
 pub enum ControlRequest {
     Status,
+    ExecReceipt {
+        run_id: String,
+        pid: u32,
+        pid_version: u32,
+    },
     AddDirectories {
         entries: Vec<DirectoryImport>,
     },
@@ -142,6 +148,8 @@ pub struct RuntimeStatus {
     pub collector_run_id: Option<String>,
     pub collector_schema_version: Option<u64>,
     pub collector_message_version: Option<u64>,
+    #[serde(default)]
+    pub collector_streams: BTreeMap<SourceStream, AdapterHealth>,
     pub collector_dropped_lines: u64,
     pub reader_dropped_frames: u64,
     pub database_state: String,
@@ -210,6 +218,14 @@ struct RuntimeCounters {
     duplicates: u64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ExecReceipt {
+    run_id: String,
+    source_stream: SourceStream,
+    pid: u32,
+    pid_version: u32,
+}
+
 impl Default for RuntimeCounters {
     fn default() -> Self {
         Self {
@@ -256,8 +272,10 @@ struct DaemonState {
     bulk_window_ms: i64,
     storage: Storage,
     rules: RuleEngine,
-    adapter: Option<EsloggerAdapter>,
+    adapters: BTreeMap<SourceStream, EsloggerAdapter>,
+    split_source: Option<bool>,
     adapter_run_id: Option<String>,
+    exec_receipts: VecDeque<ExecReceipt>,
     source_state: String,
     source_diagnostic_state: Option<String>,
     database_state: String,
@@ -307,12 +325,17 @@ fn event_kind_name(kind: EventKind) -> &'static str {
 }
 
 fn event_dedup_key(event: &ActivityEvent) -> Option<String> {
+    let stream = if event.source_stream == SourceStream::Combined {
+        String::new()
+    } else {
+        format!("{}:", event.source_stream.as_str())
+    };
     if let Some(sequence) = event.global_seq {
-        return Some(format!("{}:g:{sequence}", event.source_run_id));
+        return Some(format!("{}:{stream}g:{sequence}", event.source_run_id));
     }
     event.event_seq.map(|sequence| {
         format!(
-            "{}:e:{}:{sequence}",
+            "{}:{stream}e:{}:{sequence}",
             event.source_run_id,
             event_kind_name(event.kind)
         )
@@ -528,8 +551,10 @@ fn run_daemon_inner(
         bulk_window_ms: options.bulk_window_ms,
         storage,
         rules,
-        adapter: None,
+        adapters: BTreeMap::new(),
+        split_source: None,
         adapter_run_id: None,
+        exec_receipts: VecDeque::new(),
         source_state: "connecting".into(),
         source_diagnostic_state: None,
         database_state: "ready".into(),
@@ -801,6 +826,14 @@ fn write_control_response(stream: &mut UnixStream, response: &ControlResponse) -
 impl DaemonState {
     fn status(&self) -> RuntimeStatus {
         let now = now_ms();
+        let health: Vec<_> = self
+            .adapters
+            .values()
+            .map(EsloggerAdapter::health)
+            .collect();
+        let observed = !health.is_empty() && health.iter().all(|source| source.lines > 0);
+        let schema = health.first().and_then(|source| source.schema_version);
+        let message = health.first().and_then(|source| source.message_version);
         RuntimeStatus {
             state: "running".into(),
             uid: self.uid,
@@ -808,14 +841,20 @@ impl DaemonState {
             bulk_window_ms: self.bulk_window_ms,
             collector_state: self.source_state.clone(),
             collector_run_id: self.adapter_run_id.clone(),
-            collector_schema_version: self
-                .adapter
-                .as_ref()
-                .and_then(|adapter| adapter.health().schema_version),
-            collector_message_version: self
-                .adapter
-                .as_ref()
-                .and_then(|adapter| adapter.health().message_version),
+            collector_schema_version: schema.filter(|_| {
+                observed && health.iter().all(|source| source.schema_version == schema)
+            }),
+            collector_message_version: message.filter(|_| {
+                observed
+                    && health
+                        .iter()
+                        .all(|source| source.message_version == message)
+            }),
+            collector_streams: self
+                .adapters
+                .iter()
+                .map(|(stream, adapter)| (*stream, adapter.health().clone()))
+                .collect(),
             collector_dropped_lines: self.collector_dropped_lines,
             reader_dropped_frames: self.reader_dropped_frames.load(Ordering::Relaxed),
             database_state: self.database_state.clone(),
@@ -844,6 +883,13 @@ impl DaemonState {
     fn handle_control(&mut self, request: ControlRequest) -> (ControlResponse, bool) {
         let result = match request {
             ControlRequest::Status => json_value(self.status()),
+            ControlRequest::ExecReceipt {
+                run_id,
+                pid,
+                pid_version,
+            } => json_value(self.exec_receipts.iter().rev().find(|receipt| {
+                receipt.run_id == run_id && receipt.pid == pid && receipt.pid_version == pid_version
+            })),
             ControlRequest::AddDirectories { entries } => {
                 self.add_directories(&entries).and_then(json_value)
             }
@@ -1045,6 +1091,7 @@ impl DaemonState {
             }
             CollectorFrame::Line {
                 run_id,
+                source_stream,
                 line,
                 received_timestamp_ms,
             } => {
@@ -1058,19 +1105,42 @@ impl DaemonState {
                     return;
                 }
                 self.ensure_adapter(&run_id);
-                let previous_version = self.adapter.as_ref().and_then(|adapter| {
+                let split = source_stream != SourceStream::Combined;
+                if self.split_source.is_some_and(|previous| previous != split) {
+                    self.write_health(
+                        "eslogger",
+                        "source_stream_mode_mismatch",
+                        "degraded",
+                        "同一采集实例不能混合旧单路与分流协议。",
+                    );
+                    return;
+                }
+                if self.split_source.is_none() {
+                    self.split_source = Some(split);
+                    let streams: &[SourceStream] = if split {
+                        &[SourceStream::Exec, SourceStream::Activity]
+                    } else {
+                        &[SourceStream::Combined]
+                    };
+                    for stream in streams {
+                        self.adapters
+                            .insert(*stream, EsloggerAdapter::new_with_stream(&run_id, *stream));
+                    }
+                }
+                let previous_version = self.adapters.get(&source_stream).and_then(|adapter| {
                     let health = adapter.health();
                     (health.lines > 0).then_some((health.schema_version, health.message_version))
                 });
                 let outcome = self
-                    .adapter
-                    .as_mut()
+                    .adapters
+                    .get_mut(&source_stream)
                     .map(|adapter| adapter.parse_line(&line, received_timestamp_ms));
                 let Some(outcome) = outcome else {
                     return;
                 };
                 let source = SourceContext {
                     run_id,
+                    source_stream,
                     schema_version: outcome.schema_version,
                     message_version: outcome.message_version,
                     field: None,
@@ -1106,7 +1176,24 @@ impl DaemonState {
                     );
                 }
                 if let Some(event) = outcome.event {
+                    let receipt = (event.kind == EventKind::Exec)
+                        .then(|| {
+                            event.process.pid_version.map(|pid_version| ExecReceipt {
+                                run_id: event.source_run_id.clone(),
+                                source_stream: event.source_stream,
+                                pid: event.process.pid,
+                                pid_version,
+                            })
+                        })
+                        .flatten();
                     self.handle_event(event);
+                    // 回执只证明宿主已处理这个 exec；不证明来源无缺口或数据库健康。
+                    if let Some(receipt) = receipt {
+                        self.exec_receipts.push_back(receipt);
+                        while self.exec_receipts.len() > EXEC_RECEIPT_CAPACITY {
+                            self.exec_receipts.pop_front();
+                        }
+                    }
                 }
             }
             CollectorFrame::Heartbeat {
@@ -1178,7 +1265,9 @@ impl DaemonState {
         let changed = self.adapter_run_id.is_some();
         self.pipeline_timing.collector = None;
         self.adapter_run_id = Some(run_id.to_owned());
-        self.adapter = Some(EsloggerAdapter::new(run_id));
+        self.adapters.clear();
+        self.split_source = None;
+        self.exec_receipts.clear();
         self.source_state = "connected".into();
         self.source_diagnostic_state = None;
         if changed {

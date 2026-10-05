@@ -1,5 +1,5 @@
 use chrono::DateTime;
-use codeperimeter::model::now_ms;
+use codeperimeter::model::{SourceStream, now_ms};
 use codeperimeter::runtime::{
     ControlRequest, DirectoryImport, NotificationSender, RuntimeOptions, RuntimeStatus,
     notify_burst_with_sender, notify_once_with_sender, request_control,
@@ -151,7 +151,7 @@ fn query<T: DeserializeOwned>(socket: &Path, request: ControlRequest) -> T {
     let response = request_control(socket, request.clone())
         .unwrap_or_else(|error| panic!("IPC请求 {request:?} 未完成：{error}"));
     assert!(response.ok, "{:?}", response.error);
-    serde_json::from_value(response.data.unwrap()).unwrap()
+    serde_json::from_value(response.data.unwrap_or(Value::Null)).unwrap()
 }
 
 fn collector_eof_health(socket: &Path) -> Vec<Value> {
@@ -171,6 +171,155 @@ fn stop_host(socket: &Path, handle: JoinHandle<codeperimeter::Result<()>>) {
     let response = request_control(socket, ControlRequest::Stop).unwrap();
     assert!(response.ok);
     handle.join().unwrap().unwrap();
+}
+
+#[test]
+fn split_sources_keep_shared_identity_independent_sequences_and_bounded_exec_receipts() {
+    let temp = fixture();
+    let project = temp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let file = project.join("source.txt");
+    fs::write(&file, b"anonymous source").unwrap();
+    let runtime = options(temp.path());
+    let control_socket = runtime.control_socket.clone();
+    let host = start_host(runtime.clone());
+    wait_for_socket(&control_socket);
+    let _: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::AddDirectories {
+            entries: vec![DirectoryImport {
+                path: project.clone(),
+                sources: vec!["manual".into()],
+            }],
+        },
+    );
+    let source = SyntheticSource::start(&runtime.collector_socket);
+    source.wait_connected();
+    let exec_frame = |pid, sequence, input: &Path| {
+        let CollectorFrame::Line {
+            run_id,
+            line,
+            received_timestamp_ms,
+            ..
+        } = open_frame(&file, pid, 7, sequence)
+        else {
+            unreachable!()
+        };
+        let mut value: Value = serde_json::from_str(&line).unwrap();
+        let mut target = value["process"].clone();
+        target["executable"]["path"] = json!("/usr/bin/gzip");
+        value["event_type"] = json!(9);
+        value["event"] = json!({"exec": {"target": target, "cwd": {"path": project, "path_truncated": false}, "args": ["gzip", "-c", input]}});
+        CollectorFrame::Line {
+            run_id,
+            source_stream: SourceStream::Exec,
+            line: value.to_string(),
+            received_timestamp_ms,
+        }
+    };
+    let receipt_request = |pid| ControlRequest::ExecReceipt {
+        run_id: "synthetic-run-01".into(),
+        pid,
+        pid_version: 7,
+    };
+    source.send(exec_frame(700, 1, &file));
+    wait_until(
+        || query::<Option<Value>>(&control_socket, receipt_request(700)).is_some(),
+        "主 exec 应在处理后提供精确回执",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.collector_schema_version, None);
+    assert_eq!(status.collector_streams[&SourceStream::Activity].lines, 0);
+    let receipt: Option<Value> = query(&control_socket, receipt_request(700));
+    assert_eq!(receipt.unwrap()["source_stream"], "exec");
+    let wrong_generation: Option<Value> = query(
+        &control_socket,
+        ControlRequest::ExecReceipt {
+            run_id: "synthetic-run-01".into(),
+            pid: 700,
+            pid_version: 8,
+        },
+    );
+    assert!(wrong_generation.is_none());
+    let mut activity = open_frame(&file, 700, 7, 1);
+    if let CollectorFrame::Line { source_stream, .. } = &mut activity {
+        *source_stream = SourceStream::Activity;
+    }
+    source.send(activity.clone());
+    wait_until(
+        || {
+            query::<RuntimeStatus>(&control_socket, ControlRequest::Status).persisted_events_by_kind
+                ["open"]
+                == 1
+        },
+        "相同序号的另一来源仍应保存",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.collector_schema_version, Some(1));
+    assert_eq!(status.collector_message_version, Some(9));
+    assert_eq!(status.duplicate_events, 0);
+    let events: Vec<Value> = query(
+        &control_socket,
+        ControlRequest::QueryEvents {
+            filter: EventFilter::default(),
+        },
+    );
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event"]["source_run_id"] == "synthetic-run-01")
+    );
+    source.send(activity);
+    source.send(exec_frame(701, 2, &file));
+    let mut skipped = open_frame(&file, 700, 7, 3);
+    if let CollectorFrame::Line { source_stream, .. } = &mut skipped {
+        *source_stream = SourceStream::Activity;
+    }
+    source.send(skipped);
+    wait_until(
+        || {
+            query::<RuntimeStatus>(&control_socket, ControlRequest::Status).collector_streams
+                [&SourceStream::Activity]
+                .sequence_gaps
+                == 2
+        },
+        "缺口必须只记在对应来源",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(
+        status.collector_streams[&SourceStream::Exec].sequence_gaps,
+        0
+    );
+    assert_eq!(status.duplicate_events, 1);
+    for sequence in 3..=260 {
+        source.send(exec_frame(
+            1000 + sequence as u32,
+            sequence,
+            Path::new("/outside/source.txt"),
+        ));
+    }
+    wait_until(
+        || query::<Option<Value>>(&control_socket, receipt_request(1260)).is_some(),
+        "最新 exec 回执应可查询",
+    );
+    assert!(query::<Option<Value>>(&control_socket, receipt_request(700)).is_none());
+    source.send(CollectorFrame::Heartbeat {
+        run_id: "synthetic-run-02".into(),
+        dropped_lines: 0,
+    });
+    wait_until(
+        || {
+            query::<RuntimeStatus>(&control_socket, ControlRequest::Status)
+                .collector_run_id
+                .as_deref()
+                == Some("synthetic-run-02")
+        },
+        "重启必须建立新的来源域",
+    );
+    assert!(query::<Option<Value>>(&control_socket, receipt_request(1260)).is_none());
+    stop_host(&control_socket, host);
+    source.stop();
 }
 
 fn create_files(directory: &Path, prefix: &str) -> Vec<PathBuf> {
@@ -216,6 +365,7 @@ fn open_frame(path: &Path, process_id: u32, generation: u32, sequence: u64) -> C
         }}
     });
     CollectorFrame::Line {
+        source_stream: SourceStream::Combined,
         run_id: "synthetic-run-01".into(),
         line: event.to_string(),
         received_timestamp_ms: now_ms(),
@@ -809,6 +959,7 @@ fn archive_stdin_gap_keeps_the_parsed_identity_without_saving_unrelated_execs() 
     source.wait_connected();
     for sequence in [1, 2] {
         let CollectorFrame::Line {
+            source_stream,
             run_id,
             line,
             received_timestamp_ms,
@@ -829,6 +980,7 @@ fn archive_stdin_gap_keeps_the_parsed_identity_without_saving_unrelated_execs() 
             "args": ["gzip", "-c"]
         }});
         source.send(CollectorFrame::Line {
+            source_stream,
             run_id,
             line: value.to_string(),
             received_timestamp_ms,
@@ -906,6 +1058,7 @@ fn source_versions_and_structured_gaps_are_queryable_by_run_after_restart() {
     source.wait_connected();
     source.send(open_frame(&files[0], 890, 15, 1));
     if let CollectorFrame::Line {
+        source_stream,
         run_id,
         line,
         received_timestamp_ms,
@@ -918,6 +1071,7 @@ fn source_versions_and_structured_gaps_are_queryable_by_run_after_restart() {
             .unwrap()
             .remove("fflag");
         source.send(CollectorFrame::Line {
+            source_stream,
             run_id,
             line: value.to_string(),
             received_timestamp_ms,
@@ -925,6 +1079,7 @@ fn source_versions_and_structured_gaps_are_queryable_by_run_after_restart() {
     }
     for sequence in [5, 6] {
         if let CollectorFrame::Line {
+            source_stream,
             run_id,
             line,
             received_timestamp_ms,
@@ -934,6 +1089,7 @@ fn source_versions_and_structured_gaps_are_queryable_by_run_after_restart() {
             value["schema_version"] = json!(2);
             value["version"] = json!(11);
             source.send(CollectorFrame::Line {
+                source_stream,
                 run_id,
                 line: value.to_string(),
                 received_timestamp_ms,

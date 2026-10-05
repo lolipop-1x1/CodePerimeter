@@ -1,5 +1,5 @@
 use codeperimeter::eslogger::{EsloggerAdapter, MAX_LINE_BYTES, parse_line};
-use codeperimeter::model::EventKind;
+use codeperimeter::model::{EventKind, SourceStream};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -149,6 +149,75 @@ fn tracks_sequences_before_filtering_and_distinguishes_reset() {
         first_event.process.key(&first_event.source_run_id),
         second_event.process.key(&second_event.source_run_id)
     );
+}
+
+#[test]
+fn partitioned_sources_keep_client_sequences_and_reject_misrouted_known_events() {
+    let mut exec = EsloggerAdapter::new_with_stream("synthetic-shared-run", SourceStream::Exec);
+    let mut activity =
+        EsloggerAdapter::new_with_stream("synthetic-shared-run", SourceStream::Activity);
+    let mut command = rows().remove(2);
+    let mut open = rows().remove(0);
+    for row in [&mut command, &mut open] {
+        row["global_seq_num"] = json!(7);
+        row["seq_num"] = json!(4);
+    }
+    let first_exec = exec.parse_line(&command.to_string(), 1);
+    let first_activity = activity.parse_line(&open.to_string(), 1);
+    assert!(first_exec.issues.is_empty());
+    assert!(first_activity.issues.is_empty());
+    assert_eq!(first_exec.event.unwrap().source_stream, SourceStream::Exec);
+    assert_eq!(
+        first_activity.event.unwrap().source_stream,
+        SourceStream::Activity
+    );
+    for row in [&mut command, &mut open] {
+        row["global_seq_num"] = json!(8);
+        row["seq_num"] = json!(5);
+    }
+    assert!(exec.parse_line(&command.to_string(), 2).issues.is_empty());
+    assert!(activity.parse_line(&open.to_string(), 2).issues.is_empty());
+    command["global_seq_num"] = json!(9);
+    let wrong = activity.parse_line(&command.to_string(), 3);
+    assert!(wrong.event.is_none());
+    assert!(
+        wrong
+            .issues
+            .iter()
+            .any(|issue| issue.code == "source_stream_event_mismatch")
+    );
+    open["global_seq_num"] = json!(10);
+    open["seq_num"] = json!(6);
+    assert!(activity.parse_line(&open.to_string(), 4).issues.is_empty());
+    assert_eq!(activity.health().sequence_gaps, 0);
+    assert_eq!(activity.health().skipped_lines, 1);
+
+    for row in rows() {
+        let kind = parse(&row).event.unwrap().kind;
+        let accepted = if kind == EventKind::Exec {
+            SourceStream::Exec
+        } else {
+            SourceStream::Activity
+        };
+        let rejected = if kind == EventKind::Exec {
+            SourceStream::Activity
+        } else {
+            SourceStream::Exec
+        };
+        let mut correct = EsloggerAdapter::new_with_stream("synthetic-route-run", accepted);
+        let outcome = correct.parse_line(&row.to_string(), 5);
+        assert!(outcome.issues.is_empty());
+        assert_eq!(outcome.event.unwrap().source_stream, accepted);
+        let mut wrong = EsloggerAdapter::new_with_stream("synthetic-route-run", rejected);
+        let outcome = wrong.parse_line(&row.to_string(), 5);
+        assert!(outcome.event.is_none());
+        assert!(
+            outcome
+                .issues
+                .iter()
+                .any(|issue| issue.code == "source_stream_event_mismatch")
+        );
+    }
 }
 
 #[test]

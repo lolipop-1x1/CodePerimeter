@@ -52,6 +52,45 @@ def analyze(value):
 
 
 class ValidationTimingTests(unittest.TestCase):
+    def test_unknown_process_generation_is_never_associated_across_source_streams(self):
+        identity = PROCESS | {"pid_version": None}
+        execution = event(1000, "exec", process=identity, source_stream="exec")
+        activity = event(1000, process=identity, source_stream="activity")
+        self.assertNotEqual(validation.process_key(execution), validation.process_key(activity))
+        self.assertEqual(validation.process_key(activity), validation.process_key(dict(activity)))
+        execution["process"] = activity["process"] = PROCESS
+        self.assertEqual(validation.process_key(execution), validation.process_key(activity))
+
+    def test_stream_health_needs_both_observed_sources_and_keeps_only_fixed_fields(self):
+        sample = {"lines": 1, "parsed_events": 1, "skipped_lines": 0, "lines_with_issues": 0,
+                  "last_received_timestamp_ms": 1000, "schema_version": 1, "message_version": 9,
+                  "global_sequence_available": True, "event_sequence_available": True,
+                  "sequence_gaps": 0, "private": "SYNTHETIC_PRIVATE_MARKER"}
+        status = {"collector_streams": {name: dict(sample) for name in ("exec", "activity")},
+                  "collector_schema_version": 1, "collector_message_version": 9}
+        self.assertTrue(validation.collector_streams_healthy(status))
+        summary = validation.collector_streams_snapshot(status)
+        self.assertNotIn("SYNTHETIC_PRIVATE_MARKER", json.dumps(summary))
+        self.assertEqual(set(summary), {"exec", "activity"})
+        for field, value in (("lines", 0), ("schema_version", None), ("message_version", 8),
+                             ("sequence_gaps", 1)):
+            wrong = {**status, "collector_streams": {"exec": dict(sample), "activity": dict(sample, **{field: value})}}
+            self.assertFalse(validation.collector_streams_healthy(wrong))
+        for streams in ({}, {"exec": sample}, {"activity": sample}, {"unknown": sample},
+                        {"exec": sample, "activity": sample, "combined": sample}):
+            self.assertFalse(validation.collector_streams_healthy(dict(status, collector_streams=streams)))
+        self.assertTrue(validation.collector_streams_healthy(dict(status, collector_streams={"combined": sample})))
+        self.assertFalse(validation.collector_streams_healthy({}))
+
+    def test_trigger_order_keeps_equal_time_sequence_local_to_the_source_stream(self):
+        output = event(1000, "write")["file"] | {"path": str(PROJECT / "result.zip"), "readable": None}
+        values = [event(1000, "write", source_stream="activity", global_seq=2, file=output),
+                  event(1000, "exec", source_stream="exec", global_seq=1, file=None, archive={"tool": "tar"}),
+                  event(1000, source_stream="activity", global_seq=1)]
+        triggers = validation.triggers({"events": values}, PROJECT)
+        self.assertEqual(triggers[(validation.process_key(values[0]), "archive_output")], [1000])
+        self.assertEqual(triggers[(validation.process_key(values[1]), "archive_command")], [1000])
+
     def test_fiftieth_distinct_source_is_trigger_even_when_last_alert_is_later(self):
         events = []
         for index in range(55):
@@ -174,7 +213,7 @@ class ValidationCompletionTests(unittest.TestCase):
         control.assert_not_called()
 
     def test_real_fence_requires_read_flag_matching_pid_path_and_sequence(self):
-        for replacement in ({"global_seq": None}, {"kind": "close"}, {"process": PROCESS},
+        for replacement in ({"global_seq": None}, {"source_stream": "exec"}, {"kind": "close"}, {"process": PROCESS},
                             {"file": self.fence_event["file"] | {"readable": False}},
                             {"file": self.fence_event["file"] | {"path_truncated": True}},
                             {"file": self.fence_event["file"] | {"path": str(PROJECT / "other")}}):
@@ -232,6 +271,20 @@ class ValidationCompletionTests(unittest.TestCase):
 
 
 class ValidationStartupTests(unittest.TestCase):
+    def test_exec_receipt_query_uses_the_runtime_operation_payload_shape(self):
+        receipt = {"run_id": "anonymous-run", "pid": 100, "pid_version": 4, "source_stream": "exec"}
+        connection = unittest.mock.MagicMock()
+        connection.makefile.return_value = io.BytesIO(json.dumps({"ok": True, "data": receipt}).encode() + b"\n")
+        with patch.object(validation.socket, "socket") as factory:
+            factory.return_value.__enter__.return_value = connection
+            observed = validation.control(Path("/anonymous.sock"), "exec_receipt", {
+                "run_id": "anonymous-run", "pid": 100, "pid_version": 4,
+            })
+        self.assertEqual(observed, receipt)
+        self.assertEqual(json.loads(connection.sendall.call_args.args[0]), {
+            "operation": "exec_receipt", "payload": {"run_id": "anonymous-run", "pid": 100, "pid_version": 4},
+        })
+
     def test_startup_diagnostics_are_bounded_static_and_never_echo_raw(self):
         stream = io.BytesIO(("执行失败：root 服务文件或父目录可被普通用户修改\n"
                              + "anonymous-secret=/unknown/private/path " * 10000 + "\n"
@@ -301,7 +354,10 @@ class ValidationHostLifecycleTests(unittest.TestCase):
                 return SimpleNamespace(stdout=json.dumps({"pid": 999, "path": str(project / ".fence")}))
             status = {"observed_events_by_kind": {kind: 0 for kind in validation.KINDS},
                       "collector_dropped_lines": 0, "reader_dropped_frames": 0,
-                      "database_gap_events": 0, "database_state": "ready", "state": "ready"}
+                      "database_gap_events": 0, "database_state": "ready", "state": "ready",
+                      "collector_schema_version": 1, "collector_message_version": 9,
+                      "collector_streams": {"combined": {"lines": 1, "schema_version": 1,
+                                                         "message_version": 9, "sequence_gaps": 0}}}
             def request(path, operation, payload=None):
                 statuses.append(operation)
                 self.assertEqual(path, runtime_paths[0])

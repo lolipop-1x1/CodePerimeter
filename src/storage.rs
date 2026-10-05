@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::model::{ActivityEvent, Alert, AlertRule, EventKind};
+use crate::model::{ActivityEvent, Alert, AlertRule, EventKind, SourceStream};
 use crate::rules::normalize_path;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,8 @@ impl Default for HealthFilter {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceContext {
     pub run_id: String,
+    #[serde(default)]
+    pub source_stream: SourceStream,
     pub schema_version: Option<u64>,
     pub message_version: Option<u64>,
     pub field: Option<String>,
@@ -1174,7 +1176,7 @@ fn normalize_optional_query_path(path: Option<&Path>) -> Result<Option<PathBuf>>
 }
 
 fn sequence_key(event: &ActivityEvent) -> Option<String> {
-    event
+    let key = event
         .global_seq
         .map(|sequence| format!("g:{sequence}"))
         .or_else(|| {
@@ -1189,7 +1191,11 @@ fn sequence_key(event: &ActivityEvent) -> Option<String> {
                     event_kind_name(event.kind)
                 )
             })
-        })
+        });
+    key.map(|key| match event.source_stream {
+        SourceStream::Combined => key,
+        stream => format!("{}:{key}", stream.as_str()),
+    })
 }
 
 fn event_kind_name(kind: EventKind) -> &'static str {

@@ -1,5 +1,7 @@
 use crate::Result;
-use crate::model::{ActivityEvent, Alert, AlertRule, EventKind, FileEvidence, ProcessIdentity};
+use crate::model::{
+    ActivityEvent, Alert, AlertRule, EventKind, FileEvidence, ProcessIdentity, SourceStream,
+};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
@@ -63,12 +65,13 @@ struct ProcessKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ProcessGeneration {
     Source(u32),
-    Observed(u64),
+    Observed(SourceStream, u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct UnknownProcessKey {
     source_run_id: String,
+    source_stream: SourceStream,
     pid: u32,
 }
 
@@ -249,6 +252,7 @@ impl RuleEngine {
             self.process_states.remove(&process_key);
             self.unknown_processes.remove(&UnknownProcessKey {
                 source_run_id: event.source_run_id.clone(),
+                source_stream: event.source_stream,
                 pid: event.process.pid,
             });
         }
@@ -267,6 +271,7 @@ impl RuleEngine {
 
         let unknown_key = UnknownProcessKey {
             source_run_id: event.source_run_id.clone(),
+            source_stream: event.source_stream,
             pid: event.process.pid,
         };
 
@@ -275,7 +280,7 @@ impl RuleEngine {
                 self.process_states.remove(&ProcessKey {
                     source_run_id: event.source_run_id.clone(),
                     pid: event.process.pid,
-                    generation: ProcessGeneration::Observed(old_instance.id),
+                    generation: ProcessGeneration::Observed(event.source_stream, old_instance.id),
                 });
             }
         }
@@ -295,7 +300,10 @@ impl RuleEngine {
                     self.process_states.remove(&ProcessKey {
                         source_run_id: oldest_key.source_run_id.clone(),
                         pid: oldest_key.pid,
-                        generation: ProcessGeneration::Observed(oldest.id),
+                        generation: ProcessGeneration::Observed(
+                            oldest_key.source_stream,
+                            oldest.id,
+                        ),
                     });
                 }
                 self.push_health_records(
@@ -320,7 +328,7 @@ impl RuleEngine {
         ProcessKey {
             source_run_id: unknown_key.source_run_id,
             pid: unknown_key.pid,
-            generation: ProcessGeneration::Observed(instance),
+            generation: ProcessGeneration::Observed(event.source_stream, instance),
         }
     }
 
@@ -704,9 +712,10 @@ impl RuleEngine {
                 .map(|(key, _)| key.clone())
         {
             self.process_states.remove(&oldest_key);
-            if let ProcessGeneration::Observed(instance) = oldest_key.generation {
+            if let ProcessGeneration::Observed(source_stream, instance) = oldest_key.generation {
                 let unknown_key = UnknownProcessKey {
                     source_run_id: oldest_key.source_run_id.clone(),
+                    source_stream,
                     pid: oldest_key.pid,
                 };
                 if self
@@ -826,7 +835,7 @@ impl RuleEngine {
         self.next_alert_id = self.next_alert_id.saturating_add(1);
         let generation = match process_key.generation {
             ProcessGeneration::Source(value) => format!("v{value}"),
-            ProcessGeneration::Observed(value) => format!("o{value}"),
+            ProcessGeneration::Observed(_, value) => format!("o{value}"),
         };
         if self.alerts.len() >= self.config.max_process_states.saturating_mul(3)
             && let Some(oldest_key) = self

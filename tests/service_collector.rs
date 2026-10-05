@@ -1,3 +1,4 @@
+use codeperimeter::model::SourceStream;
 use codeperimeter::service::{
     CollectorClient, CollectorFrame, MAX_FRAME_BYTES, ServicePlan, checked_root_path, peer_uid,
     read_bounded_line, verify_peer_uid, write_frame,
@@ -47,6 +48,7 @@ fn transports_explicit_test_frames_and_detects_eof() {
             dropped_lines: 0,
         },
         CollectorFrame::Line {
+            source_stream: SourceStream::Combined,
             run_id: "test-only-run".into(),
             line: "{\"synthetic\":true}".into(),
             received_timestamp_ms: 100,
@@ -80,6 +82,24 @@ fn transports_explicit_test_frames_and_detects_eof() {
         io::ErrorKind::UnexpectedEof
     );
     producer.join().unwrap();
+}
+
+#[test]
+fn old_frames_default_to_combined_and_unknown_streams_are_rejected() {
+    let old = r#"{"type":"line","run_id":"anonymous-run","line":"{}","received_timestamp_ms":1}"#;
+    let parsed: CollectorFrame = serde_json::from_str(old).unwrap();
+    assert!(matches!(
+        parsed,
+        CollectorFrame::Line {
+            source_stream: SourceStream::Combined,
+            ..
+        }
+    ));
+    let unknown = old.replace(
+        "\"line\":\"{}\"",
+        "\"source_stream\":\"unknown\",\"line\":\"{}\"",
+    );
+    assert!(serde_json::from_str::<CollectorFrame>(&unknown).is_err());
 }
 
 #[test]

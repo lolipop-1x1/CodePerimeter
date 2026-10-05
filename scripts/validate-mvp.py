@@ -22,6 +22,7 @@ import time
 REPO = Path(__file__).resolve().parent.parent
 SENDER = REPO / "scripts" / "synthetic_sender.py"
 KINDS = ("open", "mmap", "exec", "fork", "exit", "create", "write", "rename", "close")
+SOURCE_STREAMS = ("combined", "exec", "activity")
 
 
 def save(path, value):
@@ -45,6 +46,56 @@ def control(path, operation, payload=None):
     if not response.get("ok"):
         raise RuntimeError(response.get("error") or "宿主拒绝请求")
     return response["data"]
+
+
+def source_stream(value):
+    if not isinstance(value, dict):
+        return None
+    name = value.get("source_stream", "combined")
+    return name if name in SOURCE_STREAMS else None
+
+
+def collector_streams_snapshot(status):
+    streams = status.get("collector_streams")
+    if not isinstance(streams, dict):
+        return {}
+    result = {}
+    for name in SOURCE_STREAMS:
+        sample = streams.get(name)
+        if not isinstance(sample, dict):
+            continue
+        result[name] = {field: sample.get(field) if type(sample.get(field)) is int
+                       and sample[field] >= 0 else None for field in (
+            "lines", "parsed_events", "skipped_lines", "lines_with_issues",
+            "last_received_timestamp_ms", "schema_version", "message_version", "sequence_gaps",
+        )}
+        result[name].update({field: sample.get(field) if type(sample.get(field)) is bool else None
+                             for field in ("global_sequence_available", "event_sequence_available")})
+    return result
+
+
+def collector_stream_versions(status):
+    streams = status.get("collector_streams")
+    if not isinstance(streams, dict) or set(streams) not in ({"combined"}, {"exec", "activity"}):
+        return None
+    samples = collector_streams_snapshot(status)
+    if set(samples) != set(streams) or any(not sample["lines"] for sample in samples.values()):
+        return None
+    versions = {(sample["schema_version"], sample["message_version"]) for sample in samples.values()}
+    if len(versions) != 1 or any(value is None for value in next(iter(versions))):
+        return None
+    return next(iter(versions))
+
+
+def collector_streams_healthy(status):
+    versions = collector_stream_versions(status)
+    if versions is None:
+        return False
+    if (type(status.get("collector_schema_version")) is not int
+            or type(status.get("collector_message_version")) is not int
+            or versions != (status["collector_schema_version"], status["collector_message_version"])):
+        return False
+    return all(sample["sequence_gaps"] == 0 for sample in collector_streams_snapshot(status).values())
 
 
 class CollectorStartupError(RuntimeError):
@@ -239,6 +290,7 @@ def completion_state(evidence, operations, project, initial_status, fence):
                   and event.get("file") and event["file"].get("readable") is True
                   and not event["file"]["path_truncated"]
                   and canonical_path(event["file"]["path"]) == canonical_path(fence["path"])
+                  and source_stream(event) in ("combined", "activity")
                   and event.get("global_seq") is not None
                   and event.get("source_run_id") for event in evidence["events"])
     cases = analyze(evidence, operations, project, initial_status, initial_status)["cases"]
@@ -290,7 +342,10 @@ def load_evidence(database):
 
 def process_key(event):
     identity = event["process"]
-    return event["source_run_id"], identity["pid"], identity["pid_version"]
+    generation = identity["pid_version"]
+    if generation is None:
+        generation = ("unknown", source_stream(event))
+    return event["source_run_id"], identity["pid"], generation
 
 
 def latency_summary(values, missing):
@@ -303,7 +358,10 @@ def latency_summary(values, missing):
 
 def triggers(evidence, project):
     windows, recent_reads, candidates = {}, {}, {}
-    events = sorted(evidence["events"], key=lambda event: (event["source_timestamp_ms"] or 0, event["global_seq"] or 0))
+    # 跨路同毫秒只作稳定分组；序号仅在同路内排序，不表示跨客户端全序。
+    events = sorted(evidence["events"], key=lambda event: (
+        event["source_timestamp_ms"] or 0, source_stream(event) or "unknown", event["global_seq"] or 0,
+    ))
     for event in events:
         timestamp = event["source_timestamp_ms"]
         if timestamp is None:
@@ -638,6 +696,7 @@ def run_with_socket(args, report, summary, control_socket):
         summary["initial_status"], summary["final_status"] = initial, final_status
         summary["verification"] = analyze(evidence, operations, project, initial, final_status)
         summary["coverage"] = {
+            "collector_streams": collector_streams_snapshot(final_status),
             "collector_dropped_lines": final_status["collector_dropped_lines"],
             "reader_dropped_frames": final_status["reader_dropped_frames"],
             "database_gap_events": final_status["database_gap_events"],
@@ -651,7 +710,7 @@ def run_with_socket(args, report, summary, control_socket):
         save(report / "fault-evidence.json", load_evidence(database))
         summary["controlled_disconnect"] = {"collector_state": fault_status["collector_state"], "state": fault_status["state"], "observed": fault_status["collector_state"] != final_status["collector_state"]}
         verification = summary["verification"]
-        healthy = final_status["database_state"] == "ready" and not any(summary["coverage"][field] for field in ("collector_dropped_lines", "reader_dropped_frames", "database_gap_events", "degraded_health_records"))
+        healthy = final_status["database_state"] == "ready" and final_status.get("collector_state") == "connected" and collector_streams_healthy(final_status) and not any(summary["coverage"][field] for field in ("collector_dropped_lines", "reader_dropped_frames", "database_gap_events", "degraded_health_records"))
         passed = summary["source_completion"]["completed"] and healthy and summary["collector_stopped"] and summary["controlled_disconnect"]["observed"] and all(case["passed"] for case in verification["cases"]) and verification["nine_event_aggregate_passed"] and verification["generation_latency"]["within_3000_ms"] and verification["notification_send_latency"]["within_3000_ms"]
         summary["phase"] = "completed"
         summary["result"] = "real_run_passed_display_and_boot_pending" if passed else "real_run_failed_or_partial"

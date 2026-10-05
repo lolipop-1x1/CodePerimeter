@@ -2,6 +2,27 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStream {
+    #[default]
+    Combined,
+    Exec,
+    Activity,
+}
+
+impl SourceStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Combined => "combined",
+            Self::Exec => "exec",
+            Self::Activity => "activity",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -61,6 +82,8 @@ pub struct ArchiveCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivityEvent {
     pub source_run_id: String,
+    #[serde(default)]
+    pub source_stream: SourceStream,
     #[serde(default)]
     pub source_schema_version: Option<u64>,
     #[serde(default)]

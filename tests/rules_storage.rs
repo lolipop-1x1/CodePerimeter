@@ -1,5 +1,6 @@
 use codeperimeter::model::{
     ActivityEvent, Alert, AlertRule, ArchiveCommand, EventKind, FileEvidence, ProcessIdentity,
+    SourceStream,
 };
 use codeperimeter::rules::{RuleConfig, RuleEngine};
 use codeperimeter::storage::{
@@ -34,6 +35,68 @@ fn legacy_health_source_json_defaults_new_numeric_identity_fields() {
     assert!(serialized.get("global_seq").is_none());
 }
 
+#[test]
+fn legacy_event_and_source_json_default_to_combined_stream() {
+    let mut legacy =
+        serde_json::to_value(event(EventKind::Exec, None, Some(1), 2, 30, Some(7))).unwrap();
+    legacy.as_object_mut().unwrap().remove("source_stream");
+    let parsed: ActivityEvent = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        serde_json::to_value(parsed).unwrap()["source_stream"],
+        "combined"
+    );
+    let source: SourceContext = serde_json::from_value(serde_json::json!({
+        "run_id": "synthetic-legacy-run", "schema_version": 1, "message_version": 9,
+        "field": null, "missing_events": null
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(source).unwrap()["source_stream"],
+        "combined"
+    );
+}
+
+#[test]
+fn rules_share_known_generations_but_keep_unknown_observation_instances_in_their_stream() {
+    let temp = fixture();
+    let root = protected_root(&temp, "partitioned-project");
+    for generation in [Some(7), None] {
+        let mut engine = RuleEngine::new(vec![root.clone()], rule_config(2)).unwrap();
+        let mut first = read_event(root.join("first.rs"), 1_000, 1_000, 30, generation);
+        first.source_stream = SourceStream::Activity;
+        assert!(engine.process(&first).alerts.is_empty());
+        let mut command = event(EventKind::Exec, None, Some(1_010), 1_010, 30, generation);
+        command.source_stream = SourceStream::Exec;
+        command.archive = Some(ArchiveCommand {
+            tool: "gzip".into(),
+            input_paths: Vec::new(),
+            output_path: None,
+            output_paths: Vec::new(),
+            cwd: None,
+        });
+        let command_result = engine.process(&command);
+        if generation.is_some() {
+            assert_eq!(command_result.alerts.len(), 1);
+            assert_eq!(command_result.alerts[0].rule, AlertRule::ArchiveCommand);
+            assert_eq!(command_result.alerts[0].roots, vec![root.clone()]);
+        } else {
+            assert!(command_result.alerts.is_empty());
+        }
+        let mut second = read_event(root.join("second.rs"), 1_020, 1_020, 30, generation);
+        second.source_stream = SourceStream::Activity;
+        let second_result = engine.process(&second);
+        assert_eq!(second_result.alerts.len(), 1);
+        assert_eq!(second_result.alerts[0].rule, AlertRule::BulkFileAccess);
+        assert_eq!(second_result.alerts[0].unique_files, 2);
+        let mut exit = event(EventKind::Exit, None, Some(1_030), 1_030, 30, generation);
+        exit.source_stream = SourceStream::Activity;
+        engine.process(&exit);
+        let mut third = read_event(root.join("third.rs"), 1_040, 1_040, 30, generation);
+        third.source_stream = SourceStream::Activity;
+        assert!(engine.process(&third).alerts.is_empty());
+    }
+}
+
 fn protected_root(temp: &TempDir, name: &str) -> PathBuf {
     let path = temp.path().join(name);
     std::fs::create_dir_all(&path).expect("合成保护目录创建成功");
@@ -61,6 +124,7 @@ fn event(
 ) -> ActivityEvent {
     ActivityEvent {
         source_run_id: "synthetic-run".into(),
+        source_stream: SourceStream::Combined,
         source_schema_version: Some(1),
         source_message_version: Some(9),
         source_timestamp_ms: timestamp_ms,
@@ -700,6 +764,61 @@ fn sqlite_directory_event_alert_notification_and_retention_apis_are_atomic() {
 }
 
 #[test]
+fn sqlite_partitioned_sequences_are_distinct_and_combined_accepts_legacy_rows() {
+    let temp = fixture();
+    let database = temp.path().join("partitioned.sqlite");
+    let mut storage = Storage::open(&database).unwrap();
+    let mut legacy = event(EventKind::Exec, None, Some(100), 100, 60, Some(2));
+    legacy.global_seq = Some(7);
+    assert!(storage.record_event(&legacy, &[]).unwrap());
+    drop(storage);
+    // 模拟既有 schema 3 的 Combined 行；旧格式没有来源流字段。
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE events SET sequence_key='g:7', event_json=json_remove(event_json,'$.source_stream')",
+            [],
+        )
+        .unwrap();
+    let mut storage = Storage::open(&database).unwrap();
+    assert!(!storage.record_event(&legacy, &[]).unwrap());
+    let mut command = legacy.clone();
+    command.source_stream = SourceStream::Exec;
+    assert!(storage.record_event(&command, &[]).unwrap());
+    assert!(!storage.record_event(&command, &[]).unwrap());
+    let mut activity = legacy.clone();
+    activity.kind = EventKind::Exit;
+    activity.source_stream = SourceStream::Activity;
+    assert!(storage.record_event(&activity, &[]).unwrap());
+    assert!(!storage.record_event(&activity, &[]).unwrap());
+    assert_eq!(storage.schema_version().unwrap(), 3);
+    let rows = storage.query_events(&EventFilter::default()).unwrap();
+    assert_eq!(rows.len(), 3);
+    for source_stream in [
+        SourceStream::Combined,
+        SourceStream::Exec,
+        SourceStream::Activity,
+    ] {
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.event.source_stream == source_stream)
+                .count(),
+            1
+        );
+    }
+    let mut fallback = event(EventKind::Open, None, Some(101), 101, 60, Some(2));
+    fallback.event_seq = Some(9);
+    assert!(storage.record_event(&fallback, &[]).unwrap());
+    fallback.source_stream = SourceStream::Activity;
+    assert!(storage.record_event(&fallback, &[]).unwrap());
+    assert!(!storage.record_event(&fallback, &[]).unwrap());
+    assert_eq!(
+        storage.query_events(&EventFilter::default()).unwrap().len(),
+        5
+    );
+}
+
+#[test]
 fn sqlite_write_failures_are_returned_without_incrementing_partial_statistics() {
     let temp = fixture();
     let root = protected_root(&temp, "project");
@@ -1093,6 +1212,7 @@ fn schema_v2_migration_preserves_legacy_rows_statistics_and_new_source_context()
     assert_eq!(migrated.cumulative_stats().unwrap(), stats);
     let source = SourceContext {
         run_id: "anonymous-run".into(),
+        source_stream: SourceStream::Combined,
         schema_version: Some(1),
         message_version: Some(9),
         field: Some("global_seq_num".into()),

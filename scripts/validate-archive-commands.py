@@ -92,6 +92,7 @@ FAILURE_CODES = {
     "python_version_unsupported",
     "source_latency_exec_pair_missing", "source_latency_timestamp_missing",
     "source_latency_source_time_mismatch", "source_latency_execution_window_mismatch",
+    "main_exec_receipt_missing",
 }
 
 
@@ -1237,6 +1238,61 @@ def matching_sidecar_alerts(case, evidence, source_run_id, sidecar_exec):
             and project_root in {MVP.canonical_path(root) for root in alert.get("roots", [])}]
 
 
+def exact_main_exec_receipt(receipt, source_run_id, pid, pid_version):
+    return (isinstance(receipt, dict) and receipt.get("run_id") == source_run_id
+            and type(receipt.get("pid")) is int and receipt["pid"] == pid
+            and type(receipt.get("pid_version")) is int and receipt["pid_version"] == pid_version
+            and receipt.get("source_stream") in ("combined", "exec"))
+
+
+def matching_stdin_gaps(evidence, source_run_id, pid, pid_version, stream):
+    return [row for row in evidence["health"]
+            if row.get("component") == "eslogger"
+            and row.get("code") == "archive_input_source_unknown"
+            and (row.get("source") or {}).get("run_id") == source_run_id
+            and type((row.get("source") or {}).get("pid")) is int
+            and row["source"]["pid"] == pid
+            and type((row.get("source") or {}).get("pid_version")) is int
+            and row["source"]["pid_version"] == pid_version
+            and MVP.source_stream(row.get("source")) == stream
+            and type((row.get("source") or {}).get("global_seq")) is int
+            and row["source"]["global_seq"] >= 0]
+
+
+def wait_for_negative_main_evidence(case, execution, database, source_run_id, control_socket,
+                                    timeout=REAL_CASE_TIMEOUT_SECONDS):
+    execution["main_exec_processed_before_fence"] = False
+    execution["source_unknown_gap_before_fence"] = False
+    execs = execution.get("sidecar_execs") or (execution.get("sidecar") or {}).get("execs") or []
+    if len(execs) != 1 or not control_socket:
+        return "main_exec_receipt_missing"
+    pid, pid_version = execs[0].get("target_pid"), execs[0].get("target_pid_version")
+    if type(pid) is not int or type(pid_version) is not int:
+        return "main_exec_receipt_missing"
+    deadline = time.monotonic() + timeout
+    failure = "main_exec_receipt_missing"
+    while time.monotonic() < deadline:
+        try:
+            receipt = MVP.control(control_socket, "exec_receipt", {
+                "run_id": source_run_id, "pid": pid, "pid_version": pid_version,
+            })
+            if exact_main_exec_receipt(receipt, source_run_id, pid, pid_version):
+                execution["main_exec_receipt"] = {name: receipt[name] for name in (
+                    "run_id", "pid", "pid_version",
+                )} | {"source_stream": MVP.source_stream(receipt)}
+                failure = "stdin_source_gap_missing" if case.mode == "stdin" else None
+                if case.mode != "stdin" or matching_stdin_gaps(
+                    MVP.load_evidence(database), source_run_id, pid, pid_version, MVP.source_stream(receipt)
+                ):
+                    execution["main_exec_processed_before_fence"] = True
+                    execution["source_unknown_gap_before_fence"] = case.mode == "stdin"
+                    return None
+        except (OSError, ValueError, RuntimeError, sqlite3.Error):
+            pass
+        time.sleep(0.05)
+    return failure
+
+
 def analyze_negative(case, execution, evidence, source_run_id, barrier, healthy):
     result = {"passed": False, "failure_code": None, "evidence_event_count": 0,
               "archive_exec_count": 0, "archive_command_alert_count": 0,
@@ -1271,7 +1327,7 @@ def analyze_negative(case, execution, evidence, source_run_id, barrier, healthy)
     target_pid = sidecar_exec.get("target_pid")
     target_version = sidecar_exec.get("target_pid_version")
     actual_tool = sidecar_exec.get("executable")
-    if (not isinstance(target_pid, int) or not isinstance(target_version, int)
+    if (type(target_pid) is not int or type(target_version) is not int
             or not isinstance(actual_tool, str)):
         result["failure_code"] = "sidecar_exec_identity_missing"
         return result
@@ -1282,6 +1338,11 @@ def analyze_negative(case, execution, evidence, source_run_id, barrier, healthy)
         return result
     if actual_tool not in expected_tool_names(case.tool):
         result["failure_code"] = "sidecar_exec_identity_missing"
+        return result
+    receipt = execution.get("main_exec_receipt")
+    if (execution.get("main_exec_processed_before_fence") is not True
+            or not exact_main_exec_receipt(receipt, source_run_id, target_pid, target_version)):
+        result["failure_code"] = "main_exec_receipt_missing"
         return result
     result["actual_executable"] = actual_tool
     result["archive_exec_count"] = 1
@@ -1308,21 +1369,19 @@ def analyze_negative(case, execution, evidence, source_run_id, barrier, healthy)
     if barrier.get("pid") in execution["pids"] or barrier.get("pid") in sidecar_pids or fence_key in target_keys:
         result["failure_code"] = "negative_fence_not_independent"
         return result
-    if not barrier.get("crossed"):
+    if (not barrier.get("crossed")
+            or (MVP.source_stream(receipt), MVP.source_stream(barrier)) not in (
+                ("combined", "combined"), ("exec", "activity"),
+            )):
         result["failure_code"] = "negative_fence_missing"
         return result
     if case.mode == "stdin":
-        fence_seq = barrier.get("global_seq")
-        gaps = [row for row in evidence["health"]
-                if row.get("component") == "eslogger"
-                and row.get("code") == "archive_input_source_unknown"
-                and (row.get("source") or {}).get("run_id") == source_run_id
-                and (row.get("source") or {}).get("pid") == target_pid
-                and (row.get("source") or {}).get("pid_version") == target_version
-                and isinstance((row.get("source") or {}).get("global_seq"), int)
-                and isinstance(fence_seq, int)
-                and 0 <= row["source"]["global_seq"] < fence_seq]
-        if not gaps:
+        stream = MVP.source_stream(receipt)
+        gaps = matching_stdin_gaps(evidence, source_run_id, target_pid, target_version, stream)
+        if stream == "combined" and MVP.source_stream(barrier) == "combined":
+            fence_seq = barrier.get("global_seq")
+            gaps = [row for row in gaps if type(fence_seq) is int and row["source"]["global_seq"] < fence_seq]
+        if not gaps or execution.get("source_unknown_gap_before_fence") is not True:
             result["failure_code"] = "stdin_source_gap_missing"
             return result
         result["source_unknown_gap_count"] = len(gaps)
@@ -1341,6 +1400,8 @@ def healthy_status(status, evidence):
         return False, "collector_dropped_events", {}
     if status.get("database_gap_events", 0):
         return False, "database_gap", {}
+    if not MVP.collector_streams_healthy(status):
+        return False, "collector_unhealthy", {}
     issue_rows = [row for row in evidence["health"] if row.get("state") in (
         "degraded", "gap", "failed", "error", "permission_denied", "coverage_gap",
     )]
@@ -1412,20 +1473,21 @@ def run_fence(script, path, database, source_run_id, timeout=8):
                     and event.get("kind") in ("open", "mmap")
                     and file.get("readable") is True and not file.get("path_truncated")
                     and MVP.canonical_path(file.get("path")) == expected
+                    and MVP.source_stream(event) in ("combined", "activity")
                     and event.get("global_seq") is not None):
                 return {"pid": metadata["pid"], "pid_version": identity["pid_version"],
+                        "source_stream": MVP.source_stream(event),
                         "global_seq": event["global_seq"], "crossed": True}
         time.sleep(0.05)
     return {"pid": metadata.get("pid"), "pid_version": None, "crossed": False}
 
 
-def process_case(case, binary, database, source_run_id, script, sidecar=None, observe_positive=False):
+def process_case(case, binary, database, source_run_id, script, sidecar=None, observe_positive=False,
+                 control_socket=None):
     negative = is_negative(case.mode)
     if case.preparation_failure:
         execution = {"return_code": None, "pids": set(), "duration_ms": None,
                      "stdout_bytes": 0, "failure_code": case.preparation_failure}
-        if negative:
-            return execution, run_fence(script, case.fence_path, database, source_run_id)
         return execution, None
     if case.mode == "update" and not case.outputs[0].is_file():
         return {"return_code": None, "pids": set(), "duration_ms": None, "stdout_bytes": 0,
@@ -1436,10 +1498,15 @@ def process_case(case, binary, database, source_run_id, script, sidecar=None, ob
     execution = execute(binary, case.argv, case.cwd, capture_stdout=case.stdout_expected,
                         observer=observer, stdin_payload=case.stdin_payload)
     if execution["failure_code"]:
-        barrier = run_fence(script, case.fence_path, database, source_run_id) if negative else None
-        return execution, barrier
+        return execution, None
     validate_operation(case, execution)
     if negative:
+        if not execution.get("operation_verified"):
+            return execution, None
+        failure = wait_for_negative_main_evidence(case, execution, database, source_run_id, control_socket)
+        if failure:
+            execution["failure_code"] = failure
+            return execution, None
         barrier = run_fence(script, case.fence_path, database, source_run_id)
         return execution, barrier
     return execution, None
@@ -1478,6 +1545,8 @@ def case_summary(case, execution, result, version):
         "archive_exec_count": result.get("archive_exec_count", 0),
         "sidecar_exec_count": result.get("sidecar_exec_count", 0),
         "source_unknown_gap_count": result.get("source_unknown_gap_count", 0),
+        "main_exec_processed_before_fence": execution.get("main_exec_processed_before_fence") is True,
+        "source_unknown_gap_before_fence": execution.get("source_unknown_gap_before_fence") is True,
         "archive_command_alert_count": result.get("archive_command_alert_count", 0),
         "notification_feedback_count": result.get("notification_feedback_count", 0),
         "generation_latency_ms": result.get("generation_latency_ms"),
@@ -1644,9 +1713,11 @@ def real_validation(args, report, tools, version_rows):
         )
         bridge = MVP.wait_for_bridge(control_socket, root_process, collector, {})
         source_status = MVP.control(control_socket, "status")
+        source_versions = MVP.collector_stream_versions(source_status)
         summary["collector_protocol"] = {
-            "schema_version": source_status.get("collector_schema_version"),
-            "message_version": source_status.get("collector_message_version"),
+            "schema_version": source_versions[0] if source_versions else None,
+            "message_version": source_versions[1] if source_versions else None,
+            "collector_streams": MVP.collector_streams_snapshot(source_status),
         }
         source_run_id = source_status.get("collector_run_id")
         if not source_run_id:
@@ -1674,7 +1745,7 @@ def real_validation(args, report, tools, version_rows):
                 continue
             execution, barrier = process_case(case, tools[tool], database, source_run_id,
                                               Path(__file__).resolve(), sidecar=sidecar,
-                                              observe_positive=diagnostic)
+                                              observe_positive=diagnostic, control_socket=control_socket)
             deadline = time.monotonic() + REAL_CASE_TIMEOUT_SECONDS
             result = {"passed": False, "failure_code": None, "evidence_event_count": 0,
                       "archive_exec_count": 0, "archive_command_alert_count": 0,
@@ -1730,6 +1801,7 @@ def real_validation(args, report, tools, version_rows):
         serialized_evidence = json.dumps(final_evidence, ensure_ascii=False, sort_keys=True)
         privacy_ok = CONTENT_SENTINEL.decode("ascii") not in serialized_evidence and PASSWORD_SENTINEL not in serialized_evidence
         summary["collector_health"] = {
+            "collector_streams": MVP.collector_streams_snapshot(final_status),
             "pipeline_timing": numeric_pipeline_timing(final_status),
             "database_state": final_status.get("database_state"),
             "collector_state": final_status.get("collector_state"),

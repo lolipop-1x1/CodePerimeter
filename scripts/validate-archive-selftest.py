@@ -86,6 +86,19 @@ def sidecar_exec(pid=PID, pid_version=PID_VERSION, executable="zip", related_pid
     }
 
 
+def main_exec_receipt(stream="combined"):
+    return {"run_id": SOURCE_RUN, "pid": PID, "pid_version": PID_VERSION,
+            "source_stream": stream}
+
+
+def source_health(stream="combined"):
+    return {stream: {"lines": 1, "parsed_events": 1, "skipped_lines": 0,
+                     "lines_with_issues": 0, "last_received_timestamp_ms": 1005,
+                     "schema_version": 1, "message_version": 9,
+                     "global_sequence_available": True, "event_sequence_available": True,
+                     "sequence_gaps": 0}}
+
+
 def positive_case(tool="zip", mode="create", input_path=INPUT, output_path=OUTPUT):
     return VALIDATOR.Case(
         tool=tool,
@@ -150,8 +163,11 @@ def unrelated_fixture():
     execution = {
         "pids": {PID},
         "return_code": 0,
+        "failure_code": None,
         "operation_verified": True,
         "sidecar_execs": [sidecar_exec()],
+        "main_exec_receipt": main_exec_receipt(),
+        "main_exec_processed_before_fence": True,
     }
     barrier = {"pid": 41002, "pid_version": 2, "crossed": True}
     return case, execution, evidence, barrier
@@ -174,14 +190,139 @@ def reverse_fixture():
     execution = {
         "pids": {PID},
         "return_code": 0,
+        "failure_code": None,
         "operation_verified": True,
         "sidecar_execs": [sidecar_exec()],
+        "main_exec_receipt": main_exec_receipt(),
+        "main_exec_processed_before_fence": True,
     }
     barrier = {"pid": 41002, "pid_version": 2, "crossed": True}
     return case, execution, evidence, barrier
 
 
 class ArchiveValidationSelfTest(unittest.TestCase):
+    def test_negative_requires_exact_main_exec_receipt_before_the_file_fence(self):
+        case, execution, evidence, barrier = unrelated_fixture()
+        for field, value in (("main_exec_receipt", None),
+                             ("main_exec_processed_before_fence", False),
+                             ("main_exec_processed_before_fence", "SYNTHETIC_PRIVATE_MARKER")):
+            wrong = dict(execution, **{field: value})
+            result = VALIDATOR.analyze_negative(case, wrong, evidence, SOURCE_RUN, barrier, True)
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["failure_code"], "main_exec_receipt_missing")
+        for field, value in (("run_id", "synthetic-other-run"), ("pid", PID + 1),
+                             ("pid_version", PID_VERSION + 1), ("source_stream", "activity"),
+                             ("source_stream", None), ("pid", True), ("pid_version", True)):
+            wrong = copy.deepcopy(execution)
+            wrong["main_exec_receipt"][field] = value
+            self.assertEqual(VALIDATOR.analyze_negative(
+                case, wrong, evidence, SOURCE_RUN, barrier, True
+            )["failure_code"], "main_exec_receipt_missing")
+        missing_stream = copy.deepcopy(execution)
+        missing_stream["main_exec_receipt"].pop("source_stream")
+        self.assertEqual(VALIDATOR.analyze_negative(
+            case, missing_stream, evidence, SOURCE_RUN, barrier, True
+        )["failure_code"], "main_exec_receipt_missing")
+
+    def test_split_stdin_requires_a_persisted_gap_confirmed_before_the_activity_fence(self):
+        case, execution, evidence, barrier = unrelated_fixture()
+        case.mode = "stdin"
+        execution.update(main_exec_receipt=main_exec_receipt("exec"),
+                         source_unknown_gap_before_fence=True)
+        barrier.update(source_stream="activity", global_seq=1)
+        gap = {"component": "eslogger", "code": "archive_input_source_unknown", "source": {
+            "run_id": SOURCE_RUN, "pid": PID, "pid_version": PID_VERSION,
+            "source_stream": "exec", "global_seq": 200,
+        }}
+        evidence["health"] = [gap]
+        result = VALIDATOR.analyze_negative(case, execution, evidence, SOURCE_RUN, barrier, True)
+        self.assertTrue(result["passed"], "不同客户端的序号不构成先后比较")
+        self.assertEqual(result["source_unknown_gap_count"], 1)
+        wrong_stream = dict(barrier, source_stream="exec")
+        self.assertEqual(VALIDATOR.analyze_negative(
+            case, execution, evidence, SOURCE_RUN, wrong_stream, True
+        )["failure_code"], "negative_fence_missing")
+        no_confirmation = dict(execution, source_unknown_gap_before_fence=False)
+        self.assertEqual(VALIDATOR.analyze_negative(
+            case, no_confirmation, evidence, SOURCE_RUN, barrier, True
+        )["failure_code"], "stdin_source_gap_missing")
+        for field, value in (("run_id", "synthetic-other-run"), ("pid", PID + 1),
+                             ("pid_version", PID_VERSION + 1), ("source_stream", "activity"),
+                             ("global_seq", None)):
+            wrong = copy.deepcopy(evidence)
+            wrong["health"][0]["source"][field] = value
+            self.assertEqual(VALIDATOR.analyze_negative(
+                case, execution, wrong, SOURCE_RUN, barrier, True
+            )["failure_code"], "stdin_source_gap_missing")
+
+    def test_negative_waits_for_main_receipt_and_stdin_persistence_before_starting_the_fence(self):
+        case, execution, evidence, barrier = unrelated_fixture()
+        case.mode = "stdin"
+        execution.pop("main_exec_receipt")
+        execution.pop("main_exec_processed_before_fence")
+        receipt = main_exec_receipt("exec")
+        gap = {"component": "eslogger", "code": "archive_input_source_unknown", "source": {
+            **receipt, "global_seq": 200,
+        }}
+        calls = []
+
+        def request(_socket, operation, payload):
+            calls.append("receipt")
+            self.assertEqual(operation, "exec_receipt")
+            self.assertEqual(payload, {"run_id": SOURCE_RUN, "pid": PID, "pid_version": PID_VERSION})
+            return None if len(calls) == 1 else receipt
+
+        def fence(*_):
+            calls.append("fence")
+            self.assertIs(execution["main_exec_processed_before_fence"], True)
+            self.assertIs(execution["source_unknown_gap_before_fence"], True)
+            return barrier
+
+        with mock.patch.object(VALIDATOR, "execute", return_value=execution), \
+                mock.patch.object(VALIDATOR, "validate_operation"), \
+                mock.patch.object(VALIDATOR.MVP, "control", side_effect=request), \
+                mock.patch.object(VALIDATOR.MVP, "load_evidence", side_effect=[
+                    evidence, dict(evidence, health=[gap]),
+                ]), \
+                mock.patch.object(VALIDATOR.time, "sleep"), \
+                mock.patch.object(VALIDATOR, "run_fence", side_effect=fence):
+            actual, actual_barrier = VALIDATOR.process_case(
+                case, Path("/usr/bin/zip"), Path("/anonymous.sqlite"), SOURCE_RUN, SCRIPT_PATH,
+                control_socket=Path("/anonymous.sock"),
+            )
+        self.assertIs(actual, execution)
+        self.assertIs(actual_barrier, barrier)
+        self.assertEqual(calls, ["receipt", "receipt", "receipt", "fence"])
+        summary = VALIDATOR.case_summary(case, execution, {"passed": True}, "1.0")
+        self.assertTrue(summary["main_exec_processed_before_fence"])
+        self.assertTrue(summary["source_unknown_gap_before_fence"])
+        self.assertNotIn("main_exec_receipt", summary)
+        self.assertNotIn(SOURCE_RUN, json.dumps(summary))
+
+    def test_missing_main_receipt_never_runs_a_file_fence_or_echoes_control_errors(self):
+        case, execution, _, _ = unrelated_fixture()
+        execution.pop("main_exec_receipt")
+        execution.pop("main_exec_processed_before_fence")
+        with mock.patch.object(VALIDATOR.MVP, "control",
+                               side_effect=RuntimeError("SYNTHETIC_PRIVATE_MARKER")), \
+                mock.patch.object(VALIDATOR.time, "monotonic", side_effect=[0, 0, 9]), \
+                mock.patch.object(VALIDATOR.time, "sleep"):
+            failure = VALIDATOR.wait_for_negative_main_evidence(
+                case, execution, Path("/anonymous.sqlite"), SOURCE_RUN, Path("/anonymous.sock")
+            )
+        self.assertEqual(failure, "main_exec_receipt_missing")
+        self.assertNotIn("SYNTHETIC_PRIVATE_MARKER", json.dumps(execution, default=list))
+        with mock.patch.object(VALIDATOR, "execute", return_value=execution), \
+                mock.patch.object(VALIDATOR, "validate_operation"), \
+                mock.patch.object(VALIDATOR, "wait_for_negative_main_evidence", return_value=failure), \
+                mock.patch.object(VALIDATOR, "run_fence") as fence:
+            _, barrier = VALIDATOR.process_case(
+                case, Path("/usr/bin/zip"), None, SOURCE_RUN, SCRIPT_PATH,
+                control_socket=Path("/anonymous.sock"),
+            )
+        self.assertIsNone(barrier)
+        fence.assert_not_called()
+
     def test_source_latency_utc_parser_keeps_nine_digit_precision_and_rejects_unknown_time(self):
         self.assertEqual(VALIDATOR.parse_utc_timestamp_ns("1970-01-01T00:00:01.123456789Z"),
                          1_123_456_789)
@@ -799,6 +940,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
         case.mode = "stdin"
         case.cwd = PROJECT
         case.inputs = ()
+        execution["source_unknown_gap_before_fence"] = True
         barrier["global_seq"] = 21
         gap = {"component": "eslogger", "code": "archive_input_source_unknown", "source": {
             "run_id": SOURCE_RUN, "pid": PID, "pid_version": PID_VERSION, "global_seq": 20,
@@ -1139,6 +1281,9 @@ class ArchiveValidationSelfTest(unittest.TestCase):
             "collector_dropped_lines": 0,
             "reader_dropped_frames": 0,
             "database_gap_events": 0,
+            "collector_streams": source_health(),
+            "collector_schema_version": 1,
+            "collector_message_version": 9,
         }
         evidence = {"health": [{
             "component": "eslogger",

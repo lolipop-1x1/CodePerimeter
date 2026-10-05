@@ -1,6 +1,8 @@
 //! eslogger schema 1 的窄适配器。原始行和参数只在本次解析期间存在。
 
-use crate::model::{ActivityEvent, ArchiveCommand, EventKind, FileEvidence, ProcessIdentity};
+use crate::model::{
+    ActivityEvent, ArchiveCommand, EventKind, FileEvidence, ProcessIdentity, SourceStream,
+};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,7 +33,7 @@ pub struct ParseOutcome {
     pub event_seq: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdapterHealth {
     pub lines: u64,
     pub parsed_events: u64,
@@ -47,6 +49,7 @@ pub struct AdapterHealth {
 
 pub struct EsloggerAdapter {
     source_run_id: String,
+    source_stream: SourceStream,
     global_seq: Option<u64>,
     event_seq: HashMap<u64, u64>,
     health: AdapterHealth,
@@ -55,8 +58,13 @@ pub struct EsloggerAdapter {
 impl EsloggerAdapter {
     /// 采集器重启必须创建新适配器和新的 source_run_id。
     pub fn new(source_run_id: impl Into<String>) -> Self {
+        Self::new_with_stream(source_run_id, SourceStream::Combined)
+    }
+
+    pub fn new_with_stream(source_run_id: impl Into<String>, source_stream: SourceStream) -> Self {
         Self {
             source_run_id: source_run_id.into(),
+            source_stream,
             global_seq: None,
             event_seq: HashMap::new(),
             health: AdapterHealth::default(),
@@ -87,6 +95,24 @@ impl EsloggerAdapter {
             }
             self.health.global_sequence_available = outcome.global_seq.is_some();
             self.health.event_sequence_available = outcome.event_seq.is_some();
+        }
+        if let Some((_, kind)) = outcome.event_type.and_then(event_kind) {
+            let subscribed = match self.source_stream {
+                SourceStream::Combined => true,
+                SourceStream::Exec => kind == EventKind::Exec,
+                SourceStream::Activity => kind != EventKind::Exec,
+            };
+            if !subscribed {
+                outcome.issues.push(issue(
+                    "source_stream_event_mismatch",
+                    "event_type",
+                    "已知事件与来源流订阅不符，已跳过；监控覆盖存在缺口",
+                ));
+                outcome.event = None;
+            }
+        }
+        if let Some(event) = &mut outcome.event {
+            event.source_stream = self.source_stream;
         }
         self.health.lines += 1;
         self.health.parsed_events += u64::from(outcome.event.is_some());
@@ -313,6 +339,7 @@ pub fn parse_line(line: &str, source_run_id: &str, received_timestamp_ms: i64) -
     };
     outcome.event = Some(ActivityEvent {
         source_run_id: source_run_id.into(),
+        source_stream: SourceStream::Combined,
         source_schema_version: outcome.schema_version,
         source_message_version: outcome.message_version,
         source_timestamp_ms,
