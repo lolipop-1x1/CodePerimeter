@@ -19,7 +19,7 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 
 ## Answer
 
-实现与历次补修的双轴独立复核已完成，PR保持可审查。最新持久入口真实运行cadc已完成全部操作、16场景证据全部通过、22告警全部sent，九类系统计数／受控断流／清理成立，已知本地drop／SQLite gap／degraded为0；最大生成9235ms／发送9620ms仍超过3000ms，因此整体仍失败或部分通过。匿名普通组件已三轮确认Darwin接收连接继承非阻塞模式，导致5ms写重试累积；已补修两处accept后的连接模式并通过独立两轴审查，不把组件吞吐结论扩展为系统时效通过。06保持claimed；新head远端CI以PR回读为准。桌面／后台／长期性能与旧worktree保护边界保持。
+实现与历次补修的双轴独立复核已完成，PR保持可审查。2026-10-05新版c8a7真实运行1f56通过核心观察验收：16场景证据全部通过、22告警全部sent，生成max2255ms／p95 2233ms、发送max2541ms／p95 2454ms，全部在3000ms内；来源屏障、九类系统计数、受控断流与清理通过，已知drop／SQLite gap／degraded均0。06仍claimed：通知实际到屏、独立后台FDA、开机／注销登录／补发、持续性能与阈值校准待验；旧worktree固定保护边界保持。
 
 - `tests/end_to_end.rs` 运行真实 CLI→普通用户 daemon→SQLite：手动目录、匿名 Codex／Claude 元信息合并、预览后新增历史不扩大范围、同库重启回查／移除；独立用例验证普通用户启动 collector 被拒绝。采集源刻意不可用，不冒充 ES。
 - `scripts/validate-prepare-collector.py --binary target/release/codeperimeter` 只在用户终端显式 `sudo -v` 后准备 root-owned `/Library/CodePerimeter/<uid>/codeperimeter`，检查 root 父路径、写 ACL、来源权限和复制 SHA256，默认拒绝已有目标；仅无launchd安装的验收副本可明确旧hash安全替换，root发布时重查完整路径／ACL、旧新hash与无活动端点／进程／plist／loaded jobs；不创建 job、不改 FDA。
@@ -108,3 +108,14 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 接收连接最小补修 `6ff3f6a1a956c4ae3b0cb76a2e1ed3070f24c397`（tree `38fd4b2e6456a27f113fb455ddb5115e7883e858`）：仅src/service.rs，两处accept经peer验证后统一显式set_nonblocking(false)，保留250ms写超时和非阻塞listener；原写偏移／取消／5ms超时重试与32／64容量不改。确定性旧策略回归O_NONBLOCK=4／期望0，exit101；修后lib＋service_collector＋runtime_host共34通过／1信号helper由监督用例调用，真实accept下512KiB半写完整，取消保持生产250ms超时；fmt／严格all-target clippy／diff通过。Standards静态hard0／heuristic0；Spec缺失0／scope creep0／可证缺陷0，独立普通accept／半写取消2项通过，0.35秒；真实3秒未因此关闭。merger快进并核对HEAD／tree相同，原两份文档hash不变。
 
 主agent以Rust1.88.0及锁定依赖正常offline release构建成功，普通工作区复制并核对SHA256 `c8a7cd2ce0a4a50a96cbbf6b798f2bba6c6524301c379c0f927ba9f9d2725e0b`；受保护副本仍 `ecbd09284b9d404fe2cdb486f9e1a666e5a01da5e24483c534431548744cee06`，未替换／启动root。持久私有封装已更新明确新旧hash，sh语法／Python AST／0700权限／Git忽略及构建hash一致通过，CLI版本与三角色plan回读通过；未执行install、修改FDA、注销或重启。当前源码与组件审查完成，新head远端CI以PR回读为准；新构建真实3000ms、到屏、后台生命周期与持续性能仍待，06保持claimed。
+
+
+## Comments
+
+2026-10-05 新版真实 `run-1f5632ebd9c344f1b5f324222a84a0a5`：用户终端已将无launchd验收副本从ecbd替换为 `c8a7cd2ce0a4a50a96cbbf6b798f2bba6c6524301c379c0f927ba9f9d2725e0b`，本轮普通构建与受保护副本hash一致，未安装launchd或更改FDA。macOS15.6.1／Python3.12.12／eslogger schema1/message9，b08dcfe脚本，real_source_confirmed=true、root桥接身份verified。7.189秒窗口，16场景全部通过，包括可读OPEN、MMAP、批量读取、tar／zip项目内及临时输出、同进程落盘／内存归档访问、预加载内存对照与正常搜索／索引／构建。最终系统观察50807事件、筛选保存2585项目事件；九类为系统观察计数，不声称全部九类项目事件落库。
+
+22条告警来源触发→首次生成max2255ms／p95 2233ms；来源→sent反馈max2541ms／p95 2454ms，两项sample22／missing0，全部0–3000ms。来源完成屏障与全部预期证据、通知排空、受控collector断流、root退出清理通过；collector／reader drop、SQLite gap、degraded均0。相较前一cadc生成max9235ms／发送9620ms，本轮实际达到目标；两次全系统输入与负载不同，不当作严格配对性能A/B。原失败记录保留。
+
+管线样本45114行／95762957字节、Line写帧701968us（max2446us）、source send546761us（max140809us），宿主50816帧handle_frame累计2638115us（max2162us）；跨线程墙钟重叠，不相加。全事件来源到collector完整读行max3006ms，3秒通过门针对规则触发→告警／sent，并不保证所有系统事件均小于3秒。性能9样本聚合RSS峰值297024KiB、ps累计平均CPU百分比求和峰值205.7，无独立基线，持续开销／误报校准仍未完成。sent仅表示命令接受，到屏、launchd独立FDA、注销／补发／重启／未登录与FileVault解锁前仍待验；06保持claimed。源码／脚本／3000ms门禁未调整，仅更新验收证据。
+
+独立只读复核：standard-evidence的22条Alert／outbox／NotificationRecord与timing逐条对齐，原始时间戳重算generation p95／max2233／2255ms、send2454／2541ms，missing与负值均0；schema3、4条健康记录及drop／gap／degraded一致，裁决与summary相符。复核笔记保存在本轮私有报告independent-check.md，未运行额外系统采集。

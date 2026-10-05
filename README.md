@@ -6,7 +6,7 @@ macOS 本机项目文件活动观察工具。当前 MVP 用 Rust CLI 配置多�
 
 ## 当前状态
 
-CLI、窄事件适配、规则、SQLite、历史目录发现、权限分离和 launchd 管理已实现。组件测试和匿名用户流程通过；已有系统 eslogger 的真实字段探针。完整 Rust 采集链路、3 秒目标、桌面通知到屏、后台 FDA、注销和重启仍需按 [MVP 验收](docs/validation/activity-monitor-mvp.md) 实测，不能用测试或配置文件代替。
+CLI、窄事件适配、规则、SQLite、历史目录发现、权限分离和 launchd 管理已实现。2026-10-05 在 macOS 15.6.1 完成真实 eslogger → Rust → SQLite／通知发送验收：16 个合成场景全部通过，22 条告警生成与通知发送均在 3 秒内，最大分别为 2.255 秒和 2.541 秒，本轮已知丢弃及保存缺口为 0。桌面通知到屏、后台 FDA、注销／登录补发、重启和持续性能仍待按 [MVP 验收](docs/validation/activity-monitor-mvp.md) 单独验证；sent 回执不代表到屏，短时通过不保证长期覆盖。
 
 系统采集使用 macOS 自带 `/usr/bin/eslogger`，需要管理员权限与责任进程的完全磁盘访问。root 仅运行采集／转发；分析、SQLite 和通知使用普通用户。原始全系统 JSON、完整命令行、环境变量和文件正文不落盘。当前订阅 NOTIFY 事件，支持本机观察，不提供压缩或网络拦截。
 
