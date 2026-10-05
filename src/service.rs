@@ -496,6 +496,12 @@ fn produce_stderr(
     })
 }
 
+fn configure_collector_stream(stream: &UnixStream) -> io::Result<()> {
+    // macOS accept 会继承非阻塞标志；让背压等待由写超时控制。
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(Duration::from_millis(250)))
+}
+
 fn write_frame_cancellable(
     stream: &mut UnixStream,
     frame: &CollectorFrame,
@@ -644,7 +650,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 if verify_peer_uid(&stream, options.allowed_uid).is_ok() && client.is_none() {
-                    stream.set_write_timeout(Some(Duration::from_millis(250)))?;
+                    configure_collector_stream(&stream)?;
                     let frame = CollectorFrame::Status {
                         run_id: run_id.clone(),
                         state: "connected".into(),
@@ -763,7 +769,7 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
         }
         if let Ok((mut stream, _)) = listener.accept() {
             if verify_peer_uid(&stream, options.allowed_uid).is_ok() {
-                stream.set_write_timeout(Some(Duration::from_millis(250)))?;
+                configure_collector_stream(&stream)?;
                 if let Some((state, message)) = last_diagnostic {
                     let _ = write_frame_cancellable(
                         &mut stream,
@@ -1494,13 +1500,50 @@ mod tests {
     }
 
     #[test]
+    fn accepted_collector_stream_is_blocking_and_keeps_the_write_timeout() {
+        let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+        let listener = UnixListener::bind(directory.path().join("c.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _client = UnixStream::connect(directory.path().join("c.sock")).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        verify_peer_uid(&stream, unsafe { libc::geteuid() }).unwrap();
+        let accepted_flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(accepted_flags >= 0);
+        #[cfg(target_os = "macos")]
+        assert_ne!(accepted_flags & libc::O_NONBLOCK, 0);
+
+        configure_collector_stream(&stream).unwrap();
+
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, 0, "采集连接不能继承非阻塞标志");
+        assert_eq!(
+            stream.write_timeout().unwrap(),
+            Some(Duration::from_millis(250))
+        );
+        let listener_flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) };
+        assert!(listener_flags >= 0);
+        assert_ne!(listener_flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
     fn partial_writes_survive_congestion_and_stop_releases_a_blocked_writer() {
+        let connection = || {
+            let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+            let listener = UnixListener::bind(directory.path().join("c.sock")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let reader = UnixStream::connect(directory.path().join("c.sock")).unwrap();
+            let (writer, _) = listener.accept().unwrap();
+            verify_peer_uid(&writer, unsafe { libc::geteuid() }).unwrap();
+            configure_collector_stream(&writer).unwrap();
+            (writer, reader)
+        };
         let frame = CollectorFrame::Line {
             run_id: "anonymous-run".into(),
             line: "x".repeat(512 * 1024),
             received_timestamp_ms: 100,
         };
-        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let (mut writer, mut reader) = connection();
         writer
             .set_write_timeout(Some(Duration::from_millis(20)))
             .unwrap();
@@ -1517,10 +1560,7 @@ mod tests {
             expected
         );
 
-        let (mut writer, _reader) = UnixStream::pair().unwrap();
-        writer
-            .set_write_timeout(Some(Duration::from_millis(20)))
-            .unwrap();
+        let (mut writer, _reader) = connection();
         let stopping = Arc::new(AtomicBool::new(false));
         let writer_stopping = Arc::clone(&stopping);
         let blocked = thread::spawn(move || {
