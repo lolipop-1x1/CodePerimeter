@@ -26,7 +26,7 @@ codeperimeter watch remove ~/work/project-a
 
 移除已不存在的目录时，提供它此前登记的绝对路径。移除配置不会删除已有活动、告警或统计记录。
 
-历史发现只读取 Codex 与 Claude Code CLI 记录中的目录元信息，不导入或保存会话正文。先生成 JSON 预览快照，再按快照中的零起始候选序号导入：
+历史发现读取 Codex、Claude Code CLI 记录与 ZCode 会话库中的目录元信息，不导入或保存会话正文。先生成 JSON 预览快照，再按快照中的零起始候选序号导入：
 
 ~~~sh
 codeperimeter history preview --output ~/Desktop/codeperimeter-history.json
@@ -40,6 +40,14 @@ codeperimeter history import --preview ~/Desktop/codeperimeter-history.json --al
 ~~~
 
 导入只使用快照中记录的候选与来源；命令会重新核对路径仍解析到同一规范目录。目录失效或快照格式不匹配时，操作失败，请重新预览。新的会话不会自动扩大已选目录集合。预览文件只含目录、来源、版本和发现缺口等元信息，建议仍按本地敏感文件保管。
+
+ZCode 默认数据库是 `~/.zcode/cli/db/db.sqlite`，自定义位置可显式指定；该参数不改变 Codex 与 Claude Code 的默认发现位置：
+
+~~~sh
+codeperimeter history preview --zcode-db /absolute/path/db.sqlite --output candidates.json
+~~~
+
+ZCode 适配只读普通 `session` 表中明确保存的 `directory`，能读取已提交的 WAL 记录，不迁移或写入原库；不查询会话 ID、标题、正文，也不借用语义未验证的 `path` 字段。支持格式依据本机 ZCode 3.8.1 的字段形状，不承诺所有版本。预览始终显示会话中途目录变化未验证的缺口；数据库缺失、schema 不支持、读取失败或锁等待超时分别报告。历史来源标签不证明运行时进程归属，也不证明远程路径对应本机执行。当前程序继续接受原有 v1 快照，旧程序不承诺读取含 `zcode` 的新快照。
 
 ## 回查活动和告警
 

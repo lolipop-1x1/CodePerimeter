@@ -1,5 +1,6 @@
 // 真实 CLI／普通用户宿主／SQLite 用户流程；采集源刻意不可用，不代表 ES 实测。
 use codeperimeter::runtime::{ControlRequest, request_control};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Read;
@@ -109,6 +110,32 @@ fn cli_imports_a_fixed_history_snapshot_and_reopens_the_same_user_database() {
     )
     .unwrap();
     fs::write(claude.join("projects/synthetic/synthetic.jsonl"), format!("{}\n", json!({"type":"user","cwd":history,"version":"2.1.0","message":{"content":"SYNTHETIC_PRIVATE_CONVERSATION"}}))).unwrap();
+    let zcode_db = directory.path().join("zcode.sqlite");
+    let zcode = Connection::open(&zcode_db).unwrap();
+    zcode
+        .execute_batch(
+            "CREATE TABLE session (id TEXT, directory TEXT, title TEXT, path TEXT, version TEXT);
+         CREATE TABLE message (body TEXT);",
+        )
+        .unwrap();
+    zcode
+        .execute(
+            "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                "SYNTHETIC_PRIVATE_SESSION_ID",
+                history.to_str().unwrap(),
+                "SYNTHETIC_PRIVATE_CONVERSATION",
+                "SYNTHETIC_PRIVATE_PATH",
+                "SYNTHETIC_PRIVATE_VERSION",
+            ),
+        )
+        .unwrap();
+    zcode
+        .execute(
+            "INSERT INTO message VALUES (?1)",
+            ["SYNTHETIC_PRIVATE_CONVERSATION"],
+        )
+        .unwrap();
     let host = Host::start(directory.path());
     host.cli(&["watch", "add", manual.to_str().unwrap()]);
     let preview = directory.path().join("preview.json");
@@ -119,11 +146,16 @@ fn cli_imports_a_fixed_history_snapshot_and_reopens_the_same_user_database() {
         codex.to_str().unwrap(),
         "--claude-home",
         claude.to_str().unwrap(),
+        "--zcode-db",
+        zcode_db.to_str().unwrap(),
         "--output",
         preview.to_str().unwrap(),
     ]);
     let snapshot = fs::read_to_string(&preview).unwrap();
     assert!(!snapshot.contains("SYNTHETIC_PRIVATE_CONVERSATION"));
+    assert!(!snapshot.contains("SYNTHETIC_PRIVATE_SESSION_ID"));
+    assert!(!snapshot.contains("SYNTHETIC_PRIVATE_PATH"));
+    assert!(!snapshot.contains("SYNTHETIC_PRIVATE_VERSION"));
     let saved: Value = serde_json::from_str(&snapshot).unwrap();
     assert_eq!(saved["candidates"].as_array().unwrap().len(), 1);
     // 预览后新增会话目录，导入必须仍使用旧快照，不重扫并自动扩大范围。
@@ -133,6 +165,12 @@ fn cli_imports_a_fixed_history_snapshot_and_reopens_the_same_user_database() {
         json!({"type":"turn_context","payload":{"cwd":later}})
     ));
     fs::write(session, changed).unwrap();
+    zcode
+        .execute(
+            "INSERT INTO session (directory) VALUES (?1)",
+            [later.to_str().unwrap()],
+        )
+        .unwrap();
     host.cli(&[
         "history",
         "import",
@@ -152,7 +190,18 @@ fn cli_imports_a_fixed_history_snapshot_and_reopens_the_same_user_database() {
         .iter()
         .find(|item| item["path"] == history.canonicalize().unwrap().to_str().unwrap())
         .unwrap();
-    assert_eq!(imported["sources"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        imported["sources"],
+        json!(["claude_code", "codex", "zcode"])
+    );
+    host.cli(&[
+        "history",
+        "import",
+        "--preview",
+        preview.to_str().unwrap(),
+        "--all-available",
+    ]);
+    assert_eq!(host.cli(&["watch", "list"]), configured);
     assert!(host.cli(&["events"]).as_array().unwrap().is_empty());
     assert!(host.cli(&["alerts"]).as_array().unwrap().is_empty());
     assert_eq!(host.cli(&["stats", "show"])["cumulative"]["events"], 0);

@@ -86,6 +86,8 @@ enum HistoryCommand {
         codex_home: Option<PathBuf>,
         #[arg(long, value_name = "DIRECTORY")]
         claude_home: Option<PathBuf>,
+        #[arg(long, value_name = "FILE")]
+        zcode_db: Option<PathBuf>,
     },
     Import {
         #[arg(long, value_name = "FILE")]
@@ -455,6 +457,7 @@ fn run_history(command: HistoryCommand, socket: Option<&Path>) -> CliResult<()> 
             output,
             codex_home,
             claude_home,
+            zcode_db,
         } => {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -463,6 +466,7 @@ fn run_history(command: HistoryCommand, socket: Option<&Path>) -> CliResult<()> 
             let report = history::discover(&HistoryOptions {
                 codex_home: codex_home.or(defaults.codex_home),
                 claude_home: claude_home.or(defaults.claude_home),
+                zcode_db: zcode_db.or(defaults.zcode_db),
             });
             let preview = HistoryPreview {
                 format_version: HISTORY_PREVIEW_VERSION,
@@ -591,6 +595,7 @@ fn history_import_entries(
             let source = match origin.source {
                 history::HistorySource::Codex => "codex",
                 history::HistorySource::ClaudeCode => "claude_code",
+                history::HistorySource::Zcode => "zcode",
                 history::HistorySource::Manual => continue,
             };
             candidate_sources.insert(source.into());
@@ -750,7 +755,10 @@ mod tests {
             gaps: Vec::new(),
             versions: Vec::new(),
         };
-        let entries = history_import_entries(&preview, &[0], false).unwrap();
+        // 新增历史来源后仍接受现有 v1 快照。
+        let legacy_bytes = serde_json::to_vec(&preview).unwrap();
+        let restored: HistoryPreview = serde_json::from_slice(&legacy_bytes).unwrap();
+        let entries = history_import_entries(&restored, &[0], false).unwrap();
         assert_eq!(entries[0].path, canonical);
         assert_eq!(entries[0].sources, vec!["codex"]);
     }

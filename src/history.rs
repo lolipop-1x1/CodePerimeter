@@ -1,7 +1,9 @@
+use rusqlite::{Connection, ErrorCode, OpenFlags, types::ValueRef};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// 超长记录跳过并报告缺口，下一条元信息仍能继续提取。
 pub const MAX_HISTORY_LINE_BYTES: usize = 1024 * 1024;
@@ -11,6 +13,7 @@ pub const MAX_HISTORY_LINE_BYTES: usize = 1024 * 1024;
 pub enum HistorySource {
     Codex,
     ClaudeCode,
+    Zcode,
     Manual,
 }
 
@@ -55,6 +58,8 @@ pub enum DiscoveryGapKind {
     MissingDirectory,
     MissingVersion,
     VersionNotValidated,
+    DirectoryChangesNotValidated,
+    ReadTimedOut,
     SkippedSymlink,
 }
 
@@ -106,6 +111,8 @@ pub struct HistoryOptions {
     pub codex_home: Option<PathBuf>,
     /// Claude Code CLI 配置根目录；扫描其 projects。
     pub claude_home: Option<PathBuf>,
+    /// ZCode 会话数据库；只读取 session.directory。
+    pub zcode_db: Option<PathBuf>,
 }
 
 impl HistoryOptions {
@@ -113,6 +120,7 @@ impl HistoryOptions {
         Self {
             codex_home: Some(home.join(".codex")),
             claude_home: Some(home.join(".claude")),
+            zcode_db: Some(home.join(".zcode/cli/db/db.sqlite")),
         }
     }
 }
@@ -135,8 +143,152 @@ pub fn discover(options: &HistoryOptions) -> DiscoveryReport {
             &mut report,
         );
     }
+    if let Some(path) = &options.zcode_db {
+        scan_zcode(path, &mut report);
+    }
     finish_report(&mut report);
     report
+}
+
+fn scan_zcode(path: &Path, report: &mut DiscoveryReport) {
+    let source = HistorySource::Zcode;
+    // 保存的会话目录不证明能还原会话中途的目录变化。
+    add_gap(
+        report,
+        source,
+        path,
+        None,
+        DiscoveryGapKind::DirectoryChangesNotValidated,
+    );
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            add_gap(report, source, path, None, DiscoveryGapKind::MissingSource);
+            return;
+        }
+        _ => {
+            report.counts.io_errors += 1;
+            add_gap(report, source, path, None, DiscoveryGapKind::IoError);
+            return;
+        }
+    }
+    if let Err(kind) = read_zcode_directories(path, report) {
+        match kind {
+            DiscoveryGapKind::UnsupportedFormat => report.counts.unsupported_records += 1,
+            _ => report.counts.io_errors += 1,
+        }
+        // SQLite 原始错误可能包含 schema 表达式或历史内容，不进入报告。
+        add_gap(report, source, path, None, kind);
+    }
+}
+
+fn read_zcode_directories(
+    path: &Path,
+    report: &mut DiscoveryReport,
+) -> Result<(), DiscoveryGapKind> {
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(zcode_sqlite_gap)?;
+    connection
+        .busy_timeout(Duration::from_millis(250))
+        .map_err(zcode_sqlite_gap)?;
+    connection
+        .execute_batch("PRAGMA trusted_schema=OFF;")
+        .map_err(zcode_sqlite_gap)?;
+    // 正常只读事务包括已提交 WAL；schema 与目录行使用同一个快照。
+    let transaction = connection.transaction().map_err(zcode_sqlite_gap)?;
+    let supported: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_list('session')
+                WHERE schema='main' AND name='session' AND type='table')
+                AND EXISTS(SELECT 1 FROM pragma_table_xinfo('session')
+                WHERE name='directory' AND upper(type)='TEXT' AND hidden=0)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(zcode_sqlite_gap)?;
+    if !supported {
+        return Err(DiscoveryGapKind::UnsupportedFormat);
+    }
+    report.counts.files_scanned += 1;
+    let mut statement = transaction
+        .prepare("SELECT directory FROM main.session")
+        .map_err(zcode_sqlite_gap)?;
+    let mut rows = statement.query([]).map_err(zcode_sqlite_gap)?;
+    while let Some(row) = rows.next().map_err(zcode_sqlite_gap)? {
+        report.counts.records_scanned += 1;
+        let value = row.get_ref(0).map_err(zcode_sqlite_gap)?;
+        let directory = match value {
+            ValueRef::Null => None,
+            ValueRef::Text(bytes) if bytes.len() > MAX_HISTORY_LINE_BYTES => {
+                report.counts.oversized_records += 1;
+                add_gap(
+                    report,
+                    HistorySource::Zcode,
+                    path,
+                    None,
+                    DiscoveryGapKind::RecordTooLong,
+                );
+                continue;
+            }
+            ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    zcode_malformed_directory(path, report);
+                    continue;
+                }
+            },
+            _ => {
+                zcode_malformed_directory(path, report);
+                continue;
+            }
+        };
+        report.counts.matched_metadata_records += 1;
+        let Some(directory) = directory.filter(|directory| !directory.trim().is_empty()) else {
+            add_gap(
+                report,
+                HistorySource::Zcode,
+                path,
+                None,
+                DiscoveryGapKind::MissingDirectory,
+            );
+            continue;
+        };
+        add_candidate(
+            report,
+            PathBuf::from(directory),
+            DirectoryOrigin {
+                source: HistorySource::Zcode,
+                history_file: Some(path.to_path_buf()),
+                record_type: Some("session".into()),
+                line: None,
+                version: None,
+                field: "directory".into(),
+                occurrences: 1,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn zcode_sqlite_gap(error: rusqlite::Error) -> DiscoveryGapKind {
+    match error.sqlite_error_code() {
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => DiscoveryGapKind::ReadTimedOut,
+        _ => DiscoveryGapKind::IoError,
+    }
+}
+
+fn zcode_malformed_directory(path: &Path, report: &mut DiscoveryReport) {
+    report.counts.malformed_records += 1;
+    add_gap(
+        report,
+        HistorySource::Zcode,
+        path,
+        None,
+        DiscoveryGapKind::MalformedRecord,
+    );
 }
 
 /// 供手动多个目录使用。相对路径不借用宿主当前目录补全。
@@ -290,7 +442,7 @@ fn scan_file(path: &Path, source: HistorySource, report: &mut DiscoveryReport) {
                 parse_codex(&line.bytes, path, line_number, &mut codex_version, report)
             }
             HistorySource::ClaudeCode => parse_claude(&line.bytes, path, line_number, report),
-            HistorySource::Manual => unreachable!(),
+            HistorySource::Zcode | HistorySource::Manual => unreachable!(),
         };
         if let Err(error) = result {
             let kind = if !line.terminated && error.is_eof() {

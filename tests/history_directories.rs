@@ -43,6 +43,7 @@ fn codex_initial_and_turn_roots_keep_sources_and_skip_contents() {
     let report = discover(&HistoryOptions {
         codex_home: Some(root),
         claude_home: None,
+        zcode_db: None,
     });
     assert_eq!(report.candidates.len(), 2);
     assert_eq!(report.counts.files_scanned, 1);
@@ -99,6 +100,7 @@ fn codex_compressed_archives_and_active_files_are_deduplicated() {
     let report = discover(&HistoryOptions {
         codex_home: Some(root),
         claude_home: None,
+        zcode_db: None,
     });
     assert_eq!(report.counts.files_scanned, 2);
     assert_eq!(report.candidates.len(), 1);
@@ -122,6 +124,7 @@ fn claude_reads_actual_cwd_and_never_decodes_project_folder_names() {
     let report = discover(&HistoryOptions {
         codex_home: None,
         claude_home: Some(root),
+        zcode_db: None,
     });
     assert_eq!(report.candidates.len(), 2);
     assert_eq!(report.counts.unresolved_directories, 1);
@@ -160,6 +163,7 @@ fn bad_unknown_oversized_and_partial_records_do_not_hide_later_metadata() {
     let report = discover(&HistoryOptions {
         codex_home: Some(root),
         claude_home: None,
+        zcode_db: None,
     });
     assert_eq!(report.candidates.len(), 1);
     assert_eq!(report.counts.malformed_records, 1);
@@ -235,6 +239,7 @@ fn missing_sources_and_corrupt_compression_are_visible() {
     let report = discover(&HistoryOptions {
         codex_home: Some(root),
         claude_home: Some(temp.path().join("absent-claude")),
+        zcode_db: None,
     });
     assert!(
         report
@@ -258,6 +263,7 @@ fn unreadable_files_and_symlink_history_are_reported() {
     let report = discover(&HistoryOptions {
         codex_home: Some(root),
         claude_home: None,
+        zcode_db: None,
     });
     if unsafe { libc::geteuid() } != 0 {
         assert_eq!(report.counts.io_errors, 1);

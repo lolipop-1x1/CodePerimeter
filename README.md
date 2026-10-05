@@ -33,13 +33,15 @@ sudo ./target/release/codeperimeter service start --user "$(id -un)"
 ./target/release/codeperimeter health --source-run-id "实际run_id" --limit 100
 ```
 
-首次历史导入先生成快照，再选其中的目录。Codex 与 Claude Code 的元信息分别适配，新会话不会自动扩大范围：
+首次历史导入先生成快照，再选其中的目录。Codex、Claude Code 与 ZCode 的目录元信息分别适配，新会话不会自动扩大范围：
 
 ```sh
 ./target/release/codeperimeter history preview --output candidates.json
 ./target/release/codeperimeter history import --preview candidates.json --index 0
 ./target/release/codeperimeter watch list
 ```
+
+ZCode 默认只读 `~/.zcode/cli/db/db.sqlite` 中明确保存的会话目录，也可用 `history preview --zcode-db FILE` 指定数据库。本机格式基线为 ZCode 3.8.1；会话中途目录变化未验证，预览会显示覆盖缺口。来源标签说明目录出处，不表示运行时进程已归属到 ZCode。
 
 完整参数、查询、阈值、停止和卸载见 [CLI 使用说明](docs/usage.md)；三角色、root 二进制、FDA 边界见 [后台服务](docs/service.md)。停止／卸载保留数据库和目录配置。
 
