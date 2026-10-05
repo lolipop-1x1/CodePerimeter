@@ -65,11 +65,13 @@ python3 -B scripts/validate-prepare-collector.py --binary target/release/codeper
 
 准备入口检查来源普通文件和权限，检查 root 父路径／ACL，先复制到 root 私有暂存文件，清除新创建自有目录／文件的继承 ACL 并核对 SHA256，再用系统 link 原子发布为 `/Library/CodePerimeter/<uid>/codeperimeter`；发布也拒绝已有目标，包括并发创建。默认拒绝已有目标。仅对无 launchd 安装的验收副本，可明确指定 `--replace-sha256`：普通用户先核对旧hash与完整root路径／ACL；发布时固定 `/usr/bin/python3 -I -B -S` 再核验旧／新SHA256、root属主与完整路径／ACL、旧／新采集端点和控制端点、任何codeperimeter进程、该UID的三份plist与loaded jobs，全部静止才原子替换。系统Python不可用或任一检查不符就失败，不降级、不删除未知端点。已有服务安装应按服务管理流程处理，本入口不是通用更新器。此入口只准备副本，不创建 job、不运行 collector、不变更 FDA。
 
-本机当前受保护副本仍为a67。调度补修的新release SHA256为 `ecbd09284b9d404fe2cdb486f9e1a666e5a01da5e24483c534431548744cee06`；本机封装入口只允许显式替换已知a67旧hash，仍核验root路径、ACL、无活动服务及新旧hash。在此前有FDA的同一终端运行：
+2026-10-05 本机受保护副本已由用户终端更新为调度补修版，新release SHA256为 `ecbd09284b9d404fe2cdb486f9e1a666e5a01da5e24483c534431548744cee06`；本机封装入口对相同hash只核验并直接验收，旧版仅允许显式替换已知a67旧hash，仍核验root路径、ACL、无活动服务及新旧hash。在此前有FDA的同一终端运行：
 
 ```sh
-sh /private/tmp/codeperimeter-mvp-research/run-final-validation.sh
+sh .scratch/activity-monitor-mvp/local-validation/run-final-validation.sh
 ```
+
+2026-10-05 重启后旧 `/private/tmp` 封装脚本和原始临时证据已被清理；代码和新release仍在，原结果的匿名汇总保留在本文。本机封装入口已恢复到上述项目内的私有本地目录（不提交Git），每次结果保存到同目录下新的 `run-<UUID>` 子目录，目录权限0700，文件由umask077创建。该脚本绑定本机已核验的新旧hash，不是其他安装的通用更新入口。恢复只核验语法／路径／二进制hash，未再次执行管理员准备或真实系统验收。
 
 这条观察路线使用系统 eslogger 的已有 ES 授权，不需要为本项目申请自有 ES 开发者签名。责任进程仍需要 FDA：终端／eslogger 探针成功不推导包装二进制或 launchd 已授权。实际错误包含 `permission_denied` 时，到系统设置检查责任进程；必要时给上述受保护 codeperimeter 副本和 eslogger 授予完全磁盘访问，再重试。不改 TCC 数据库、SIP、AMFI 或 sudoers。
 
@@ -79,12 +81,12 @@ sh /private/tmp/codeperimeter-mvp-research/run-final-validation.sh
 python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
 ```
 
-可先用 `--preflight-only` 检查二进制、root 路径、版本一致、当前终端 sudo 与端点占用；它不启动监控，也不尝试连接已有固定采集端点。可用 `--report-dir /private/tmp/一个新的空目录` 指定本地结果目录，已有非空目录会被拒绝。
+可先用 `--preflight-only` 检查二进制、root 路径、版本一致、当前终端 sudo 与端点占用；它不启动监控，也不尝试连接已有固定采集端点。可用 `--report-dir .scratch/activity-monitor-mvp/local-validation/一个新的空目录` 指定持久的本地结果目录，已有非空目录会被拒绝。该本地目录已加入Git忽略规则。
 
 入口按以下顺序执行：
 
 1. 创建 55 个匿名源码文件；启动预加载对照，收到 ready 后才开始监控。
-2. 以普通用户启动独立 daemon／SQLite／控制 socket，只添加本轮 `workspace/project`。root collector 固定 root peer 和端点，sudo 保留当前 TTY 认证；collector 自己建立 PGID。notify 和每个发送器使用独立进程组。
+2. 以普通用户启动独立 daemon／SQLite，只添加本轮 `workspace/project`。控制 socket 使用 `/private/tmp/cpv-<随机值>/host.sock`，私有目录0700；本轮结束或前置失败后清理。SQLite／合成项目／证据仍保存在报告目录，报告路径长度不会扩大 socket 路径。root collector 固定 root peer 和端点，sudo 保留当前 TTY 认证；collector 自己建立 PGID。notify 和每个发送器使用独立进程组。
 3. 必须先观察到真实合成文件事件才继续；释放已预加载的进程，之后在内存中压缩，不重新打开源码。
 4. 显式 create/write/open/mmap/close/rename/fork/exec/exit；执行单文件读取、可读 mmap、55 次同文件读取、55 个不同文件批量、tar／zip 项目内和临时输出、同进程落盘／内存归档，以及正常搜索／索引／构建。
 5. 从本轮匿名 SQLite 只读回查标准事件、告警、outbox 首建和通知反馈。每场景等待通知队列收敛，记录缺失与超时，不借操作端元数据补造监控证据。
@@ -102,7 +104,7 @@ python3 -B scripts/validate-mvp.py --binary target/release/codeperimeter
 - 缺失、负时延、超过 3000ms、字段／序号缺口、桥接／宿主丢弃、数据库缺口或不完整清理明确判失败／部分通过。无真实源不会回退 fixture。
 - sent 只表示通知命令接受，不等于用户看到弹窗。脚本结束仍将桌面展示和系统后台验收列为待验。
 
-标准输出仅给结果与 `summary.json` 路径。结果目录包含私有权限的匿名操作元数据、筛选后的标准证据与健康状态；collector启动stderr持续有界排空，只在 `root_startup` 保留最多8种白名单静态诊断码、退出码与排空完整性；提前退出立即失败，不等待通用超时。完整系统 raw JSON、原stderr、完整 args／env 和文件正文不落盘。采样以后台角色及后代 RSS 求和、ps 累计平均 %cpu 报告，无性能基线时不宣称开销达标。脚本保留合成产物和证据，方便核查；目录外归档仍按发送器清单登记，不自动删除未知文件。
+标准输出仅给结果与 `summary.json` 路径。结果目录包含私有权限的匿名操作元数据、筛选后的标准证据与健康状态；宿主和collector的stderr持续有界排空，分别在 `host_startup`／`root_startup` 保留最多8种白名单静态诊断码、退出码与排空完整性；提前退出立即失败，不等待通用超时。socket路径超长分类为`socket_path_too_long`，宿主提前退出分类为`host_exited`。完整系统 raw JSON、原stderr、完整 args／env 和文件正文不落盘。采样以后台角色及后代 RSS 求和、ps 累计平均 %cpu 报告，无性能基线时不宣称开销达标。脚本保留合成产物和证据，方便核查；目录外归档仍按发送器清单登记，不自动删除未知文件。
 
 退出码：0 代表本轮脚本定义的真实观察／发送检查通过（仍有到屏和后台待验），1 代表实际场景失败／部分通过，2 代表前置条件、源连接或执行失败。`--preflight-only` 的 0 只表示前置检查通过。
 
@@ -128,3 +130,8 @@ sudo ./target/release/codeperimeter service start --user "$(id -un)"
 宿主启动时及每小时清理30天以前明细，累计统计保留；`retention_state`／`retention_last_run_ms` 回显执行与失败，明细过期健康记录表示追溯缺口。清理失败时显示数据库降级，恢复后重试。
 
 源断开在真实入口中受控验证；数据库写入失败、超长／错误 schema、序号缺口、通知失败和大批补发已有独立组件故障注入。真运行遇到这些故障要保留实际状态，不把组件注入当成本机故障通过。公开报告只使用匿名场景和摘要。
+
+
+2026-10-05 持久入口本轮 `run-720dcf6660994f48a556410d18d75cb2` 已由用户终端运行：ecbd受保护副本准备成功，未改launchd/FDA；宿主启动15秒超时，root尚未启动，实际来源未确认。该持久报告目录的控制socket路径168字节，本机普通用户重现daemon退出1并报`path must be shorter than SUN_LEN`；旧入口丢弃宿主stderr。最小补修 `939b8aa` 只将运行时socket分离到短私有目录，保留持久报告／SQLite／合成项目，补宿主早退与静态分类；3000ms与真实场景门禁不变。Python自测37项通过，包含实际run长报告接线及正常／前置失败／中断清理。主agent通过该修复后的run调用实际普通用户daemon（173字节报告、35字节socket），成功配置合成项目及schema3 SQLite，在首次sudo边界前主动停止，宿主stderr排空与临时目录清理通过。此对照跳过管理员preflight、未启动root／ES／通知，只证明宿主启动与接线修复；下一轮完整真实场景与3秒仍待用户终端运行。
+
+候选939b8aa经独立两轴定点复核：Standards hard0／heuristic0、Spec可证缺陷0／scope creep0，独立生命周期6项通过；已快进合入，Rust与ecbd构建不变，受保护副本当前也为ecbd。持久封装入口可以直接重跑，相同hash只检查不替换；原本轮失败证据保留，未将其改写为通过。

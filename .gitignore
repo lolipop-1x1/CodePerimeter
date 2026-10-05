@@ -7,3 +7,4 @@
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+/.scratch/activity-monitor-mvp/local-validation/

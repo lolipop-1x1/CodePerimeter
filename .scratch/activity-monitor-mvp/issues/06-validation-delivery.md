@@ -88,3 +88,8 @@ Blocked by: none (实现依赖与双轴审查已完成；真实授权运行与�
 验收保留业务场景原始突发顺序；末尾由独立PID访问唯一匿名文件，要求实际可读OPEN／MMAP及来源序号进入SQLite，再等待各场景证据与outbox排空，重新读取最终发送回执。完成等待20秒有限截止，报告是否越过来源屏障、缺失场景和deadline；屏障不能证明所有来源绝对完整，场景证据和缺口仍分别裁决。删除outbox空即场景完成与固定3秒快照，3000ms仍按实际来源触发时间计算，超时／晚到照常失败。
 
 本机完整Rust80通过／1信号helper由监督用例调用；Python判定器31通过、fmt／严格all-target clippy／AST／diff检查通过。双轴定点审查：Standards hard0／heuristic1（零秒测试未实际进入pending分支），唯一实现者补确定性正反例并独立复核关闭；Spec可证缺陷0／scope creep0（裁决26bfe35；d799仅测试补修由Standards窄复核）。新版release SHA256 `ecbd09284b9d404fe2cdb486f9e1a666e5a01da5e24483c534431548744cee06` 已构建，受保护副本仍a67，未替换或重新实机采集。本轮新head远端CI以PR回读为准；完整真实重跑、桌面到屏、后台／登录／重启与持续性能仍待，06保持claimed。
+
+
+2026-10-05 重启后的持久入口首跑 `run-720dcf6660994f48a556410d18d75cb2`：用户终端已将受保护副本更新为ecbd（完整hash见验收文档），launchd与FDA未修改。摘要停在host_startup，15秒超时；root采集器未启动、真实来源未确认、操作记录为空，清理完成。本机普通用户复现：将控制socket置于长报告目录产生168字节路径，daemon实际返回`path must be shorter than SUN_LEN`；原验收入口丢弃daemon stderr，故只报告通用超时。对照使用40字节私有socket与185字节数据库路径，308ms收到database_state=ready并Stop退出0，没有root／ES／通知。正在最小补修验收socket生命周期与宿主静态启动诊断；原3秒与场景门禁保持，06仍claimed。
+
+持久验收启动补修 `939b8aafabd794df3b3d2a10cfc27e7667d7106d`（tree `a67acd2d1e457f38606eaca43ee5ee40006a9769`）：只改validate-mvp.py／selftest.py，短随机0700控制目录覆盖前置失败与KeyboardInterrupt，退出时清理；报告／SQLite／合成项目不移出持久目录。宿主早退立即报host_exited及退出码，host_startup保留最多8种静态诊断码／排空状态，不保存stderr原文。修前4例红、修后37自测绿，AST／help／diff通过。主agent另外用实际普通daemon通过修复后的run接线：173字节报告／35字节socket，完成合成项目配置和schema3 SQLite，在首次sudo前主动停止，宿主及临时socket均回收；这是普通组件对照，不代表root／ES／3秒。Rust与ecbd二进制不改、不需重复替换；独立定点审查：Standards hard0／heuristic0，Spec可证缺陷0／scope creep0；独立生命周期6项均通过，merger快进合入并核对候选HEAD／tree，三份主agent文档改动合并前后hash保持。06仍claimed，下一轮真实系统验收仍待。

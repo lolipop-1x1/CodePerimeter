@@ -122,3 +122,10 @@ hard0／heuristic0。断线前ID基线与新增EOF条件避免旧证据冒充；
 可证缺陷0／scope creep0，裁决冻结26bfe35；最终d799仅变更测试，Standards已独立窄复核。保持有界保序、可靠状态、drop后join取消、原业务突发顺序、真实独立fence与预期场景证据、有限deadline；Metrics不建立实际ES证据或放宽健康。source-based3000ms、晚到／缺失与实际桌面／后台未验边界保持。
 
 主agent全Rust80通过／1监督helper调用，唯一实现者相关Rust10+11+12及Python31、fmt／严格clippy／AST／diff通过，独立复核普通定点反例通过。匿名10MB、9751行交错样本2148ms→319ms，指标版293ms，766项目事件／331合并更新／零已知缺口保持；普通组件测量不等于ES实机3秒。第四轮真实16场景8通过／8证据缺失，生成3543ms／最终7条均sent且最晚3956ms，原失败不改。release `ecbd09284b9d404fe2cdb486f9e1a666e5a01da5e24483c534431548744cee06` 已构建；受保护副本仍a67、未sudo部署／改FDA／安装launchd。新head CI及完整实机以对应后续回读为准，06保持claimed。
+
+
+## 持久验收目录的 socket 长度补修复核
+
+2026-10-05 固定点 `96dc4e34b1805adef1aa021afffc54a40701c4ae` → 候选 `939b8aafabd794df3b3d2a10cfc27e7667d7106d`（tree `a67acd2d1e457f38606eaca43ee5ee40006a9769`）：仅两份Python验收脚本，运行socket采用随机短私有目录，持久报告／SQLite不移动；宿主早退立即分类并保留退出码，原stderr不落盘。Standards hard0／heuristic0，Spec可证缺陷0／scope creep0；两轴独立生命周期6项通过。Standards最初关于TemporaryDirectory无法被mkdtemp补丁捕获的判断，经标准库源码与实际6例验证已撤回，不是候选缺陷；mode情景注入和独立host／root摘要按简单优先原则无需额外抽象。
+
+实现者37自测、AST／help／diff通过，主agent通过候选run调用实际普通宿主，在首次sudo前停止并确认长报告接线与短socket清理；不作为ES／FDA／通知或3000ms验收。merger快进合入并核对HEAD／tree，合并前后已有三份文档hash一致。Rust与ecbd二进制不变。06仍claimed，完整真实重跑待用户终端；没有新增实现worktree，既有修复树继续保留供实测，不绕过App的固定工作区保护。
