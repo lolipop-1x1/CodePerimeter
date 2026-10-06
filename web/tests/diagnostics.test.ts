@@ -58,7 +58,7 @@ test('状态标签区分连接、缺口、等待、成功及未知，健康条�
   for (const [value, expected] of [['gap', '有缺口'], ['connecting', '连接中'], ['reconnecting', '重新连接中'], ['stalled', '事件流停滞'], ['coverage_gap', '覆盖有缺口'], ['pending', '等待中'], ['succeeded', '已成功'], ['cancelled', '已取消'], ['new_unknown_state', '未知状态']]) assert.equal(stateLabel(value), expected);
   const status = { service: { installed: true, paused: false, status_error: null }, host: { collector_state: 'new_unknown_state', database_state: 'ready', collector_dropped_lines: 0, reader_dropped_frames: 0, database_gap_events: 0, memory_dropped_notifications: 0, notify_session_active: false } } as unknown as Status;
   const markup = renderToStaticMarkup(createElement(HealthStrip, { status }));
-  assert.ok(markup.includes('系统采集：<strong>未知状态</strong>'));
+  assert.match(markup.replace(/<[^>]+>/g, ''), /系统采集未知状态/);
   assert.ok(!markup.includes('正常'));
 });
 

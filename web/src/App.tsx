@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Button, GlobalTheme, Select, SelectItem, Tag } from '@carbon/react';
-import { Dashboard, Folder, Document, Archive, WarningAlt, Settings, Tools } from '@carbon/react/icons';
+import { Button, GlobalTheme, MenuButton, MenuItemRadioGroup } from '@carbon/react';
+import { Dashboard, Folder, Document, Archive, WarningAlt, Settings, Tools, Sun, Moon, Screen } from '@carbon/react/icons';
 import { api, errorMessage, initializeSession } from './api';
 import { Notice } from './components';
 import { DetailPane, type Selection } from './details';
@@ -23,6 +23,7 @@ const pages = [
   { key: 'rules', label: '规则中心', title: '规则中心', description: '内置规则开关与全局参数', icon: Settings },
   { key: 'settings', label: '设置与诊断', title: '设置与诊断', description: '系统服务、数据管理与覆盖缺口', icon: Tools },
 ] as const;
+const themeLabels: Record<string, string> = { system: '跟随系统', light: '浅色', dark: '深色' };
 
 export function App() {
   const [authenticated, setAuthenticated] = useState(initializeSession);
@@ -33,7 +34,7 @@ export function App() {
   const [operation, setOperation] = useState<ServiceOperation>();
   const [operationError, setOperationError] = useState<string>();
   const [starting, setStarting] = useState(false);
-  const [theme, setTheme] = useState(() => { try { return localStorage.getItem('codeperimeter-theme') ?? 'system'; } catch { return 'system'; } });
+  const [theme, setTheme] = useState(() => { try { const saved = localStorage.getItem('codeperimeter-theme'); return saved && themeLabels[saved] ? saved : 'system'; } catch { return 'system'; } });
   const [darkSystem, setDarkSystem] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
   const dark = theme === 'dark' || (theme === 'system' && darkSystem);
   const status = usePolling<Status>('/api/status', undefined, authenticated);
@@ -75,14 +76,15 @@ export function App() {
   const current = pages.find(item => item.key === page)!;
   const statusData = status.data;
   const mainAction = status.error ? null : primaryServiceAction(statusData?.service);
+  const ThemeIcon = theme === 'system' ? Screen : theme === 'dark' ? Moon : Sun;
   return <GlobalTheme theme={dark ? 'g100' : 'g10'}><div className="console-shell">
     <a className="skip-link" href="#main-content">跳到主要内容</a>
     <nav className="side-nav" aria-label="主要导航"><div className="brand"><img className="brand-icon" src="/codeperimeter.svg" alt="" width="32" height="32" /><div><strong>CodePerimeter</strong><span>本机监控控制台</span></div></div>
       <div className="nav-links">{pages.map(item => <button key={item.key} type="button" aria-current={page === item.key ? 'page' : undefined} onClick={() => navigate(item.key)}><item.icon size={20} /><span>{item.label}</span></button>)}</div>
-      <div className="nav-bottom"><span>仅本机访问</span><Select id="theme-selection" labelText="外观" size="sm" value={theme} onChange={event => setTheme(event.target.value)}><SelectItem value="system" text="跟随系统" /><SelectItem value="light" text="浅色" /><SelectItem value="dark" text="深色" /></Select></div>
+      <div className="nav-bottom"><div className="theme-control"><ThemeIcon className="theme-icon" size={18} aria-hidden="true" /><MenuButton className="theme-menu" label={`外观：${themeLabels[theme]}`} kind="ghost" size="sm" menuAlignment="top-start" menuBorder><MenuItemRadioGroup label="外观模式" items={['system', 'light', 'dark']} itemToString={item => themeLabels[String(item)]} selectedItem={theme} onChange={item => setTheme(String(item))} /></MenuButton></div></div>
     </nav>
     <main id="main-content" tabIndex={-1} className="main-content">
-      <header className="page-heading"><div><h1>{current.title}</h1><p>{current.description}</p></div><div className="actions"><Button kind="tertiary" size="sm" disabled={!authenticated || !mainAction || !statusData?.service_actions_enabled || starting || operation?.state === 'running'} onClick={() => mainAction && void operate(mainAction)}>{starting || operation?.state === 'running' ? '正在操作' : mainAction ? serviceLabels[mainAction] : '服务状态未知'}</Button><Tag type="gray">仅本机访问</Tag></div></header>
+      <header className="page-heading"><div><h1>{current.title}</h1><p>{current.description}</p></div><div className="actions"><Button kind="tertiary" size="sm" disabled={!authenticated || !mainAction || !statusData?.service_actions_enabled || starting || operation?.state === 'running'} onClick={() => mainAction && void operate(mainAction)}>{starting || operation?.state === 'running' ? '正在操作' : mainAction ? serviceLabels[mainAction] : '服务状态未知'}</Button></div></header>
       {!authenticated ? <section className="panel entry-expired"><h2>请重新打开控制台</h2><p>当前标签页缺少有效入口。请在本机终端运行 <code>codeperimeter ui</code>，通过新打开的页面继续使用。</p><p className="helper">网页不接收管理员密码。</p></section> : <>
         <Notice error={routeError ?? status.error ?? operationError} success={operation?.state === 'cancelled' ? '管理员操作已取消，未报告成功。' : undefined} />
         {operation?.state === 'running' && <div className="operation-progress" role="status">服务操作进行中，请查看系统授权窗口；也可在系统窗口取消。</div>}

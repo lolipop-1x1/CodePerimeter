@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Button, Tag, TextArea } from '@carbon/react';
+import { Close } from '@carbon/react/icons';
 import { consoleApi } from './api';
 import { DataState, GridTable, Notice, TableCell, TableRow } from './components';
 import { eventLabel, eventPath, processLabel, ruleLabels, timestamp } from './format';
@@ -10,8 +11,8 @@ export type Selection = { kind: 'event'; id: number } | { kind: 'alert'; id: str
 export function DetailPane({ selection, select, close, viewRule, viewProcess }: { selection: Selection; select: (selection: Selection) => void; close: () => void; viewRule: () => void; viewProcess: (pid: number) => void }) {
   if (!selection) return null;
   return <aside className="detail-pane" aria-label="记录详情">
-    <div className="section-heading"><h2>{selection.kind === 'alert' ? '告警详情' : '活动详情'}</h2><Button kind="ghost" size="sm" onClick={close}>关闭</Button></div>
-    {selection.kind === 'alert' ? <AlertDetail id={selection.id} select={select} viewRule={viewRule} viewProcess={viewProcess} /> : <ActivityDetail id={selection.id} select={select} viewProcess={viewProcess} />}
+    <div className="section-heading detail-heading"><h2>{selection.kind === 'alert' ? '告警详情' : '活动详情'}</h2><Button kind="ghost" size="sm" renderIcon={Close} onClick={close}>关闭</Button></div>
+    <div className="detail-body">{selection.kind === 'alert' ? <AlertDetail id={selection.id} select={select} viewRule={viewRule} viewProcess={viewProcess} /> : <ActivityDetail id={selection.id} select={select} viewProcess={viewProcess} />}</div>
   </aside>;
 }
 

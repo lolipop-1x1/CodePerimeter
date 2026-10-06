@@ -23,6 +23,10 @@ async function open(page: Page, data: Fixture) {
   expect(new URL(page.url()).hash.length === 0, '认证fragment已经移除').toBeTruthy();
 }
 async function navigate(page: Page, name: string) { await page.getByRole('navigation', { name: '主要导航' }).getByRole('button', { name, exact: true }).click(); }
+async function chooseTheme(page: Page, name: string) {
+  await page.getByRole('button', { name: /^外观：/ }).click();
+  await page.getByRole('menuitemradio', { name, exact: true }).click();
+}
 
 test('真实HTTP、宿主和SQLite完成七页操作闭环', async ({ page }, info) => {
   const { directory, data } = fixture();
@@ -41,6 +45,7 @@ test('真实HTTP、宿主和SQLite完成七页操作闭环', async ({ page }, in
   await alertTable.getByRole('button', { name: '查看', exact: true }).first().click();
   const detail = page.getByRole('complementary', { name: '记录详情' });
   await expect(detail.getByText('批量文件访问', { exact: true })).toBeVisible();
+  await page.screenshot({ path: info.outputPath('alert-detail-light.png'), fullPage: true });
   await detail.getByLabel('处理备注', { exact: true }).fill('合成验收备注');
   await detail.getByRole('button', { name: '标记已处理', exact: true }).click();
   await expect(detail.getByRole('button', { name: '重新打开', exact: true })).toBeVisible();
@@ -92,6 +97,7 @@ test('真实HTTP、宿主和SQLite完成七页操作闭环', async ({ page }, in
   await eventPage.getByRole('button', { name: '导出', exact: true }).click();
   const exportDialog = page.getByRole('dialog', { name: '导出当前筛选范围' });
   await expect(exportDialog).toBeVisible();
+  await page.screenshot({ path: info.outputPath('export-dialog-light.png') });
   await page.keyboard.press('Tab');
   await expect.poll(async () => exportDialog.evaluate(dialog => dialog.contains(document.activeElement)), { message: '弹窗中的键盘焦点保留在操作区域' }).toBeTruthy();
   await page.keyboard.press('Escape');
@@ -170,13 +176,14 @@ test('真实HTTP、宿主和SQLite完成七页操作闭环', async ({ page }, in
   await page.getByRole('button', { name: '保存保留期', exact: true }).click();
   const retentionDialog = page.getByRole('dialog', { name: '缩短明细保留期' });
   await expect(retentionDialog).toBeVisible();
+  await page.screenshot({ path: info.outputPath('retention-dialog-light.png') });
   await retentionDialog.getByRole('button', { name: '确认', exact: true }).click();
   await expect(retentionDialog).not.toBeVisible();
   await expect(page.getByText('明细保留期已保存。')).toBeVisible();
-  await page.getByLabel('外观', { exact: true }).selectOption('dark');
+  await chooseTheme(page, '深色');
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
   await page.screenshot({ path: info.outputPath('settings-dark.png'), fullPage: true });
-  await page.getByLabel('外观', { exact: true }).selectOption('light');
+  await chooseTheme(page, '浅色');
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
   await navigate(page, '概览');
   await expect.poll(async () => await page.locator('.metric-band > div').first().locator('strong').innerText() !== '未知').toBeTruthy();
@@ -198,6 +205,99 @@ test('真实HTTP、宿主和SQLite完成七页操作闭环', async ({ page }, in
   await navigate(page, '文件活动');
   await expect(page.getByRole('heading', { name: '暂无匹配活动' })).toBeVisible();
   expect(pageErrors.length === 0, '没有页面运行异常').toBeTruthy();
+});
+
+test('七页双主题与四档窗口没有页面溢出，外观菜单及规则开关支持键盘', async ({ page }, info) => {
+  const { directory, data } = fixture();
+  const headers = { Authorization: `Bearer ${data.session.token}`, Origin: data.session.origin };
+  const current = await page.request.post(`${data.session.origin}/api/console`, { headers, data: { action: 'rules_get' } });
+  const settings = (await current.json()).data;
+  const saved = await page.request.post(`${data.session.origin}/api/console`, { headers, data: { action: 'rules_set', payload: { settings: { ...settings, bulk_enabled: true, bulk_file_threshold: 50 } } } });
+  expect((await saved.json()).ok, '布局验收恢复标准规则并注入合成记录').toBeTruthy();
+  writeFileSync(join(directory, 'inject'), '', { mode: 0o600 });
+  const errors: string[] = [];
+  page.on('pageerror', () => errors.push('页面运行异常'));
+  await open(page, data);
+  await navigate(page, '文件活动');
+  await expect(page.getByRole('table', { name: '文件活动记录' }).getByRole('button', { name: '查看', exact: true }).first()).toBeVisible();
+  const scrollArea = page.getByRole('region', { name: '文件活动记录，可滚动表格', exact: true });
+  await scrollArea.focus();
+  await page.keyboard.press('ArrowDown');
+  await expect.poll(() => scrollArea.evaluate(element => element.scrollTop), { message: '记录表格可以用键盘滚动查看' }).toBeGreaterThan(0);
+  await expect(page.getByText('仅本机访问', { exact: true })).toHaveCount(0);
+  const appearance = page.getByRole('button', { name: /^外观：/ });
+  await appearance.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('menuitemradio', { name: '跟随系统', exact: true })).toHaveAttribute('aria-checked', 'true');
+  await page.getByRole('menuitemradio', { name: '浅色', exact: true }).focus();
+  await page.keyboard.press('ArrowDown');
+  await expect(page.getByRole('menuitemradio', { name: '深色', exact: true })).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await expect(appearance).toBeFocused();
+  await page.reload();
+  await expect(appearance).toHaveAccessibleName('外观：深色');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await chooseTheme(page, '跟随系统');
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await page.emulateMedia({ colorScheme: 'light' });
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+
+  const pages = ['概览', '监控目录', '文件活动', '归档迹象', '告警中心', '规则中心', '设置与诊断'];
+  for (const theme of ['浅色', '深色']) {
+    await chooseTheme(page, theme);
+    for (const width of [1920, 1440, 1024, 720]) {
+      await page.setViewportSize({ width, height: 960 });
+      for (const [index, name] of pages.entries()) {
+        await navigate(page, name);
+        await expect(page.locator('.page-content > section:not([hidden]) .loading')).toHaveCount(0);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${name}／${theme}／${width}px 没有页面横向溢出`).toBeTruthy();
+        if (name === '规则中心') {
+          await expect(page.getByRole('switch')).toHaveCount(3);
+          expect(await page.locator('.rule-row').evaluateAll(rows => rows.every(row => {
+            const bounds = row.getBoundingClientRect();
+            const control = row.querySelector('.cds--toggle')!.getBoundingClientRect();
+            return control.right <= bounds.right + 1 && row.scrollWidth <= row.clientWidth + 1;
+          })), '规则开关与状态文字保留在各自规则行内').toBeTruthy();
+        }
+        if (name === '概览') {
+          const chart = page.getByRole('img', { name: /^文件活动趋势/ });
+          await expect(chart).toBeVisible();
+          expect((await chart.boundingBox())!.height <= 240, '趋势图高度不随窗口宽度膨胀').toBeTruthy();
+          expect((await page.getByLabel('统计范围', { exact: true }).boundingBox())!.width <= 160, '时间选择器保持紧凑').toBeTruthy();
+        }
+        if (width === 1440 || name === '规则中心') await page.screenshot({ path: info.outputPath(`page-${index}-${theme === '浅色' ? 'light' : 'dark'}-${width}.png`), fullPage: true });
+      }
+      await navigate(page, '文件活动');
+      await page.getByRole('table', { name: '文件活动记录' }).getByRole('button', { name: '查看', exact: true }).first().click();
+      const detail = page.getByRole('complementary', { name: '记录详情' });
+      await expect(detail.getByRole('button', { name: '关闭', exact: true })).toBeVisible();
+      expect(await detail.evaluate(element => element.scrollWidth <= element.clientWidth + 1), '详情字段与长路径不横向溢出').toBeTruthy();
+      await detail.getByRole('button', { name: '关闭', exact: true }).click();
+      await page.getByRole('button', { name: '导出', exact: true }).click();
+      const dialog = page.getByRole('dialog', { name: '导出当前筛选范围' });
+      await expect(dialog).toBeVisible();
+      const bounds = (await dialog.boundingBox())!;
+      expect(bounds.x >= 0 && bounds.x + bounds.width <= width, '确认弹窗完整保留在当前窗口内').toBeTruthy();
+      if (width === 1440) await page.screenshot({ path: info.outputPath(`export-dialog-${theme === '浅色' ? 'light' : 'dark'}.png`) });
+      await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    }
+  }
+  await navigate(page, '规则中心');
+  const toggle = page.getByRole('switch', { name: '批量文件访问开关', exact: true });
+  await expect(toggle).toBeChecked();
+  await toggle.focus();
+  await page.keyboard.press('Space');
+  await expect(toggle).not.toBeChecked();
+  await page.keyboard.press('Space');
+  await expect(toggle).toBeChecked();
+  const track = page.locator('.rule-row').filter({ has: toggle }).locator('.cds--toggle__switch');
+  await track.click();
+  await expect(toggle).not.toBeChecked();
+  await track.click();
+  await expect(toggle).toBeChecked();
+  expect(errors).toEqual([]);
 });
 
 test('无入口令牌明确展示恢复路径，不触发未授权的业务请求', async ({ page }) => {

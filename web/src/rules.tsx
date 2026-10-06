@@ -42,17 +42,17 @@ export function RulesPage({ active }: { active: boolean }) {
   return <DataState loading={state.loading} error={state.error} empty={!settings}>
     {settings && <form className="form-stack" noValidate onSubmit={event => { event.preventDefault(); save(); }}>
       <section className="panel"><div className="section-heading"><h2>三类内置规则</h2><span className="helper">当前版本 {state.data?.version}</span></div>
-        {ruleDefinitions.map(rule => <div className="rule-row" key={rule.field}><div><h3>{rule.title}</h3><p>{rule.description}</p></div><Toggle id={rule.field} labelText={`${rule.title}开关`} labelA="关闭" labelB="开启" hideLabel toggled={settings[rule.field]} onToggle={toggled => { setSettings(current => current && { ...current, [rule.field]: toggled }); setDirty(true); }} /></div>)}
+        {ruleDefinitions.map(rule => <div className="rule-row" key={rule.field}><div><h3>{rule.title}</h3><p>{rule.description}</p></div><Toggle id={rule.field} aria-label={`${rule.title}开关`} labelA="关闭" labelB="开启" toggled={settings[rule.field]} onToggle={toggled => { setSettings(current => current && { ...current, [rule.field]: toggled }); setDirty(true); }} /></div>)}
       </section>
       <section className="panel"><h2>全局参数</h2><div className="form-grid">
-        <TextInput id="bulk-threshold" type="number" min={1} max={512} step={1} labelText="批量阈值（不同文件数）" helperText="同一进程、统计窗口内，1 至 512。" value={fields.threshold} onChange={event => change('threshold', event.target.value)} />
-        <TextInput id="bulk-window" type="number" min={0.1} max={3600} step={0.1} labelText="统计窗口（秒）" helperText="滚动统计不同文件，0.1 至 3600 秒。" value={fields.window} onChange={event => change('window', event.target.value)} />
-        <TextInput id="alert-merge" type="number" min={0.1} max={3600} step={0.1} labelText="告警合并时间（秒）" helperText="同一进程与规则在窗口内合并，首次即时通知。" value={fields.merge} onChange={event => change('merge', event.target.value)} />
-        <TextInput id="archive-correlation" type="number" min={0.1} max={3600} step={0.1} labelText="归档关联时间（秒）" helperText="项目活动与候选归档输出的关联窗口。" value={fields.correlation} onChange={event => change('correlation', event.target.value)} />
+        <TextInput id="bulk-threshold" size="md" type="number" min={1} max={512} step={1} labelText="批量阈值（不同文件数）" helperText="同一进程、统计窗口内，1 至 512。" value={fields.threshold} onChange={event => change('threshold', event.target.value)} />
+        <TextInput id="bulk-window" size="md" type="number" min={0.1} max={3600} step={0.1} labelText="统计窗口（秒）" helperText="滚动统计不同文件，0.1 至 3600 秒。" value={fields.window} onChange={event => change('window', event.target.value)} />
+        <TextInput id="alert-merge" size="md" type="number" min={0.1} max={3600} step={0.1} labelText="告警合并时间（秒）" helperText="同一进程与规则在窗口内合并，首次即时通知。" value={fields.merge} onChange={event => change('merge', event.target.value)} />
+        <TextInput id="archive-correlation" size="md" type="number" min={0.1} max={3600} step={0.1} labelText="归档关联时间（秒）" helperText="项目活动与候选归档输出的关联窗口。" value={fields.correlation} onChange={event => change('correlation', event.target.value)} />
       </div></section>
       <Notice error={validation ?? action.error} success={action.success} />
       {settings.version !== state.data?.version && <Notice error="后台规则版本已变化。保留的编辑内容尚未保存，请重新加载后调整。" />}
-      <div className="actions"><Button type="submit" disabled={!dirty || action.busy || settings.version !== state.data?.version}>{action.busy ? '正在保存' : '保存规则'}</Button><Button kind="secondary" disabled={action.busy} onClick={() => { if (state.data) { setSettings(state.data); setFields(settingsFields(state.data)); setDirty(false); setValidation(undefined); action.reset(); } }}>重新加载</Button></div>
+      <div className="actions"><Button type="submit" size="md" disabled={!dirty || action.busy || settings.version !== state.data?.version}>{action.busy ? '正在保存' : '保存规则'}</Button><Button kind="tertiary" size="md" disabled={action.busy} onClick={() => { if (state.data) { setSettings(state.data); setFields(settingsFields(state.data)); setDirty(false); setValidation(undefined); action.reset(); } }}>重新加载</Button></div>
       <p className="evidence-note">关闭告警规则仍保留文件活动。保存后清空尚未完成的统计窗口，新旧版本不继续合并；旧告警按触发时的参数解释，不重新计算。</p>
     </form>}
   </DataState>;

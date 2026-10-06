@@ -1,5 +1,6 @@
 import { useId, useState, type ReactNode } from 'react';
 import { Button, Checkbox, InlineNotification, Modal, Select, SelectItem, SkeletonText, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@carbon/react';
+import { Document } from '@carbon/react/icons';
 import { downloadExport } from './api';
 import { useAction } from './hooks';
 
@@ -13,12 +14,12 @@ export function DataState({ loading, error, empty, children, emptyTitle = '暂�
 }) {
   if (loading) return <div aria-busy="true" aria-label="正在加载" className="loading"><SkeletonText heading /><SkeletonText paragraph lineCount={4} /></div>;
   if (error) return <Notice error={error} />;
-  if (empty) return <div className="empty-state"><h3>{emptyTitle}</h3><p>{emptyText}</p></div>;
+  if (empty) return <div className="empty-state"><Document size={28} aria-hidden="true" /><h3>{emptyTitle}</h3><p>{emptyText}</p></div>;
   return <>{children}</>;
 }
 
 export function GridTable({ headings, children, label }: { headings: string[]; children: ReactNode; label: string }) {
-  return <div className="table-scroll"><Table size="md" aria-label={label} useZebraStyles={false}>
+  return <div className="table-scroll" role="region" aria-label={`${label}，可滚动表格`} tabIndex={0}><Table size="md" aria-label={label} useZebraStyles={false}>
     <TableHead><TableRow>{headings.map(heading => <TableHeader key={heading}>{heading}</TableHeader>)}</TableRow></TableHead>
     <TableBody>{children}</TableBody>
   </Table></div>;
