@@ -1115,6 +1115,8 @@ async fn asset(request: Request) -> Response {
                 "text/css; charset=utf-8"
             } else if name.ends_with(".svg") {
                 "image/svg+xml"
+            } else if name.ends_with(".png") {
+                "image/png"
             } else if name.ends_with(".woff2") {
                 "font/woff2"
             } else {

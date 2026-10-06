@@ -1,5 +1,7 @@
 # CodePerimeter · 代码门卫
 
+<img src="web/public/codeperimeter.svg" alt="CodePerimeter 盾牌图标" width="64" height="64" />
+
 macOS 本机项目文件活动观察工具。通过本机网页控制台或 Rust CLI 配置多个目录，记录文件打开／可读映射及来源进程，发现批量访问、外部归档命令和关联的归档输出，保存 SQLite 证据并发送系统通知。
 
 文件打开／映射是访问证据，不能证明读完了文件。批量读取不能确认程序在内存中压缩，归档迹象也不能证明源码已经外传。外传拦截属于后续产品目标。

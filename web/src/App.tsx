@@ -77,7 +77,7 @@ export function App() {
   const mainAction = status.error ? null : primaryServiceAction(statusData?.service);
   return <GlobalTheme theme={dark ? 'g100' : 'g10'}><div className="console-shell">
     <a className="skip-link" href="#main-content">跳到主要内容</a>
-    <nav className="side-nav" aria-label="主要导航"><div className="brand"><strong>CodePerimeter</strong><span>本机监控控制台</span></div>
+    <nav className="side-nav" aria-label="主要导航"><div className="brand"><img className="brand-icon" src="/codeperimeter.svg" alt="" width="32" height="32" /><div><strong>CodePerimeter</strong><span>本机监控控制台</span></div></div>
       <div className="nav-links">{pages.map(item => <button key={item.key} type="button" aria-current={page === item.key ? 'page' : undefined} onClick={() => navigate(item.key)}><item.icon size={20} /><span>{item.label}</span></button>)}</div>
       <div className="nav-bottom"><span>仅本机访问</span><Select id="theme-selection" labelText="外观" size="sm" value={theme} onChange={event => setTheme(event.target.value)}><SelectItem value="system" text="跟随系统" /><SelectItem value="light" text="浅色" /><SelectItem value="dark" text="深色" /></Select></div>
     </nav>

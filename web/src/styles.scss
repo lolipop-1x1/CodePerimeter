@@ -66,8 +66,9 @@ button:disabled { cursor: not-allowed; }
 button:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .console-shell { min-height: 100dvh; }
 .side-nav { position: fixed; inset: 0 auto 0 0; width: 212px; background: var(--sidebar); border-right: 1px solid var(--border); padding: 24px 14px; display: flex; flex-direction: column; z-index: 10; }
-.brand { padding: 0 10px 26px; }
-.brand strong { display: block; font-size: 20px; font-weight: 700; letter-spacing: -0.7px; }
+.brand { display: flex; align-items: center; gap: 8px; padding: 0 6px 26px; }
+.brand-icon { flex: none; width: 32px; height: 32px; }
+.brand strong { display: block; font-size: 18px; font-weight: 700; letter-spacing: -0.7px; }
 .brand span { color: var(--muted); font-size: 13px; }
 .nav-links { display: flex; flex-direction: column; gap: 6px; }
 .nav-links button { border: 0; border-radius: 6px; background: transparent; color: var(--muted); min-height: 42px; text-align: left; display: flex; align-items: center; gap: 13px; padding: 10px 13px; font-size: 14px; }

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!-- 复用 native/notifications/MakeIcon.swift 的盾牌比例与品牌颜色。 -->
+  <rect x="3.84" y="3.84" width="56.32" height="56.32" rx="12.16" fill="#212629"/>
+  <path d="M32 12.8 48 19.2 46.72 35.2C46.08 44.16 37.76 48.64 32 51.2C26.24 48.64 17.92 44.16 17.28 35.2L16 19.2Z" fill="#8cd4a8"/>
+  <rect x="30.08" y="23.04" width="3.84" height="18.56" rx="1.92" fill="#212629"/>
+</svg>
