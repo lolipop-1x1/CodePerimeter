@@ -8,6 +8,7 @@ use std::io::{self, Cursor, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::mpsc;
 use std::thread;
 use tempfile::TempDir;
 
@@ -65,15 +66,19 @@ fn transports_explicit_test_frames_and_detects_eof() {
         },
     ];
     let expected = frames.clone();
+    let (client_ready, wait_for_client) = mpsc::channel();
     let producer = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         verify_peer_uid(&stream, uid).unwrap();
+        // 短连接须等客户端完成身份核验与初始化，不能先写完并关闭。
+        wait_for_client.recv().unwrap();
         for frame in &frames {
             write_frame(&mut stream, frame).unwrap();
         }
     });
     // expected UID 显式为本机用户；生产 connect 始终要求 root。
     let mut client = CollectorClient::connect_expected(&path, uid).unwrap();
+    client_ready.send(()).unwrap();
     for frame in expected {
         assert_eq!(client.read_frame().unwrap(), frame);
     }
@@ -151,13 +156,17 @@ fn skips_an_oversized_line_and_recovers_at_next_boundary() {
 #[test]
 fn malformed_frames_do_not_echo_raw_values() {
     let (_directory, listener, path) = test_listener();
+    let (client_ready, wait_for_client) = mpsc::channel();
     let producer = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        // 仅同步测试发送时机，保留生产客户端的完整身份核验。
+        wait_for_client.recv().unwrap();
         stream
             .write_all(b"{\"synthetic-private-marker\":\n")
             .unwrap();
     });
     let mut client = CollectorClient::connect_expected(&path, unsafe { libc::geteuid() }).unwrap();
+    client_ready.send(()).unwrap();
     let error = client.read_frame().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(!error.to_string().contains("synthetic-private-marker"));
