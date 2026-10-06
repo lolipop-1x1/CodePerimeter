@@ -231,6 +231,11 @@ fn service_plan_separates_root_daemon_and_desktop_roles() {
     for job in &plan.jobs {
         assert_eq!(job.argv[0], plan.installed_binary.to_string_lossy());
         assert!(job.plist.contains("<key>KeepAlive</key><true/>"));
+        // 实时来源不能使用会限制 CPU／I/O 的 Background 调度。
+        assert!(
+            job.plist
+                .contains("<key>ProcessType</key><string>Standard</string>")
+        );
         assert!(
             job.plist
                 .contains("<key>StandardOutPath</key><string>/dev/null</string>")

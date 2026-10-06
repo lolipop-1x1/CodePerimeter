@@ -1,6 +1,7 @@
 //! 普通用户宿主：独占 SQLite、分析受保护目录活动，并通过本地 IPC 服务 CLI 与通知进程。
 
 use crate::Result;
+use crate::console::{ConsoleRequest, RulesSettings};
 use crate::eslogger::{AdapterHealth, EsloggerAdapter};
 use crate::model::{ActivityEvent, Alert, EventKind, SourceStream, now_ms};
 use crate::rules::{RuleConfig, RuleEngine};
@@ -21,7 +22,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -103,6 +103,9 @@ pub enum ControlRequest {
         until_ms: Option<i64>,
     },
     ClearCumulativeStats,
+    Console {
+        request: ConsoleRequest,
+    },
     PendingNotifications {
         limit: usize,
     },
@@ -141,6 +144,8 @@ pub struct PipelineTiming {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeStatus {
     pub state: String,
+    #[serde(default)]
+    pub monitoring_paused: bool,
     pub uid: u32,
     pub bulk_file_threshold: usize,
     pub bulk_window_ms: i64,
@@ -270,6 +275,8 @@ struct DaemonState {
     uid: u32,
     bulk_file_threshold: usize,
     bulk_window_ms: i64,
+    monitoring_paused: bool,
+    retention_preview: Option<(u64, i64, u32, i64, Value)>,
     storage: Storage,
     rules: RuleEngine,
     adapters: BTreeMap<SourceStream, EsloggerAdapter>,
@@ -527,13 +534,18 @@ fn run_daemon_inner(
     let listener = bind_control(&options.control_socket, uid)?;
     let storage = Storage::open(&options.database_path)?;
     let roots = storage.active_directory_paths()?;
-    let rules = RuleEngine::new(
-        roots,
-        RuleConfig {
-            bulk_file_threshold: options.bulk_file_threshold,
-            bulk_window_ms: options.bulk_window_ms,
-            ..RuleConfig::default()
-        },
+    let initial_config = RuleConfig {
+        bulk_file_threshold: options.bulk_file_threshold,
+        bulk_window_ms: options.bulk_window_ms,
+        ..RuleConfig::default()
+    };
+    let settings = storage.initialize_console_rules(RulesSettings::from_config(&initial_config))?;
+    let monitoring_paused = storage.monitoring_paused()?;
+    let mut rules = RuleEngine::new(roots, initial_config)?;
+    rules.replace_settings(&settings)?;
+    rules.replace_scope(
+        storage.active_directory_paths()?,
+        storage.excluded_directory_paths()?,
     )?;
     let (sender, receiver) = mpsc::sync_channel(COLLECTOR_QUEUE_CAPACITY);
     let reader_dropped_frames = Arc::new(AtomicU64::new(0));
@@ -547,8 +559,10 @@ fn run_daemon_inner(
     );
     let mut state = DaemonState {
         uid,
-        bulk_file_threshold: options.bulk_file_threshold,
-        bulk_window_ms: options.bulk_window_ms,
+        bulk_file_threshold: settings.bulk_file_threshold,
+        bulk_window_ms: settings.bulk_window_ms,
+        monitoring_paused,
+        retention_preview: None,
         storage,
         rules,
         adapters: BTreeMap::new(),
@@ -824,6 +838,193 @@ fn write_control_response(stream: &mut UnixStream, response: &ControlResponse) -
 }
 
 impl DaemonState {
+    fn handle_console(&mut self, request: ConsoleRequest) -> Result<Value> {
+        if self.database_state != "ready" {
+            return Err(io::Error::other("数据库处于写入冷却期").into());
+        }
+        match request {
+            ConsoleRequest::Summary { since_ms, until_ms } => {
+                self.storage.console_summary(since_ms, until_ms)
+            }
+            ConsoleRequest::Directories => self.storage.console_directories().and_then(json_value),
+            ConsoleRequest::DirectorySet { path, enabled } => {
+                let directories = self.storage.set_console_directory(&path, enabled)?;
+                self.refresh_roots()?;
+                json_value(directories)
+            }
+            ConsoleRequest::DirectoryRemovePreview { path } => {
+                self.storage.console_directory_remove_preview(&path)
+            }
+            ConsoleRequest::RulesGet => self.storage.console_rules().and_then(json_value),
+            ConsoleRequest::RulesSet { settings } => {
+                let settings = self.storage.save_console_rules(settings)?;
+                self.rules.replace_settings(&settings)?;
+                self.bulk_file_threshold = settings.bulk_file_threshold;
+                self.bulk_window_ms = settings.bulk_window_ms;
+                self.write_health(
+                    "rules",
+                    "rules_changed",
+                    "ready",
+                    "新规则版本已保存并对后续事件生效；旧统计窗口已清除。",
+                );
+                json_value(settings)
+            }
+            ConsoleRequest::EventsPage {
+                filter,
+                cursor,
+                search,
+                archive_only,
+            } => self
+                .storage
+                .console_events_page(&filter, cursor.as_deref(), search.as_deref(), archive_only)
+                .and_then(json_value),
+            ConsoleRequest::AlertsPage {
+                filter,
+                cursor,
+                search,
+                is_read,
+                processed,
+            } => self
+                .storage
+                .console_alerts_page(
+                    &filter,
+                    cursor.as_deref(),
+                    search.as_deref(),
+                    is_read,
+                    processed,
+                )
+                .and_then(json_value),
+            ConsoleRequest::EventDetail { id } => self.storage.console_event_detail(id),
+            ConsoleRequest::AlertDetail { id } => self
+                .storage
+                .console_alert_entry(&id, true)
+                .and_then(json_value),
+            ConsoleRequest::AlertUpdate {
+                id,
+                is_read,
+                processed,
+                note,
+                expected_revision,
+            } => self
+                .storage
+                .console_alert_update(&id, is_read, processed, note.as_deref(), expected_revision)
+                .and_then(json_value),
+            ConsoleRequest::RetentionGet => self.storage.console_retention(),
+            ConsoleRequest::RetentionPreview { days } => {
+                let observed = now_ms();
+                let cutoff = observed.saturating_sub(i64::from(days) * 86_400_000);
+                let mut preview = self.storage.console_retention_preview(days, cutoff)?;
+                let revision = self
+                    .retention_preview
+                    .as_ref()
+                    .map_or(observed as u64, |value| {
+                        (observed as u64).max(value.0.saturating_add(1))
+                    });
+                let counts = preview["counts"].clone();
+                preview["preview_revision"] = serde_json::json!(revision);
+                self.retention_preview = Some((revision, observed, days, cutoff, counts));
+                Ok(preview)
+            }
+            ConsoleRequest::RetentionSet {
+                days,
+                confirm,
+                preview_revision,
+            } => {
+                let result = if days < self.storage.retention_days()? {
+                    let invalid = || {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "保存期限预览已变化，请刷新并重新确认",
+                        )
+                    };
+                    let (revision, observed, preview_days, cutoff, counts) =
+                        self.retention_preview.as_ref().ok_or_else(invalid)?.clone();
+                    if !confirm
+                        || preview_revision != Some(revision)
+                        || days != preview_days
+                        || now_ms().saturating_sub(observed) > 60_000
+                        || self.storage.console_retention_preview(days, cutoff)?["counts"] != counts
+                    {
+                        return Err(invalid().into());
+                    }
+                    self.storage.set_console_retention_before(days, cutoff)?
+                } else {
+                    self.storage.set_console_retention(days, confirm)?
+                };
+                self.retention_preview = None;
+                self.write_health(
+                    "storage",
+                    "retention_changed",
+                    "ready",
+                    "明细保存期限已更新；累计统计与目录规则配置保持独立。",
+                );
+                Ok(result)
+            }
+            ConsoleRequest::ClearDetails { confirm } => {
+                let result = self.storage.clear_console_details(confirm)?;
+                self.refresh_roots()?;
+                self.memory_alerts.clear();
+                self.deferred_alerts.clear();
+                self.sent_memory_alerts.clear();
+                self.retry_alerts.clear();
+                // 已删除告警不能通过已有通知会话再次投递或重新写回。
+                self.notify_session = None;
+                Ok(result)
+            }
+            ConsoleRequest::ClearCumulative { confirm } => {
+                if !confirm {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "清除累计统计需要确认",
+                    )
+                    .into());
+                }
+                self.clear_cumulative_stats()
+            }
+            ConsoleRequest::MonitoringSet { paused } => {
+                self.storage.set_monitoring_paused(paused)?;
+                self.monitoring_paused = paused;
+                self.refresh_roots()?;
+                self.write_health(
+                    "collector",
+                    if paused {
+                        "monitoring_paused"
+                    } else {
+                        "monitoring_resumed"
+                    },
+                    if paused { "gap" } else { "pending" },
+                    if paused {
+                        "用户已暂停监控；暂停期间无完整文件活动证据。"
+                    } else {
+                        "暂停意图已解除；实际采集健康需独立验证。"
+                    },
+                );
+                Ok(serde_json::json!({"paused":paused}))
+            }
+            ConsoleRequest::RecordOperation { operation, outcome } => {
+                if !["install", "start", "pause", "resume", "uninstall"]
+                    .contains(&operation.as_str())
+                    || !["succeeded", "cancelled", "failed"].contains(&outcome.as_str())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "服务操作或结果不受支持",
+                    )
+                    .into());
+                }
+                self.storage.record_health(&HealthRecord {
+                    source: None,
+                    observed_timestamp_ms: now_ms(),
+                    component: "service".into(),
+                    code: operation,
+                    state: outcome,
+                    detail: None,
+                })?;
+                Ok(serde_json::json!({"recorded":true}))
+            }
+        }
+    }
+
     fn status(&self) -> RuntimeStatus {
         let now = now_ms();
         let health: Vec<_> = self
@@ -836,6 +1037,7 @@ impl DaemonState {
         let message = health.first().and_then(|source| source.message_version);
         RuntimeStatus {
             state: "running".into(),
+            monitoring_paused: self.monitoring_paused,
             uid: self.uid,
             bulk_file_threshold: self.bulk_file_threshold,
             bulk_window_ms: self.bulk_window_ms,
@@ -881,6 +1083,21 @@ impl DaemonState {
     }
 
     fn handle_control(&mut self, request: ControlRequest) -> (ControlResponse, bool) {
+        if let ControlRequest::Console { request } = request {
+            let response = match self.handle_console(request) {
+                Ok(data) => response_ok(&data),
+                Err(error) => {
+                    if let Some(error) = error.downcast_ref::<io::Error>()
+                        && error.kind() == io::ErrorKind::InvalidInput
+                    {
+                        response_error(&error.to_string())
+                    } else {
+                        response_error("控制台操作失败；请查看宿主与数据库状态")
+                    }
+                }
+            };
+            return (response, false);
+        }
         let result = match request {
             ControlRequest::Status => json_value(self.status()),
             ControlRequest::ExecReceipt {
@@ -930,6 +1147,7 @@ impl DaemonState {
                 })
             }
             ControlRequest::ClearCumulativeStats => self.clear_cumulative_stats(),
+            ControlRequest::Console { .. } => unreachable!("控制台请求已单独处理"),
             ControlRequest::PendingNotifications { limit } => self
                 .storage
                 .pending_notifications(limit.min(MAX_QUERY_LIMIT))
@@ -1043,8 +1261,10 @@ impl DaemonState {
     }
 
     fn refresh_roots(&mut self) -> Result<()> {
-        self.rules
-            .replace_roots(self.storage.active_directory_paths()?)?;
+        self.rules.replace_scope(
+            self.storage.active_directory_paths()?,
+            self.storage.excluded_directory_paths()?,
+        )?;
         Ok(())
     }
 
@@ -1126,6 +1346,12 @@ impl DaemonState {
                         self.adapters
                             .insert(*stream, EsloggerAdapter::new_with_stream(&run_id, *stream));
                     }
+                }
+                // 新来源按首次帧加入；旧采集器仍按实际路数核验版本和健康。
+                if matches!(source_stream, SourceStream::Read | SourceStream::Write) {
+                    self.adapters.entry(source_stream).or_insert_with(|| {
+                        EsloggerAdapter::new_with_stream(&run_id, source_stream)
+                    });
                 }
                 let previous_version = self.adapters.get(&source_stream).and_then(|adapter| {
                     let health = adapter.health();
@@ -1283,6 +1509,9 @@ impl DaemonState {
     }
 
     fn handle_event(&mut self, event: ActivityEvent) {
+        if self.monitoring_paused {
+            return;
+        }
         let kind = event_kind_name(event.kind).to_owned();
         *self.counters.observed.entry(kind.clone()).or_default() += 1;
         self.last_event_received_ms = Some(event.received_timestamp_ms);
@@ -1310,11 +1539,16 @@ impl DaemonState {
         }
         if output.matched_directories.is_empty() {
             *self.counters.filtered.entry(kind.clone()).or_default() += 1;
-        } else {
-            self.persist_matched_event(&event, &output.matched_directories);
+        } else if let Some(event_id) =
+            self.persist_matched_event(&event, &output.matched_directories, None)
+        {
+            self.rules.mark_archive_output_persisted(&event, event_id);
         }
         if let Some((command, directories)) = &output.reassociated_exec {
-            self.persist_matched_event(command, directories);
+            let _ = self.persist_matched_event(command, directories, None);
+        }
+        for (original, directories, event_id) in &output.reassociated_outputs {
+            let _ = self.persist_matched_event(original, directories, *event_id);
         }
         for alert in output.alerts {
             if self.database_state == "ready" {
@@ -1332,22 +1566,33 @@ impl DaemonState {
         }
     }
 
-    fn persist_matched_event(&mut self, event: &ActivityEvent, directories: &[PathBuf]) {
+    fn persist_matched_event(
+        &mut self,
+        event: &ActivityEvent,
+        directories: &[PathBuf],
+        existing_event_id: Option<i64>,
+    ) -> Option<i64> {
         if self.database_state == "ready" {
-            match self.storage.record_event(event, directories) {
-                Ok(true) => {
-                    *self
-                        .counters
-                        .persisted
-                        .entry(event_kind_name(event.kind).to_owned())
-                        .or_default() += 1
+            match self
+                .storage
+                .record_event_with_identity(event, directories, existing_event_id)
+            {
+                Ok((inserted, event_id)) => {
+                    if inserted {
+                        *self
+                            .counters
+                            .persisted
+                            .entry(event_kind_name(event.kind).to_owned())
+                            .or_default() += 1;
+                    }
+                    return Some(event_id);
                 }
-                Ok(false) => {}
                 Err(_) => self.database_write_failed(1),
             }
         } else {
             self.database_gap_events = self.database_gap_events.saturating_add(1);
         }
+        None
     }
 
     fn queue_alert(&mut self, alert: Alert) {
@@ -1468,7 +1713,7 @@ impl DaemonState {
                         "storage",
                         "details_expired",
                         "gap",
-                        "超过30天的明细已清理，累计统计保留；过期部分无法完整追溯。",
+                        "超过当前保存期限的明细已清理，累计统计保留；过期部分无法完整追溯。",
                     );
                 }
             }
@@ -1840,8 +2085,8 @@ pub fn notify_once_with_sender(
         NotifyPollResult::Alert { alert, persisted } => {
             let title = match alert.rule {
                 crate::model::AlertRule::BulkFileAccess => "检测到批量文件访问",
-                crate::model::AlertRule::ArchiveCommand => "检测到归档命令",
-                crate::model::AlertRule::ArchiveOutput => "检测到归档输出",
+                crate::model::AlertRule::ArchiveCommand => "归档命令迹象",
+                crate::model::AlertRule::ArchiveOutput => "归档输出迹象",
             };
             let body = format!(
                 "PID {} · {} 个文件 · {}",
@@ -1916,43 +2161,35 @@ fn summary_notification_body(summary: &PendingNotificationSummary) -> String {
 
 /// 生产通知helper；保持轮询直到launchd停止该用户进程。
 pub fn run_notify(control_socket: &Path) -> Result<()> {
-    let session_id = format!("notify-{}-{}", std::process::id(), now_ms());
-    let mut sender = OsascriptSender;
-    loop {
-        match notify_burst_with_sender(control_socket, &session_id, &mut sender, MAX_NOTIFY_BURST) {
-            Ok(sent) if sent > 0 => continue,
-            Ok(_) => thread::sleep(Duration::from_millis(250)),
-            Err(_) => {
-                eprintln!("CodePerimeter 通知宿主暂不可用，将重试。");
-                thread::sleep(Duration::from_secs(1));
-            }
-        }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = control_socket;
+        Err(io::Error::new(io::ErrorKind::Unsupported, "系统通知仅支持 macOS").into())
     }
-}
-
-struct OsascriptSender;
-
-impl NotificationSender for OsascriptSender {
-    fn send(&mut self, title: &str, body: &str) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            let script = "on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run";
-            let status = Command::new("/usr/bin/osascript")
-                .arg("-e")
-                .arg(script)
-                .arg(body)
-                .arg(title)
-                .status()?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other("系统通知发送失败").into())
-            }
+    #[cfg(target_os = "macos")]
+    {
+        let session_id = format!("notify-{}-{}", std::process::id(), now_ms());
+        let mut sender = crate::notifications::NativeNotificationSender::new(include_bytes!(
+            concat!(env!("OUT_DIR"), "/CodePerimeterNotifications")
+        ))?;
+        // 先申请普通通知权限；拒绝不影响采集，后续发送仍记录失败而非伪成功。
+        if sender.request_authorization().is_err() {
+            eprintln!("CodePerimeter 系统通知授权未完成，发送结果将保留失败。");
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (title, body);
-            Err(io::Error::new(io::ErrorKind::Unsupported, "系统通知仅支持 macOS").into())
+        loop {
+            match notify_burst_with_sender(
+                control_socket,
+                &session_id,
+                &mut sender,
+                MAX_NOTIFY_BURST,
+            ) {
+                Ok(sent) if sent > 0 => continue,
+                Ok(_) => thread::sleep(Duration::from_millis(250)),
+                Err(_) => {
+                    eprintln!("CodePerimeter 通知宿主暂不可用，将重试。");
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
         }
     }
 }

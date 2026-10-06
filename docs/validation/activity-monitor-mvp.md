@@ -43,7 +43,7 @@
 | 3 秒生成／通知发送 | 实际标准事件、outbox、通知反馈的独立时间 | 22条均通过；生成max2255ms／发送max2541ms，missing均0；不代表实际到屏 |
 | 通知到屏、后台 FDA、登录补发和重启 | 下文独立步骤 | 尚未验收 |
 
-原生输入参考 macOS 15.6.1 的 eslogger schema 1／message 9 和 Apple SDK 字段；实际脚本会报告本机 OS、Python、二进制版本及 SHA256。SQLite 读取器锁定 schema 3，发现不兼容立即失败。宿主状态回显当前 run_id 的实际 schema／message 版本；标准事件保存对应版本，健康查询的 source 保留 run_id、版本、field 和 missing_events。每个采集运行首次实见或版本变更才新增版本健康记录；用 `health --source-run-id <run_id>` 回查版本变化和缺口。旧 v1／v2 数据原子迁移，旧事件缺版本时保持未知。
+原生输入参考 macOS 15.6.1 的 eslogger schema 1／message 9 和 Apple SDK 字段；实际脚本会报告本机 OS、Python、二进制版本及 SHA256。SQLite 读取器明确支持已核对的 schema 3／4：网页控制台迁移到 4 后保留原有核心证据表契约；其他版本立即拒绝，不根据字段相似猜测兼容。两版核心证据读回及归档屏障读取已有匿名组件回归，不表示 schema 4 的真实系统验收已通过。宿主状态回显当前 run_id 的实际 schema／message 版本；标准事件保存对应版本，健康查询的 source 保留 run_id、版本、field 和 missing_events。每个采集运行首次实见或版本变更才新增版本健康记录；用 `health --source-run-id <run_id>` 回查版本变化和缺口。旧 v1／v2 数据原子迁移，旧事件缺版本时保持未知。
 
 CI 固定 Rust 1.88.0，与 Cargo rust-version 和本机已验证基线一致；fmt、clippy `-D warnings` 与测试步骤保持。工具链升级需要独立验证，不把浮动 stable 的新增 lint 当作功能测试结论。
 

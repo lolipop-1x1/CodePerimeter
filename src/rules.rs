@@ -6,6 +6,10 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static ENGINE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_BULK_WINDOW_MS: i64 = 10_000;
 const DEFAULT_BULK_FILE_THRESHOLD: usize = 50;
@@ -54,6 +58,7 @@ pub struct RuleOutput {
     pub health: Vec<RuleHealth>,
     pub matched_directories: Vec<PathBuf>,
     pub reassociated_exec: Option<(ActivityEvent, Vec<PathBuf>)>,
+    pub reassociated_outputs: Vec<(ActivityEvent, Vec<PathBuf>, Option<i64>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -102,6 +107,14 @@ struct ProcessState {
     bulk_files: HashMap<FileKey, FileTouch>,
     recent_reads: VecDeque<FileTouch>,
     pending_archive_exec: Option<ActivityEvent>,
+    pending_archive_outputs: VecDeque<PendingArchiveOutput>,
+    exit_source_timestamp_ms: Option<i64>,
+}
+
+#[derive(Debug)]
+struct PendingArchiveOutput {
+    event: ActivityEvent,
+    persisted_event_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -131,12 +144,15 @@ struct AlertCandidate {
 
 pub struct RuleEngine {
     roots: Vec<PathBuf>,
+    exclusions: Vec<PathBuf>,
+    enabled_rules: [bool; 3],
     config: RuleConfig,
     process_states: HashMap<ProcessKey, ProcessState>,
     unknown_processes: HashMap<UnknownProcessKey, UnknownProcessInstance>,
     next_observed_instance: u64,
     alerts: HashMap<AlertKey, PendingAlert>,
     next_alert_id: u64,
+    instance_id: String,
     health_last_emitted: HashMap<String, i64>,
 }
 
@@ -146,12 +162,22 @@ impl RuleEngine {
         let roots = normalize_roots(roots)?;
         Ok(Self {
             roots,
+            exclusions: Vec::new(),
+            enabled_rules: [true; 3],
             config,
             process_states: HashMap::new(),
             unknown_processes: HashMap::new(),
             next_observed_instance: 0,
             alerts: HashMap::new(),
             next_alert_id: 0,
+            instance_id: format!(
+                "{}-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                ENGINE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ),
             health_last_emitted: HashMap::new(),
         })
     }
@@ -166,6 +192,35 @@ impl RuleEngine {
 
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
+    }
+
+    /// 设置停用子树；排除优先于任何启用根目录，并清除旧范围的统计。
+    pub fn replace_scope(&mut self, roots: Vec<PathBuf>, exclusions: Vec<PathBuf>) -> Result<()> {
+        let exclusions = normalize_roots(exclusions)?;
+        self.replace_roots(roots)?;
+        self.exclusions = exclusions;
+        Ok(())
+    }
+
+    /// 保留告警编号单调递增，避免规则版本变更后覆盖既有证据。
+    pub fn replace_settings(&mut self, settings: &crate::console::RulesSettings) -> Result<()> {
+        settings.validate()?;
+        let mut config = self.config.clone();
+        config.bulk_file_threshold = settings.bulk_file_threshold;
+        config.bulk_window_ms = settings.bulk_window_ms;
+        config.alert_merge_window_ms = settings.alert_merge_window_ms;
+        config.archive_correlation_window_ms = settings.archive_correlation_window_ms;
+        validate_config(&config)?;
+        self.config = config;
+        self.enabled_rules = [
+            settings.bulk_enabled,
+            settings.archive_command_enabled,
+            settings.archive_output_enabled,
+        ];
+        self.process_states.clear();
+        self.unknown_processes.clear();
+        self.alerts.clear();
+        Ok(())
     }
 
     pub fn process(&mut self, event: &ActivityEvent) -> RuleOutput {
@@ -194,6 +249,24 @@ impl RuleEngine {
 
         let process_key = self.process_key(event, &mut output.health);
         output.matched_directories = self.event_directories(event);
+
+        if event.kind != EventKind::Exit
+            && let Some(exit_time) = self
+                .process_states
+                .get(&process_key)
+                .and_then(|state| state.exit_source_timestamp_ms)
+            && event
+                .source_timestamp_ms
+                .is_none_or(|time| time >= exit_time)
+        {
+            self.push_health(
+                &mut output,
+                "event_after_process_exit",
+                event.received_timestamp_ms,
+                "已退出代际的事件缺少退出前来源时间证据；不延续旧进程规则窗口。",
+            );
+            return output;
+        }
 
         if event.source_timestamp_ms.is_some()
             && self
@@ -230,6 +303,17 @@ impl RuleEngine {
                     .alerts
                     .push(self.emit_alert(&process_key, candidate, &mut output.health));
                 output.reassociated_exec = Some((command, roots));
+            }
+            for (original, candidate, persisted_event_id) in
+                self.reassociate_archive_outputs(event, &process_key)
+            {
+                let roots = candidate.roots.clone();
+                output
+                    .alerts
+                    .push(self.emit_alert(&process_key, candidate, &mut output.health));
+                output
+                    .reassociated_outputs
+                    .push((original, roots, persisted_event_id));
             }
         }
 
@@ -269,24 +353,72 @@ impl RuleEngine {
             }
         }
 
-        if let Some(candidate) = self.archive_output_candidate(
-            event,
-            &process_key,
-            event_timestamp_ms,
-            &mut output.health,
-        ) {
-            output
-                .matched_directories
-                .extend(candidate.roots.iter().cloned());
-            output
-                .alerts
-                .push(self.emit_alert(&process_key, candidate, &mut output.health));
+        if let Some(path) = self.archive_output_path(event, &mut output.health) {
+            if let Some(candidate) =
+                self.archive_output_candidate(event, &process_key, event_timestamp_ms, path)
+            {
+                output
+                    .matched_directories
+                    .extend(candidate.roots.iter().cloned());
+                output
+                    .alerts
+                    .push(self.emit_alert(&process_key, candidate, &mut output.health));
+            } else {
+                self.remember_archive_output(event, &process_key, &mut output.health);
+            }
         }
 
         sort_dedup_paths(&mut output.matched_directories);
+        output.alerts.retain(|alert| match alert.rule {
+            AlertRule::BulkFileAccess => self.enabled_rules[0],
+            AlertRule::ArchiveCommand => self.enabled_rules[1],
+            AlertRule::ArchiveOutput => self.enabled_rules[2],
+        });
 
         if event.kind == EventKind::Exit {
-            self.process_states.remove(&process_key);
+            if event.source_stream != SourceStream::Combined
+                && event.process.pid_version.is_some()
+                && let Some(exit_time) = event.source_timestamp_ms
+            {
+                // 分流的退出可能先到；保留该已知代际的退出前证据，退出后不续窗。
+                self.ensure_process_state(
+                    &process_key,
+                    event.received_timestamp_ms,
+                    &mut output.health,
+                );
+                if let Some(state) = self.process_states.get_mut(&process_key) {
+                    let exit_time = state
+                        .exit_source_timestamp_ms
+                        .map_or(exit_time, |known| known.min(exit_time));
+                    state.exit_source_timestamp_ms = Some(exit_time);
+                    state
+                        .recent_reads
+                        .retain(|touch| touch.timestamp_ms < exit_time);
+                    state
+                        .bulk_files
+                        .retain(|_, touch| touch.timestamp_ms < exit_time);
+                    state.source_watermark_ms = state
+                        .recent_reads
+                        .iter()
+                        .map(|touch| touch.timestamp_ms)
+                        .max();
+                    state.pending_archive_outputs.retain(|pending| {
+                        pending
+                            .event
+                            .source_timestamp_ms
+                            .is_some_and(|time| time < exit_time)
+                    });
+                    if state.pending_archive_exec.as_ref().is_some_and(|pending| {
+                        pending
+                            .source_timestamp_ms
+                            .is_none_or(|time| time >= exit_time)
+                    }) {
+                        state.pending_archive_exec = None;
+                    }
+                }
+            } else {
+                self.process_states.remove(&process_key);
+            }
             self.unknown_processes.remove(&UnknownProcessKey {
                 source_run_id: event.source_run_id.clone(),
                 source_stream: event.source_stream,
@@ -302,7 +434,10 @@ impl RuleEngine {
         read: &ActivityEvent,
         process_key: &ProcessKey,
     ) -> Option<(ActivityEvent, AlertCandidate)> {
-        if read.source_stream != SourceStream::Activity {
+        if !matches!(
+            read.source_stream,
+            SourceStream::Read | SourceStream::Activity
+        ) {
             return None;
         }
         let read_timestamp = read.source_timestamp_ms?;
@@ -338,6 +473,138 @@ impl RuleEngine {
             .get_mut(process_key)?
             .pending_archive_exec = None;
         Some((command, candidate))
+    }
+
+    fn remember_archive_output(
+        &mut self,
+        event: &ActivityEvent,
+        key: &ProcessKey,
+        health: &mut Vec<RuleHealth>,
+    ) {
+        if !self.enabled_rules[2]
+            || !matches!(
+                event.source_stream,
+                SourceStream::Activity | SourceStream::Write
+            )
+            || event.process.pid_version.is_none()
+            || event.source_timestamp_ms.is_none()
+        {
+            return;
+        }
+        self.ensure_process_state(key, event.received_timestamp_ms, health);
+        let state = self.process_states.get_mut(key).expect("进程状态已建立");
+        if (event.global_seq.is_some() || event.event_seq.is_some())
+            && state
+                .pending_archive_outputs
+                .iter()
+                .any(|pending| pending.event == *event)
+        {
+            return;
+        }
+        let evicted = state.pending_archive_outputs.len() >= self.config.max_evidence_paths;
+        if evicted {
+            state.pending_archive_outputs.pop_front();
+        }
+        state
+            .pending_archive_outputs
+            .push_back(PendingArchiveOutput {
+                event: event.clone(),
+                persisted_event_id: None,
+            });
+        if evicted {
+            self.push_health_records(
+                health,
+                "archive_output_state_capacity",
+                event.received_timestamp_ms,
+                "进程待关联归档输出达到证据上限；最早候选已清除，迟到关联可能缺失。",
+            );
+        }
+    }
+
+    /// 本次观测成功落库后绑定原行；无序号的独立观测也各自保留身份。
+    pub(crate) fn mark_archive_output_persisted(&mut self, event: &ActivityEvent, event_id: i64) {
+        if !matches!(
+            event.kind,
+            EventKind::Create | EventKind::Write | EventKind::Rename
+        ) {
+            return;
+        }
+        let Some(pid_version) = event.process.pid_version else {
+            return;
+        };
+        let key = ProcessKey {
+            source_run_id: event.source_run_id.clone(),
+            pid: event.process.pid,
+            generation: ProcessGeneration::Source(pid_version),
+        };
+        if let Some(state) = self.process_states.get_mut(&key)
+            && let Some(pending) = state
+                .pending_archive_outputs
+                .iter_mut()
+                .rev()
+                .find(|pending| pending.persisted_event_id.is_none() && pending.event == *event)
+        {
+            pending.persisted_event_id = Some(event_id);
+        }
+    }
+
+    fn reassociate_archive_outputs(
+        &mut self,
+        read: &ActivityEvent,
+        key: &ProcessKey,
+    ) -> Vec<(ActivityEvent, AlertCandidate, Option<i64>)> {
+        let mut result = Vec::new();
+        if !self.enabled_rules[2]
+            || !matches!(
+                read.source_stream,
+                SourceStream::Read | SourceStream::Activity
+            )
+            || read.process.pid_version.is_none()
+        {
+            return result;
+        }
+        let Some(time) = read.source_timestamp_ms else {
+            return result;
+        };
+        let Some(file) = read.file.as_ref() else {
+            return result;
+        };
+        if file.path_truncated || file.readable != Some(true) || file.is_regular == Some(false) {
+            return result;
+        }
+        let Some(path) = normalize_path(&file.path) else {
+            return result;
+        };
+        let Some(state) = self.process_states.get_mut(key) else {
+            return result;
+        };
+        if !state
+            .recent_reads
+            .iter()
+            .any(|touch| touch.timestamp_ms == time && touch.path == path)
+        {
+            return result;
+        }
+        let pending = std::mem::take(&mut state.pending_archive_outputs);
+        let mut retained = VecDeque::new();
+        for pending in pending {
+            let original = &pending.event;
+            let output_time = original.source_timestamp_ms.expect("候选来源时间已核验");
+            if time <= output_time
+                && output_time.saturating_sub(time) <= self.config.archive_correlation_window_ms
+                && let Some(path) = self.archive_output_path(original, &mut Vec::new())
+                && let Some(candidate) =
+                    self.archive_output_candidate(original, key, output_time, path)
+            {
+                result.push((pending.event, candidate, pending.persisted_event_id));
+            } else {
+                retained.push_back(pending);
+            }
+        }
+        if let Some(state) = self.process_states.get_mut(key) {
+            state.pending_archive_outputs = retained;
+        }
+        result
     }
 
     fn process_key(&mut self, event: &ActivityEvent, health: &mut Vec<RuleHealth>) -> ProcessKey {
@@ -659,12 +926,40 @@ impl RuleEngine {
     }
 
     fn archive_output_candidate(
-        &mut self,
+        &self,
         event: &ActivityEvent,
         process_key: &ProcessKey,
         event_timestamp_ms: i64,
-        health: &mut Vec<RuleHealth>,
+        output: PathBuf,
     ) -> Option<AlertCandidate> {
+        let (mut roots, mut read_paths) =
+            self.recent_read_summary(process_key, event_timestamp_ms)?;
+        let first_timestamp_ms = self
+            .recent_read_first_timestamp(process_key, event_timestamp_ms)
+            .unwrap_or(event_timestamp_ms);
+        roots.extend(self.matching_roots(&output));
+        sort_dedup_paths(&mut roots);
+        read_paths.push(output);
+        sort_dedup_paths(&mut read_paths);
+        read_paths.truncate(self.config.max_evidence_paths);
+        Some(AlertCandidate {
+            rule: AlertRule::ArchiveOutput,
+            process: event.process.clone(),
+            roots,
+            first_timestamp_ms,
+            event_timestamp_ms,
+            received_timestamp_ms: event.received_timestamp_ms,
+            unique_files: 1,
+            activity_count: 1,
+            evidence_paths: read_paths,
+        })
+    }
+
+    fn archive_output_path(
+        &mut self,
+        event: &ActivityEvent,
+        health: &mut Vec<RuleHealth>,
+    ) -> Option<PathBuf> {
         if !matches!(
             event.kind,
             EventKind::Create | EventKind::Write | EventKind::Rename
@@ -698,35 +993,10 @@ impl RuleEngine {
             output_paths.push(destination);
         }
         sort_dedup_paths(&mut output_paths);
-        let output = output_paths.into_iter().find(|path| {
-            is_archive_output_candidate(path) && is_output_location(path, &self.roots)
-        })?;
-
-        let (mut roots, mut read_paths) =
-            self.recent_read_summary(process_key, event_timestamp_ms)?;
-        if roots.is_empty() {
-            return None;
-        }
-        let first_timestamp_ms = self
-            .recent_read_first_timestamp(process_key, event_timestamp_ms)
-            .unwrap_or(event_timestamp_ms);
-        roots.extend(self.matching_roots(&output));
-        roots.sort();
-        roots.dedup();
-        read_paths.push(output.clone());
-        sort_dedup_paths(&mut read_paths);
-        read_paths.truncate(self.config.max_evidence_paths);
-
-        Some(AlertCandidate {
-            rule: AlertRule::ArchiveOutput,
-            process: event.process.clone(),
-            roots,
-            first_timestamp_ms,
-            event_timestamp_ms,
-            received_timestamp_ms: event.received_timestamp_ms,
-            unique_files: 1,
-            activity_count: 1,
-            evidence_paths: read_paths,
+        output_paths.into_iter().find(|path| {
+            is_archive_output_candidate(path)
+                && is_output_location(path, &self.roots)
+                && !self.exclusions.iter().any(|root| path.starts_with(root))
         })
     }
 
@@ -819,6 +1089,9 @@ impl RuleEngine {
     }
 
     fn matching_roots(&self, path: &Path) -> Vec<PathBuf> {
+        if self.exclusions.iter().any(|root| path.starts_with(root)) {
+            return Vec::new();
+        }
         self.roots
             .iter()
             .filter(|root| path.starts_with(root))
@@ -935,11 +1208,12 @@ impl RuleEngine {
 
         let alert = Alert {
             id: format!(
-                "{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}",
                 process_key.source_run_id,
                 process_key.pid,
                 generation,
                 alert_rule_name(candidate.rule),
+                self.instance_id,
                 self.next_alert_id
             ),
             rule: candidate.rule,

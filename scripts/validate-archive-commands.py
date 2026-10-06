@@ -1416,8 +1416,11 @@ def analyze_negative(case, execution, evidence, source_run_id, barrier, healthy)
         return result
     if (not barrier.get("crossed")
             or (MVP.source_stream(receipt), MVP.source_stream(barrier)) not in (
-                ("combined", "combined"), ("exec", "activity"),
-            )):
+                ("combined", "combined"), ("exec", "activity"), ("exec", "read"),
+            ) or (MVP.source_stream(barrier) == "read"
+                  and barrier.get("activity_fence_crossed") is not True)
+            or (barrier.get("write_fence_required") is True
+                and barrier.get("write_fence_crossed") is not True)):
         code = barrier.get("failure_code")
         result["failure_code"] = code if code in FAILURE_CODES else "negative_fence_missing"
         return result
@@ -1485,8 +1488,13 @@ def numeric_pipeline_timing(status):
 
 def fence_worker(path):
     try:
-        with Path(path).open("rb") as stream:
-            stream.read(1)
+        with Path(path).open("r+b", buffering=0) as stream:
+            data = stream.read(1)
+            # 读、写、关闭在毫秒来源时间上可区分，核验各独立来源的先后。
+            time.sleep(0.005)
+            stream.seek(0)
+            stream.write(data)
+            time.sleep(0.005)
         print(json.dumps({"pid": os.getpid(), "success": True}))
         return 0
     except OSError:
@@ -1494,11 +1502,13 @@ def fence_worker(path):
         return 2
 
 
-def run_fence(script, path, database, source_run_id, timeout=FENCE_TIMEOUT_SECONDS, authorization=None):
+def run_fence(script, path, database, source_run_id, timeout=FENCE_TIMEOUT_SECONDS, authorization=None,
+              require_write=False):
     started = time.monotonic()
     result = {"pid": None, "pid_version": None, "crossed": False,
               "timeout_seconds": timeout, "wait_duration_ms": 0,
-              "source_to_receive_ms": None, "failure_code": "negative_fence_worker_failed"}
+              "source_to_receive_ms": None, "failure_code": "negative_fence_worker_failed",
+              "write_fence_required": require_write}
 
     def finished(code):
         result.update(failure_code=code, wait_duration_ms=round((time.monotonic() - started) * 1000))
@@ -1520,21 +1530,25 @@ def run_fence(script, path, database, source_run_id, timeout=FENCE_TIMEOUT_SECON
     expected = MVP.canonical_path(path)
     deadline = time.monotonic() + timeout
     invalid_observed = False
+    read_event = None
+    activity_closes = []
     try:
         # 屏障只读取本轮独立 worker 的目标文件，不反复装载全部业务证据。
         with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1)) as connection:
-            if connection.execute("PRAGMA user_version").fetchone()[0] != 3:
+            if connection.execute("PRAGMA user_version").fetchone()[0] not in MVP.SUPPORTED_SQLITE_SCHEMAS:
                 return finished("negative_fence_query_failed")
             first_query = True
             while True:
                 if not first_query and time.monotonic() > deadline:
                     break
                 first_query = False
+                activity_closes = []
+                write_events = []
                 if authorization:
                     authorization.require()
                 rows = connection.execute(
                     "SELECT event_json FROM events WHERE source_run_id=? AND pid=? "
-                    "AND file_path=? AND kind IN ('open','mmap')",
+                    "AND file_path=? AND kind IN ('open','mmap','write','close')",
                     (source_run_id, metadata["pid"], expected),
                 )
                 for row in rows:
@@ -1546,31 +1560,89 @@ def run_fence(script, path, database, source_run_id, timeout=FENCE_TIMEOUT_SECON
                             event.get("source_run_id") == source_run_id
                             and type(identity.get("pid")) is int and identity["pid"] == metadata["pid"]
                             and type(identity.get("pid_version")) is int and identity["pid_version"] >= 0
-                            and event.get("kind") in ("open", "mmap")
-                            and file.get("readable") is True and file.get("path_truncated") is False
+                            and file.get("path_truncated") is False
                             and isinstance(file.get("path"), str) and MVP.canonical_path(file["path"]) == expected
-                            and MVP.source_stream(event) in ("combined", "activity")
                             and type(event.get("global_seq")) is int and event["global_seq"] >= 0
                         )
                     except (ValueError, TypeError, AttributeError):
                         eligible = False
-                    if eligible:
+                    if not eligible:
+                        invalid_observed = True
+                    elif (event.get("kind") in ("open", "mmap") and file.get("readable") is True
+                          and MVP.source_stream(event) in ("combined", "read", "activity")):
+                        read_event = event
+                    elif event.get("kind") == "close" and MVP.source_stream(event) == "activity":
+                        activity_closes.append(event)
+                    elif event.get("kind") == "write" and MVP.source_stream(event) == "write":
+                        write_events.append(event)
+                    else:
+                        invalid_observed = True
+                if read_event is not None:
+                    identity = read_event["process"]
+                    close = next((event for event in activity_closes
+                                  if event["process"]["pid_version"] == identity["pid_version"]
+                                  and type(event.get("source_timestamp_ms")) is int
+                                  and type(read_event.get("source_timestamp_ms")) is int
+                                  and event["source_timestamp_ms"] > read_event["source_timestamp_ms"]), None)
+                    write = next((event for event in write_events
+                                  if event["process"]["pid_version"] == identity["pid_version"]
+                                  and close is not None and type(event.get("source_timestamp_ms")) is int
+                                  and read_event["source_timestamp_ms"] < event["source_timestamp_ms"]
+                                  < close["source_timestamp_ms"]), None)
+                    # 独立读取流不能证明变更流已越过屏障；同一 worker 的关闭也必须到达。
+                    if ((MVP.source_stream(read_event) != "read" or close is not None)
+                            and (not require_write or write is not None)):
                         if time.monotonic() > deadline:
                             return finished("negative_fence_timeout")
                         result.update(pid_version=identity["pid_version"],
-                                      source_stream=MVP.source_stream(event),
-                                      global_seq=event["global_seq"], crossed=True)
-                        source, received = event.get("source_timestamp_ms"), event.get("received_timestamp_ms")
+                                      source_stream=MVP.source_stream(read_event),
+                                      global_seq=read_event["global_seq"], crossed=True)
+                        if close is not None:
+                            result.update(activity_fence_crossed=True,
+                                          activity_fence_global_seq=close["global_seq"])
+                        if write is not None:
+                            result.update(write_fence_crossed=True, write_fence_global_seq=write["global_seq"])
+                        source, received = read_event.get("source_timestamp_ms"), read_event.get("received_timestamp_ms")
                         if type(source) is int and type(received) is int:
                             result["source_to_receive_ms"] = received - source
                         return finished(None)
-                    invalid_observed = True
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(0.05)
     except (OSError, sqlite3.Error):
         return finished("negative_fence_query_failed")
     return finished("negative_fence_invalid" if invalid_observed else "negative_fence_timeout")
+
+
+REAL_COLLECTOR_STREAMS = frozenset(("exec", "read", "write", "activity"))
+
+
+def real_collector_versions(status):
+    streams = status.get("collector_streams")
+    if not isinstance(streams, dict) or set(streams) != REAL_COLLECTOR_STREAMS:
+        return None
+    versions = MVP.collector_stream_versions(status)
+    if versions is None or not MVP.collector_streams_healthy(status):
+        return None
+    return versions
+
+
+def wait_for_real_collector_protocol(control_socket, expected_run_id, timeout=FENCE_TIMEOUT_SECONDS):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            status = MVP.control(control_socket, "status")
+        except (OSError, ValueError, RuntimeError):
+            status = None
+        if (isinstance(status, dict) and status.get("collector_run_id")
+                and status["collector_run_id"] != expected_run_id):
+            raise RuntimeError("collector_restarted")
+        versions = real_collector_versions(status) if isinstance(status, dict) else None
+        if versions is not None and status.get("collector_run_id") == expected_run_id:
+            return status, versions
+        if time.monotonic() >= deadline:
+            raise RuntimeError("collector_unhealthy")
+        time.sleep(0.05)
 
 
 def process_case(case, binary, database, source_run_id, script, sidecar=None, observe_positive=False,
@@ -1599,7 +1671,8 @@ def process_case(case, binary, database, source_run_id, script, sidecar=None, ob
         if failure:
             execution["failure_code"] = failure
             return execution, None
-        barrier = run_fence(script, case.fence_path, database, source_run_id, authorization=authorization)
+        barrier = run_fence(script, case.fence_path, database, source_run_id, authorization=authorization,
+                            require_write=True)
         return execution, barrier
     return execution, None
 
@@ -1811,16 +1884,46 @@ def real_validation(args, report, tools, version_rows):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
         bridge = MVP.wait_for_bridge(control_socket, root_process, collector, {})
-        source_status = MVP.control(control_socket, "status")
-        source_versions = MVP.collector_stream_versions(source_status)
-        summary["collector_protocol"] = {
-            "schema_version": source_versions[0] if source_versions else None,
-            "message_version": source_versions[1] if source_versions else None,
-            "collector_streams": MVP.collector_streams_snapshot(source_status),
-        }
+        initial_source_status = MVP.control(control_socket, "status")
+        source_status = initial_source_status
         source_run_id = source_status.get("collector_run_id")
         if not source_run_id:
             raise RuntimeError("collector_unhealthy")
+        startup_fence_path = project / ".collector-startup-fence.bin"
+        with startup_fence_path.open("xb") as stream:
+            stream.write(b"synthetic collector startup fence")
+        try:
+            startup_fence = run_fence(
+                Path(__file__).resolve(), startup_fence_path, database, source_run_id,
+                authorization=authorization, require_write=True,
+            )
+        finally:
+            startup_fence_path.unlink(missing_ok=True)
+        startup_fence_summary = {
+            "crossed": startup_fence.get("crossed") is True,
+            "source_stream": startup_fence.get("source_stream"),
+            "activity_fence_crossed": startup_fence.get("activity_fence_crossed") is True,
+            "write_fence_crossed": startup_fence.get("write_fence_crossed") is True,
+            "failure_code": startup_fence.get("failure_code"),
+        }
+        initial_streams = initial_source_status.get("collector_streams")
+        summary["collector_protocol"] = {
+            "startup_observed_streams": sorted(initial_streams) if isinstance(initial_streams, dict) else [],
+            "startup_fence": startup_fence_summary,
+        }
+        save_summary(report / "summary.json", summary)
+        if (startup_fence_summary["crossed"] is not True
+                or startup_fence_summary["source_stream"] != "read"
+                or startup_fence_summary["activity_fence_crossed"] is not True
+                or startup_fence_summary["write_fence_crossed"] is not True):
+            raise RuntimeError("collector_unhealthy")
+        source_status, source_versions = wait_for_real_collector_protocol(control_socket, source_run_id)
+        summary["collector_protocol"].update(
+            schema_version=source_versions[0],
+            message_version=source_versions[1],
+            collector_streams=MVP.collector_streams_snapshot(source_status),
+        )
+        save_summary(report / "summary.json", summary)
         sidecar.start()
         summary["sidecar_started"] = sidecar.root_identity_verified
         for case_number, case in enumerate(cases, 1):

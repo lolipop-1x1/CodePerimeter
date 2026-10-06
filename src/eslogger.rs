@@ -40,6 +40,7 @@ pub struct AdapterHealth {
     pub skipped_lines: u64,
     pub lines_with_issues: u64,
     pub last_received_timestamp_ms: Option<i64>,
+    pub last_source_timestamp_ms: Option<i64>,
     pub schema_version: Option<u64>,
     pub message_version: Option<u64>,
     pub global_sequence_available: bool,
@@ -100,6 +101,8 @@ impl EsloggerAdapter {
             let subscribed = match self.source_stream {
                 SourceStream::Combined => true,
                 SourceStream::Exec => kind == EventKind::Exec,
+                SourceStream::Read => matches!(kind, EventKind::Open | EventKind::Mmap),
+                SourceStream::Write => kind == EventKind::Write,
                 SourceStream::Activity => kind != EventKind::Exec,
             };
             if !subscribed {
@@ -124,6 +127,11 @@ impl EsloggerAdapter {
             .filter(|issue| issue.code == "sequence_gap")
             .count() as u64;
         self.health.last_received_timestamp_ms = Some(received_timestamp_ms);
+        // 与本次接收时间成对更新；不能把旧来源时间误配到缺失时间的新行。
+        self.health.last_source_timestamp_ms = outcome
+            .event
+            .as_ref()
+            .and_then(|event| event.source_timestamp_ms);
         self.health.schema_version = outcome.schema_version;
         self.health.message_version = outcome.message_version;
         outcome

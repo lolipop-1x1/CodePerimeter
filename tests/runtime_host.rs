@@ -270,6 +270,56 @@ fn split_sources_keep_shared_identity_independent_sequences_and_bounded_exec_rec
             .iter()
             .all(|event| event["event"]["source_run_id"] == "synthetic-run-01")
     );
+    let mut dedicated_read = activity.clone();
+    if let CollectorFrame::Line { source_stream, .. } = &mut dedicated_read {
+        *source_stream = SourceStream::Read;
+    }
+    source.send(dedicated_read);
+    wait_until(
+        || {
+            query::<RuntimeStatus>(&control_socket, ControlRequest::Status)
+                .collector_streams
+                .get(&SourceStream::Read)
+                .is_some_and(|health| health.lines == 1)
+        },
+        "独立读取来源应动态加入，不能与旧活动流的相同序号冲突",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.collector_streams.len(), 3);
+    assert_eq!(status.collector_schema_version, Some(1));
+    assert_eq!(status.duplicate_events, 0);
+    assert_eq!(status.persisted_events_by_kind["open"], 2);
+    let mut dedicated_write = activity.clone();
+    if let CollectorFrame::Line {
+        source_stream,
+        line,
+        ..
+    } = &mut dedicated_write
+    {
+        *source_stream = SourceStream::Write;
+        let mut value: Value = serde_json::from_str(line).unwrap();
+        value["event_type"] = json!(33);
+        value["event"] = json!({"write": {"target": value["event"]["open"]["file"]}});
+        *line = value.to_string();
+    }
+    source.send(dedicated_write);
+    wait_until(
+        || {
+            query::<RuntimeStatus>(&control_socket, ControlRequest::Status)
+                .persisted_events_by_kind
+                .get("write")
+                == Some(&1)
+        },
+        "写入来源同序号应独立传输、解析并保存",
+    );
+    let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+    assert_eq!(status.collector_streams.len(), 4);
+    assert_eq!(status.collector_schema_version, Some(1));
+    assert_eq!(
+        status.collector_streams[&SourceStream::Write].sequence_gaps,
+        0
+    );
+    assert_eq!(status.duplicate_events, 0);
     source.send(activity);
     source.send(exec_frame(701, 2, &file));
     let mut skipped = open_frame(&file, 700, 7, 3);
@@ -324,6 +374,211 @@ fn split_sources_keep_shared_identity_independent_sequences_and_bounded_exec_rec
 
 #[test]
 fn late_activity_association_backfills_the_original_exec_before_saving_its_alert() {
+    late_read_association(SourceStream::Activity);
+}
+
+#[test]
+fn dedicated_read_association_backfills_the_original_exec_before_saving_its_alert() {
+    late_read_association(SourceStream::Read);
+}
+
+#[test]
+fn late_pre_exit_read_backfills_archive_output_and_all_correlated_roots() {
+    for (output_inside, sequenced) in [(false, true), (true, true), (true, false), (false, false)] {
+        let temp = fixture();
+        let input_root = temp.path().join("anonymous-input-project");
+        let output_root = temp.path().join("anonymous-output-project");
+        fs::create_dir(&input_root).unwrap();
+        fs::create_dir(&output_root).unwrap();
+        let file = input_root.join("source.txt");
+        let output_file = if output_inside {
+            output_root.join("synthetic.zip")
+        } else {
+            temp.path().join("synthetic.zip")
+        };
+        fs::write(&file, b"anonymous source").unwrap();
+        fs::write(&output_file, b"synthetic archive evidence").unwrap();
+        let runtime = options(temp.path());
+        let control_socket = runtime.control_socket.clone();
+        let source = SyntheticSource::start(&runtime.collector_socket);
+        let host = start_host(runtime.clone());
+        wait_for_socket(&control_socket);
+        let _: Vec<Value> = query(
+            &control_socket,
+            ControlRequest::AddDirectories {
+                entries: vec![
+                    DirectoryImport {
+                        path: input_root.clone(),
+                        sources: vec!["manual".into()],
+                    },
+                    DirectoryImport {
+                        path: output_root.clone(),
+                        sources: vec!["manual".into()],
+                    },
+                ],
+            },
+        );
+        source.wait_connected();
+        let CollectorFrame::Line { run_id, line, .. } = open_frame(&file, 760, 7, 1) else {
+            unreachable!()
+        };
+        let template: Value = serde_json::from_str(&line).unwrap();
+        let make_frame = |kind: u64,
+                          stream: SourceStream,
+                          sequence: u64,
+                          time: i64,
+                          received: i64| {
+            let mut value = template.clone();
+            value["event_type"] = json!(kind);
+            value["seq_num"] = json!(if kind == 15 { 1 } else { 0 });
+            value["global_seq_num"] = json!(sequence);
+            if kind == 13 && !sequenced {
+                value.as_object_mut().unwrap().remove("global_seq_num");
+                value.as_object_mut().unwrap().remove("seq_num");
+            }
+            value["time"] = json!(
+                DateTime::from_timestamp_millis(BASE_TIME_MS + time)
+                    .unwrap()
+                    .to_rfc3339()
+            );
+            if matches!(kind, 13 | 33) {
+                let mut target = value["event"]["open"]["file"].clone();
+                target["path"] = json!(output_file);
+                let metadata = fs::metadata(&output_file).unwrap();
+                target["stat"] = json!({"st_mode": metadata.mode(), "st_dev": metadata.dev(), "st_ino": metadata.ino()});
+                value["event"] = if kind == 13 {
+                    json!({"create": {"destination_type": 0, "destination": {"existing_file": target}}})
+                } else {
+                    json!({"write": {"target": target}})
+                };
+            } else if kind == 15 {
+                value["event"] = json!({"exit": {"stat": 0}});
+            }
+            CollectorFrame::Line {
+                run_id: run_id.clone(),
+                source_stream: stream,
+                line: value.to_string(),
+                received_timestamp_ms: BASE_TIME_MS + received,
+            }
+        };
+        let create = make_frame(13, SourceStream::Activity, 1, 1_010, 2_000);
+        source.send(create.clone());
+        if !sequenced {
+            // 无序号的两个独立观测都必须保留，各自回填到首次保存的原行。
+            source.send(create.clone());
+        }
+        source.send(make_frame(15, SourceStream::Activity, 2, 1_020, 3_000));
+        wait_until(
+            || {
+                query::<RuntimeStatus>(&control_socket, ControlRequest::Status)
+                    .observed_events_by_kind["exit"]
+                    == 1
+            },
+            "先到的输出与退出已处理",
+        );
+        source.send(make_frame(10, SourceStream::Read, 1, 1_000, 5_000));
+        wait_until(
+            || {
+                let alerts: Vec<Value> = query(
+                    &control_socket,
+                    ControlRequest::QueryAlerts {
+                        filter: AlertFilter::default(),
+                    },
+                );
+                alerts.len() == 1
+            },
+            "退出前迟到读取应关联已到的归档输出",
+        );
+        let events: Vec<Value> = query(
+            &control_socket,
+            ControlRequest::QueryEvents {
+                filter: EventFilter::default(),
+            },
+        );
+        let outputs: Vec<_> = events
+            .iter()
+            .filter(|row| row["event"]["kind"] == "create")
+            .collect();
+        let expected_outputs = if sequenced { 1 } else { 2 };
+        assert_eq!(
+            outputs.len(),
+            expected_outputs,
+            "inside={output_inside}, sequenced={sequenced}"
+        );
+        let output = outputs[0];
+        assert_eq!(output["event"]["source_stream"], "activity");
+        assert_eq!(output["event"]["source_timestamp_ms"], BASE_TIME_MS + 1_010);
+        assert_eq!(
+            output["event"]["received_timestamp_ms"],
+            BASE_TIME_MS + 2_000
+        );
+        let mut roots = vec![input_root.clone()];
+        if output_inside {
+            roots.push(output_root);
+        }
+        roots.sort();
+        for output in outputs {
+            assert_eq!(output["directories"], json!(roots));
+        }
+        let status: RuntimeStatus = query(&control_socket, ControlRequest::Status);
+        assert_eq!(
+            status.persisted_events_by_kind["create"],
+            expected_outputs as u64
+        );
+        source.send(make_frame(33, SourceStream::Write, 1, 1_015, 6_000));
+        wait_until(
+            || {
+                let alerts: Vec<Value> = query(
+                    &control_socket,
+                    ControlRequest::QueryAlerts {
+                        filter: AlertFilter::default(),
+                    },
+                );
+                alerts.len() == 1 && alerts[0]["activity_count"] == expected_outputs + 1
+            },
+            "退出前但接收更晚的写入应补充同一告警，不新建通知",
+        );
+        let writes: Vec<Value> = query(
+            &control_socket,
+            ControlRequest::QueryEvents {
+                filter: EventFilter {
+                    kind: Some(codeperimeter::model::EventKind::Write),
+                    ..EventFilter::default()
+                },
+            },
+        );
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0]["directories"], json!(roots));
+        if sequenced {
+            source.send(create);
+            wait_until(
+                || {
+                    query::<RuntimeStatus>(&control_socket, ControlRequest::Status).duplicate_events
+                        == 1
+                },
+                "回关联不重复保存来源事件",
+            );
+        }
+        let connection = Connection::open(&runtime.database_path).unwrap();
+        let counts: (i64, i64, i64) = connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM events WHERE kind='create'), (SELECT COUNT(*) FROM alerts), (SELECT COUNT(*) FROM notification_outbox)",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(counts, (expected_outputs as i64, 1, 1));
+        let create_count: i64 = connection
+            .query_row(
+                "SELECT value FROM cumulative_statistics WHERE key='events.create'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(create_count, expected_outputs as i64);
+        stop_host(&control_socket, host);
+        source.stop();
+    }
+}
+
+fn late_read_association(read_stream: SourceStream) {
     let temp = fixture();
     let project = temp.path().join("anonymous-project");
     fs::create_dir(&project).unwrap();
@@ -391,7 +646,7 @@ fn late_activity_association_backfills_the_original_exec_before_saving_its_alert
             .to_rfc3339()
     );
     let activity = CollectorFrame::Line {
-        source_stream: SourceStream::Activity,
+        source_stream: read_stream,
         run_id,
         line: read.to_string(),
         received_timestamp_ms: BASE_TIME_MS + 5_000,
@@ -1615,4 +1870,367 @@ fn fast_reconnect_preserves_disconnect_evidence_after_current_state_has_recovere
     assert!(!health.is_empty());
     source.stop();
     stop_host(&control_socket, host);
+}
+
+#[test]
+fn console_ipc_rules_scope_workflow_and_pause_survive_restart() {
+    use codeperimeter::console::{AlertEntry, ConsoleRequest, Page, RulesSettings};
+    use codeperimeter::storage::StoredEvent;
+    let temp = fixture();
+    let project = temp.path().join("project");
+    let excluded = project.join("excluded");
+    fs::create_dir_all(&excluded).unwrap();
+    fs::write(excluded.join("private.rs"), "合成源码").unwrap();
+    for name in ["first.rs", "second.rs", "third.rs", "paused.rs"] {
+        fs::write(project.join(name), "合成源码").unwrap();
+    }
+    let runtime = options(temp.path());
+    let socket = runtime.control_socket.clone();
+    let host = start_host(runtime.clone());
+    wait_for_socket(&socket);
+    let _: Vec<Value> = query(
+        &socket,
+        ControlRequest::AddDirectories {
+            entries: vec![
+                DirectoryImport {
+                    path: project.clone(),
+                    sources: vec!["manual".into()],
+                },
+                DirectoryImport {
+                    path: excluded.clone(),
+                    sources: vec!["codex".into()],
+                },
+            ],
+        },
+    );
+    let console = |request| ControlRequest::Console { request };
+    let _: Value = query(
+        &socket,
+        console(ConsoleRequest::DirectorySet {
+            path: excluded.clone(),
+            enabled: false,
+        }),
+    );
+    let mut settings: RulesSettings = query(&socket, console(ConsoleRequest::RulesGet));
+    settings.bulk_file_threshold = 2;
+    let saved: RulesSettings = query(&socket, console(ConsoleRequest::RulesSet { settings }));
+    assert_eq!(saved.version, 2);
+    let source = SyntheticSource::start(&runtime.collector_socket);
+    source.wait_connected();
+    source.send(open_frame(&excluded.join("private.rs"), 801, 7, 1));
+    source.send(open_frame(&project.join("first.rs"), 801, 7, 2));
+    source.send(open_frame(&project.join("second.rs"), 801, 7, 3));
+    let request_alerts = || {
+        console(ConsoleRequest::AlertsPage {
+            filter: AlertFilter::default(),
+            cursor: None,
+            search: None,
+            is_read: None,
+            processed: None,
+        })
+    };
+    wait_until(
+        || query::<Page<AlertEntry>>(&socket, request_alerts()).total == 1,
+        "批量规则应通过真实IPC生成告警",
+    );
+    let page: Page<StoredEvent> = query(
+        &socket,
+        console(ConsoleRequest::EventsPage {
+            filter: EventFilter::default(),
+            cursor: None,
+            search: None,
+            archive_only: false,
+        }),
+    );
+    assert_eq!(page.total, 2);
+    assert!(page.items.iter().all(|entry| {
+        !entry
+            .event
+            .file
+            .as_ref()
+            .unwrap()
+            .path
+            .starts_with(&excluded)
+    }));
+    let initial: Page<AlertEntry> = query(&socket, request_alerts());
+    let initial = &initial.items[0];
+    assert_eq!(initial.rule_version, saved.version);
+    let handled: AlertEntry = query(
+        &socket,
+        console(ConsoleRequest::AlertUpdate {
+            id: initial.alert.id.clone(),
+            is_read: Some(true),
+            processed: Some(true),
+            note: Some("合成IPC处理".into()),
+            expected_revision: Some(initial.revision),
+        }),
+    );
+    assert!(handled.processed);
+    source.send(open_frame(&project.join("third.rs"), 801, 7, 4));
+    wait_until(
+        || !query::<Page<AlertEntry>>(&socket, request_alerts()).items[0].processed,
+        "新增证据应重新打开人工处理状态",
+    );
+    let _: Value = query(
+        &socket,
+        console(ConsoleRequest::MonitoringSet { paused: true }),
+    );
+    source.send(open_frame(&project.join("paused.rs"), 801, 7, 5));
+    thread::sleep(Duration::from_millis(150));
+    let paused: RuntimeStatus = query(&socket, ControlRequest::Status);
+    assert!(paused.monitoring_paused);
+    let events: Page<StoredEvent> = query(
+        &socket,
+        console(ConsoleRequest::EventsPage {
+            filter: EventFilter::default(),
+            cursor: None,
+            search: None,
+            archive_only: false,
+        }),
+    );
+    assert_eq!(events.total, 3);
+    stop_host(&socket, host);
+    source.stop();
+    let restarted = start_host(runtime);
+    wait_for_socket(&socket);
+    let status: RuntimeStatus = query(&socket, ControlRequest::Status);
+    assert!(status.monitoring_paused);
+    assert_eq!(
+        query::<RulesSettings>(&socket, console(ConsoleRequest::RulesGet)),
+        saved
+    );
+    let entries: Page<AlertEntry> = query(&socket, request_alerts());
+    assert_eq!(entries.items[0].note, "合成IPC处理");
+    let _: Value = query(
+        &socket,
+        console(ConsoleRequest::MonitoringSet { paused: false }),
+    );
+    assert!(!query::<RuntimeStatus>(&socket, ControlRequest::Status).monitoring_paused);
+    let preview: Value = query(
+        &socket,
+        console(ConsoleRequest::RetentionPreview { days: 1 }),
+    );
+    let stale = request_control(
+        &socket,
+        console(ConsoleRequest::RetentionSet {
+            days: 1,
+            confirm: true,
+            preview_revision: Some(0),
+        }),
+    )
+    .unwrap();
+    assert!(!stale.ok);
+    let _: Value = query(
+        &socket,
+        console(ConsoleRequest::RetentionSet {
+            days: 1,
+            confirm: true,
+            preview_revision: preview["preview_revision"].as_u64(),
+        }),
+    );
+    let clear = request_control(
+        &socket,
+        console(ConsoleRequest::ClearDetails { confirm: false }),
+    )
+    .unwrap();
+    assert!(!clear.ok);
+    let _: Value = query(
+        &socket,
+        console(ConsoleRequest::ClearDetails { confirm: true }),
+    );
+    let entries: Value = query(&socket, console(ConsoleRequest::Directories));
+    assert_eq!(entries.as_array().unwrap().len(), 2);
+    assert_eq!(
+        query::<RulesSettings>(&socket, console(ConsoleRequest::RulesGet)),
+        saved
+    );
+    let events: Page<StoredEvent> = query(
+        &socket,
+        console(ConsoleRequest::EventsPage {
+            filter: EventFilter::default(),
+            cursor: None,
+            search: None,
+            archive_only: false,
+        }),
+    );
+    assert_eq!(events.total, 0);
+    stop_host(&socket, restarted);
+}
+
+const HOST_BENCHMARK_SPECS: [(&str, u64, SourceStream, usize, usize); 9] = [
+    ("open", 10, SourceStream::Read, 450, 20),
+    ("mmap", 20, SourceStream::Read, 450, 0),
+    ("exec", 9, SourceStream::Exec, 100, 0),
+    ("fork", 11, SourceStream::Activity, 200, 0),
+    ("exit", 15, SourceStream::Activity, 200, 0),
+    ("create", 13, SourceStream::Activity, 200, 0),
+    ("rename", 25, SourceStream::Activity, 200, 0),
+    ("close", 12, SourceStream::Activity, 200, 0),
+    ("write", 33, SourceStream::Write, 8_000, 20),
+];
+
+struct HostBenchmarkGuard(
+    PathBuf,
+    Option<SyntheticSource>,
+    Option<JoinHandle<codeperimeter::Result<()>>>,
+);
+
+impl Drop for HostBenchmarkGuard {
+    fn drop(&mut self) {
+        self.1.take().unwrap().stop();
+        let _ = request_control(&self.0, ControlRequest::Stop);
+        let _ = self.2.take().unwrap().join();
+    }
+}
+
+fn benchmark_count(counts: &std::collections::BTreeMap<String, u64>, kind: &str) -> u64 {
+    counts.get(kind).copied().unwrap_or(0)
+}
+
+fn host_benchmark_frames(project_file: &Path, received_ms: i64) -> Vec<CollectorFrame> {
+    let templates: Vec<Value> = include_str!("fixtures/eslogger/events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let event_time = DateTime::from_timestamp_millis(received_ms)
+        .unwrap()
+        .to_rfc3339();
+    let mut stream_seq = [0_u64; 4];
+    let mut frames = Vec::with_capacity(10_000);
+    for &(_, event_type, stream, count, monitored) in &HOST_BENCHMARK_SPECS {
+        let template = templates
+            .iter()
+            .find(|v| v["event_type"].as_u64() == Some(event_type))
+            .unwrap();
+        let lane = ["exec", "read", "write", "activity"]
+            .iter()
+            .position(|name| *name == stream.as_str())
+            .unwrap();
+        for sequence in 0..count {
+            let mut event = template.clone();
+            event["version"] = json!(9);
+            event["time"] = json!(event_time);
+            event["seq_num"] = json!(sequence);
+            event["global_seq_num"] = json!(stream_seq[lane]);
+            stream_seq[lane] += 1;
+            if sequence < monitored {
+                match event_type {
+                    10 => event["event"]["open"]["file"]["path"] = json!(project_file),
+                    33 => event["event"]["write"]["target"]["path"] = json!(project_file),
+                    _ => unreachable!(),
+                }
+            }
+            event["padding"] = json!("");
+            event["padding"] = json!("x".repeat(2_048 - event.to_string().len()));
+            let line = event.to_string();
+            assert_eq!(line.len(), 2_048);
+            frames.push(CollectorFrame::Line {
+                run_id: "synthetic-host-benchmark".into(),
+                source_stream: stream,
+                line,
+                received_timestamp_ms: received_ms,
+            });
+        }
+    }
+    frames
+}
+
+fn run_host_throughput_sample(mode: &str, poll_interval: Duration) {
+    let temp = fixture();
+    let project = temp.path().join("selected-project");
+    fs::create_dir(&project).unwrap();
+    let project_file = project.join("tracked-synthetic-file");
+    fs::write(&project_file, b"synthetic benchmark bytes").unwrap();
+    let runtime = options(temp.path());
+    let socket = runtime.control_socket.clone();
+    let source = SyntheticSource::start(&runtime.collector_socket);
+    let host = start_host(runtime);
+    let guard = HostBenchmarkGuard(socket.clone(), Some(source), Some(host));
+    wait_for_socket(&socket);
+    let source = guard.1.as_ref().unwrap();
+    source.wait_connected();
+    let _: Value = query(
+        &socket,
+        ControlRequest::AddDirectories {
+            entries: vec![DirectoryImport {
+                path: project,
+                sources: vec!["manual".into()],
+            }],
+        },
+    );
+    let received_ms = now_ms();
+    let frames = host_benchmark_frames(&project_file, received_ms);
+    let started = Instant::now();
+    for frame in frames {
+        source.send(frame);
+    }
+    source.send(CollectorFrame::Status {
+        run_id: "synthetic-host-benchmark".into(),
+        state: "permission_denied".into(),
+        message: "synthetic FIFO drain fence".into(),
+        dropped_lines: 0,
+    });
+    let mut queries = 0;
+    let status = loop {
+        let status: RuntimeStatus = query(&socket, ControlRequest::Status);
+        queries += 1;
+        if status.collector_state == "permission_denied" {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "合成帧未在超时前排空"
+        );
+        thread::sleep(poll_interval);
+    };
+    let elapsed = started.elapsed();
+    assert_eq!(status.pipeline_timing.host_frames, 10_001);
+    assert_eq!(status.collector_streams.len(), 4);
+    assert_eq!(status.collector_schema_version, Some(1));
+    assert_eq!(status.collector_message_version, Some(9));
+    assert!(
+        status
+            .collector_streams
+            .values()
+            .all(|health| health.sequence_gaps == 0)
+    );
+    for (kind, _, _, count, tracked) in HOST_BENCHMARK_SPECS {
+        let actual = (
+            benchmark_count(&status.observed_events_by_kind, kind),
+            benchmark_count(&status.persisted_events_by_kind, kind),
+            benchmark_count(&status.filtered_events_by_kind, kind),
+        );
+        assert_eq!(
+            actual,
+            (count as u64, tracked as u64, (count - tracked) as u64)
+        );
+    }
+    assert_eq!(
+        (
+            status.reader_dropped_frames,
+            status.collector_dropped_lines,
+            status.database_gap_events,
+            status.duplicate_events
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(status.database_state, "ready");
+    let average_us = status.pipeline_timing.host_processing_total_us as f64
+        / status.pipeline_timing.host_frames as f64;
+    eprintln!(
+        "synthetic Host mode={mode} events=10000 elapsed_ms={} events_per_sec={:.0} status_queries={queries} observed_queries_per_sec={:.1} host_avg_us={average_us:.1} host_max_us={}",
+        elapsed.as_millis(),
+        10_000.0 / elapsed.as_secs_f64(),
+        queries as f64 / elapsed.as_secs_f64(),
+        status.pipeline_timing.host_processing_max_us
+    );
+}
+
+#[test]
+fn four_stream_ten_thousand_frame_host_throughput_with_status_polling() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    run_host_throughput_sample("base_4hz_fence", Duration::from_millis(250));
+    run_host_throughput_sample("status_30hz", Duration::from_millis(33));
 }

@@ -55,6 +55,8 @@ enum Command {
         command: StatsCommand,
     },
     Status,
+    /// 启动或打开本机网页控制台；关闭浏览器不停止监控。
+    Ui(UiCommand),
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
@@ -184,6 +186,8 @@ enum ServiceCommand {
     Plan(UserOption),
     Install(UserOption),
     Start(UserOption),
+    Pause(UserOption),
+    Resume(UserOption),
     Stop(UserOption),
     Uninstall(UserOption),
 }
@@ -192,6 +196,25 @@ enum ServiceCommand {
 struct UserOption {
     #[arg(long, value_name = "NAME")]
     user: String,
+}
+
+#[derive(Debug, Args)]
+struct UiCommand {
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+    #[arg(long)]
+    foreground: bool,
+    #[arg(long)]
+    no_browser: bool,
+    /// 私有入口文件；用于独立验收，不在终端打印令牌。
+    #[arg(long, value_name = "FILE")]
+    session_file: Option<PathBuf>,
+    #[arg(long, value_name = "DIRECTORY")]
+    codex_home: Option<PathBuf>,
+    #[arg(long, value_name = "DIRECTORY")]
+    claude_home: Option<PathBuf>,
+    #[arg(long, value_name = "FILE")]
+    zcode_db: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -394,6 +417,16 @@ fn run(cli: Cli) -> CliResult<()> {
         }
         Command::Stats { command } => run_stats(command, &host_socket(cli.host_socket)?),
         Command::Status => send_request(&host_socket(cli.host_socket)?, ControlRequest::Status),
+        Command::Ui(command) => codeperimeter::web::run(codeperimeter::web::WebOptions {
+            host_socket: host_socket(cli.host_socket)?,
+            port: command.port,
+            foreground: command.foreground,
+            no_browser: command.no_browser,
+            session_file: command.session_file,
+            codex_home: command.codex_home,
+            claude_home: command.claude_home,
+            zcode_db: command.zcode_db,
+        }),
         Command::Service { command } => run_service(command),
         Command::Collector(command) => service::run_collector(CollectorOptions {
             socket_path: command.socket,
@@ -633,6 +666,8 @@ fn run_service(command: ServiceCommand) -> CliResult<()> {
         ServiceCommand::Plan(options)
         | ServiceCommand::Install(options)
         | ServiceCommand::Start(options)
+        | ServiceCommand::Pause(options)
+        | ServiceCommand::Resume(options)
         | ServiceCommand::Stop(options)
         | ServiceCommand::Uninstall(options) => &options.user,
     };
@@ -642,18 +677,21 @@ fn run_service(command: ServiceCommand) -> CliResult<()> {
         ServiceCommand::Plan(_) => print_json(&json!({"ok": true, "data": plan})),
         ServiceCommand::Install(_) => run_operation(plan.install()?),
         ServiceCommand::Start(_) => run_operation(plan.start()?),
+        ServiceCommand::Pause(_) => run_operation(plan.pause()?),
+        ServiceCommand::Resume(_) => run_operation(plan.resume()?),
         ServiceCommand::Stop(_) => run_operation(plan.stop()?),
         ServiceCommand::Uninstall(_) => run_operation(plan.uninstall()?),
     }
 }
 
 fn run_operation(report: OperationReport) -> CliResult<()> {
-    ensure_operation_succeeded(&report)?;
+    let outcome = ensure_operation_succeeded(&report);
     print_json(&json!({
-        "ok": true,
+        "ok": outcome.is_ok(),
         "data_preserved": report.data_preserved,
         "steps": report.steps
-    }))
+    }))?;
+    outcome
 }
 
 fn ensure_operation_succeeded(report: &OperationReport) -> CliResult<()> {
@@ -721,7 +759,7 @@ mod tests {
             ],
             data_preserved: true,
         };
-        let error = ensure_operation_succeeded(&report).unwrap_err();
+        let error = run_operation(report).unwrap_err();
         assert!(error.to_string().contains("daemon"));
     }
 

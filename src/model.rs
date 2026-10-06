@@ -10,6 +10,8 @@ pub enum SourceStream {
     #[default]
     Combined,
     Exec,
+    Read,
+    Write,
     Activity,
 }
 
@@ -18,6 +20,8 @@ impl SourceStream {
         match self {
             Self::Combined => "combined",
             Self::Exec => "exec",
+            Self::Read => "read",
+            Self::Write => "write",
             Self::Activity => "activity",
         }
     }

@@ -311,11 +311,31 @@ class ArchiveValidationSelfTest(unittest.TestCase):
             child = mock.Mock(stderr=io.BytesIO(b""))
             child.poll.return_value = None
             bridge = {"pid": PID, "pgid": PID, "collector": str(binary), "source_pids": []}
+            stream_sample = {
+                "lines": 1, "schema_version": 1, "message_version": 9,
+                "sequence_gaps": 0, "global_sequence_available": True,
+                "event_sequence_available": True,
+            }
+            healthy_status = {
+                "collector_run_id": SOURCE_RUN,
+                "collector_streams": {
+                    name: dict(stream_sample) for name in ("exec", "read", "write", "activity")
+                },
+                "collector_schema_version": 1, "collector_message_version": 9,
+            }
 
             def control(_socket, operation, _payload=None):
                 if operation == "list_directories":
                     return [{"path": str(project)}]
-                return {"collector_run_id": SOURCE_RUN}
+                return healthy_status
+
+            def startup_fence(_script, path, _database, _source_run_id, **kwargs):
+                self.assertEqual(path.parent, project)
+                self.assertIs(kwargs.get("require_write"), True)
+                return {
+                    "crossed": True, "source_stream": "read",
+                    "activity_fence_crossed": True, "write_fence_crossed": True,
+                }
 
             with contextlib.ExitStack() as patches:
                 for target, name, kwargs in (
@@ -330,6 +350,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
                     (VALIDATOR.MVP, "control", {"side_effect": control}),
                     (VALIDATOR.MVP, "wait_for_host", {}),
                     (VALIDATOR.MVP, "wait_for_bridge", {"return_value": bridge}),
+                    (VALIDATOR, "run_fence", {"side_effect": startup_fence}),
                     (VALIDATOR.threading, "Thread", {}),
                 ):
                     patches.enter_context(mock.patch.object(target, name, **kwargs))
@@ -514,6 +535,74 @@ class ArchiveValidationSelfTest(unittest.TestCase):
                     finally:
                         connections[0].close()
 
+    def test_fence_reads_schema_four_and_keeps_unknown_versions_refused(self):
+        worker = mock.Mock(returncode=0, stdout=json.dumps({"pid": PID + 20, "success": True}).encode())
+        fence_event = event("open", identity=process(PID + 20, 23), file={
+            "path": str(FENCE), "readable": True, "path_truncated": False,
+        }) | {"source_stream": "activity"}
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-fence-schema-", dir="/private/tmp") as temporary:
+            for schema in (3, 4, 0, 2, 5, 999):
+                with self.subTest(schema=schema):
+                    database = Path(temporary) / f"schema-{schema}.sqlite"
+                    with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+                        connection.executescript(
+                            f"PRAGMA user_version={schema}; CREATE TABLE events "
+                            "(source_run_id TEXT,pid INTEGER,file_path TEXT,kind TEXT,event_json TEXT);"
+                        )
+                        connection.execute("INSERT INTO events VALUES(?,?,?,?,?)", (
+                            SOURCE_RUN, PID + 20, str(FENCE), "open", json.dumps(fence_event),
+                        ))
+                    with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker):
+                        result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN, timeout=0.1)
+                    self.assertEqual(result["crossed"], schema in (3, 4))
+                    self.assertEqual(result["failure_code"], None if schema in (3, 4) else "negative_fence_query_failed")
+
+    def test_real_runner_waits_when_startup_snapshot_has_not_observed_write(self):
+        sample = source_health("exec")["exec"]
+        three_stream_status = {
+            "collector_run_id": SOURCE_RUN,
+            "collector_schema_version": 1,
+            "collector_message_version": 9,
+            "collector_streams": {
+                name: dict(sample) for name in ("exec", "read", "activity")
+            },
+        }
+        four_stream_status = {
+            **three_stream_status,
+            "collector_streams": {
+                **three_stream_status["collector_streams"],
+                "write": dict(sample),
+            },
+        }
+        self.assertIsNone(VALIDATOR.real_collector_versions(three_stream_status))
+        with mock.patch.object(
+                VALIDATOR.MVP, "control", side_effect=[three_stream_status, four_stream_status]
+        ) as control, mock.patch.object(VALIDATOR.time, "sleep"):
+            status, versions = VALIDATOR.wait_for_real_collector_protocol(
+                Path("/anonymous.sock"), SOURCE_RUN, timeout=1,
+            )
+        self.assertEqual(versions, (1, 9))
+        self.assertEqual(set(status["collector_streams"]), {"exec", "read", "write", "activity"})
+        self.assertEqual(control.call_count, 2)
+
+    def test_real_runner_rejects_missing_or_changed_run_even_with_four_streams(self):
+        sample = source_health("exec")["exec"]
+        status = {
+            "collector_run_id": None,
+            "collector_schema_version": 1,
+            "collector_message_version": 9,
+            "collector_streams": {
+                name: dict(sample) for name in ("exec", "read", "write", "activity")
+            },
+        }
+        with mock.patch.object(VALIDATOR.MVP, "control", return_value=status):
+            with self.assertRaisesRegex(RuntimeError, "collector_unhealthy"):
+                VALIDATOR.wait_for_real_collector_protocol(Path("/anonymous.sock"), SOURCE_RUN, timeout=0)
+        status["collector_run_id"] = "synthetic-restarted-run"
+        with mock.patch.object(VALIDATOR.MVP, "control", return_value=status):
+            with self.assertRaisesRegex(RuntimeError, "collector_restarted"):
+                VALIDATOR.wait_for_real_collector_protocol(Path("/anonymous.sock"), SOURCE_RUN, timeout=0)
+
     def test_negative_requires_exact_main_exec_receipt_before_the_file_fence(self):
         case, execution, evidence, barrier = unrelated_fixture()
         for field, value in (("main_exec_receipt", None),
@@ -537,6 +626,67 @@ class ArchiveValidationSelfTest(unittest.TestCase):
             case, missing_stream, evidence, SOURCE_RUN, barrier, True
         )["failure_code"], "main_exec_receipt_missing")
 
+    def test_read_fence_alone_cannot_prove_the_activity_stream_has_advanced(self):
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-read-fence-", dir="/private/tmp") as directory:
+            database = Path(directory) / "events.sqlite"
+            readable = event("open", identity=process(PID + 20, 23), file={
+                "path": str(FENCE), "readable": True, "path_truncated": False,
+            }) | {"source_stream": "read"}
+            readable["source_timestamp_ms"] = 1000
+            closed = dict(readable, kind="close", source_stream="activity", source_timestamp_ms=1002)
+            with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+                connection.executescript("PRAGMA user_version=4; CREATE TABLE events "
+                                         "(source_run_id TEXT,pid INTEGER,file_path TEXT,kind TEXT,event_json TEXT);")
+                connection.execute("INSERT INTO events VALUES(?,?,?,?,?)", (
+                    SOURCE_RUN, PID + 20, str(FENCE), "open", json.dumps(readable),
+                ))
+            worker = mock.Mock(returncode=0, stdout=json.dumps({"pid": PID + 20, "success": True}).encode())
+            with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker), \
+                    mock.patch.object(VALIDATOR.time, "monotonic", return_value=0):
+                result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN, timeout=0)
+            self.assertFalse(result["crossed"])
+            self.assertEqual(result["failure_code"], "negative_fence_timeout")
+            for close_time in (999, 1000, None):
+                with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+                    connection.execute("DELETE FROM events WHERE kind='close'")
+                    connection.execute("INSERT INTO events VALUES(?,?,?,?,?)", (
+                        SOURCE_RUN, PID + 20, str(FENCE), "close",
+                        json.dumps(dict(closed, source_timestamp_ms=close_time)),
+                    ))
+                with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker), \
+                        mock.patch.object(VALIDATOR.time, "monotonic", return_value=0):
+                    result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN, timeout=0)
+                self.assertFalse(result["crossed"], "读前、同毫秒或缺时刻的关闭不能证明变更流已越过读取")
+            with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute("INSERT INTO events VALUES(?,?,?,?,?)", (
+                    SOURCE_RUN, PID + 20, str(FENCE), "close", json.dumps(closed),
+                ))
+            with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker), \
+                    mock.patch.object(VALIDATOR.time, "monotonic", return_value=0):
+                result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN, timeout=0)
+            self.assertTrue(result["crossed"])
+            self.assertTrue(result["activity_fence_crossed"])
+            self.assertEqual(result["source_stream"], "read")
+            with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker), \
+                    mock.patch.object(VALIDATOR.time, "monotonic", return_value=0):
+                result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN,
+                                             timeout=0, require_write=True)
+            self.assertFalse(result["crossed"], "关闭到达不能代替独立写入来源的进度")
+            for write_time in (999, 1000, 1002, 1003, None, 1001):
+                written = dict(readable, kind="write", source_stream="write", source_timestamp_ms=write_time)
+                with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+                    connection.execute("DELETE FROM events WHERE kind='write'")
+                    connection.execute("INSERT INTO events VALUES(?,?,?,?,?)", (
+                        SOURCE_RUN, PID + 20, str(FENCE), "write", json.dumps(written),
+                    ))
+                with mock.patch.object(VALIDATOR.subprocess, "run", return_value=worker), \
+                        mock.patch.object(VALIDATOR.time, "monotonic", return_value=0):
+                    result = VALIDATOR.run_fence(SCRIPT_PATH, FENCE, database, SOURCE_RUN,
+                                                 timeout=0, require_write=True)
+                self.assertEqual(result["crossed"], write_time == 1001)
+            self.assertTrue(result["write_fence_required"])
+            self.assertTrue(result["write_fence_crossed"])
+
     def test_split_stdin_requires_a_persisted_gap_confirmed_before_the_activity_fence(self):
         case, execution, evidence, barrier = unrelated_fixture()
         case.mode = "stdin"
@@ -551,6 +701,22 @@ class ArchiveValidationSelfTest(unittest.TestCase):
         result = VALIDATOR.analyze_negative(case, execution, evidence, SOURCE_RUN, barrier, True)
         self.assertTrue(result["passed"], "不同客户端的序号不构成先后比较")
         self.assertEqual(result["source_unknown_gap_count"], 1)
+        barrier.update(source_stream="read", activity_fence_crossed=True)
+        self.assertTrue(VALIDATOR.analyze_negative(
+            case, execution, evidence, SOURCE_RUN, barrier, True
+        )["passed"])
+        four_stream_barrier = dict(barrier, write_fence_required=True)
+        self.assertEqual(VALIDATOR.analyze_negative(
+            case, execution, evidence, SOURCE_RUN, four_stream_barrier, True
+        )["failure_code"], "negative_fence_missing")
+        four_stream_barrier["write_fence_crossed"] = True
+        self.assertTrue(VALIDATOR.analyze_negative(
+            case, execution, evidence, SOURCE_RUN, four_stream_barrier, True
+        )["passed"])
+        missing_activity = dict(barrier, activity_fence_crossed=False)
+        self.assertEqual(VALIDATOR.analyze_negative(
+            case, execution, evidence, SOURCE_RUN, missing_activity, True
+        )["failure_code"], "negative_fence_missing")
         wrong_stream = dict(barrier, source_stream="exec")
         self.assertEqual(VALIDATOR.analyze_negative(
             case, execution, evidence, SOURCE_RUN, wrong_stream, True
@@ -587,6 +753,7 @@ class ArchiveValidationSelfTest(unittest.TestCase):
 
         def fence(*_, **_kwargs):
             calls.append("fence")
+            self.assertIs(_kwargs.get("require_write"), True)
             self.assertIs(execution["main_exec_processed_before_fence"], True)
             self.assertIs(execution["source_unknown_gap_before_fence"], True)
             return barrier

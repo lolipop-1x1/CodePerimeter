@@ -3,6 +3,7 @@
 
 import argparse
 from collections import Counter
+from contextlib import closing
 import hashlib
 import json
 import math
@@ -22,7 +23,8 @@ import time
 REPO = Path(__file__).resolve().parent.parent
 SENDER = REPO / "scripts" / "synthetic_sender.py"
 KINDS = ("open", "mmap", "exec", "fork", "exit", "create", "write", "rename", "close")
-SOURCE_STREAMS = ("combined", "exec", "activity")
+SOURCE_STREAMS = ("combined", "exec", "read", "write", "activity")
+SUPPORTED_SQLITE_SCHEMAS = (3, 4)
 
 
 def save(path, value):
@@ -76,7 +78,9 @@ def collector_streams_snapshot(status):
 
 def collector_stream_versions(status):
     streams = status.get("collector_streams")
-    if not isinstance(streams, dict) or set(streams) not in ({"combined"}, {"exec", "activity"}):
+    if not isinstance(streams, dict) or set(streams) not in (
+            {"combined"}, {"exec", "activity"}, {"exec", "read", "activity"},
+            {"exec", "read", "write", "activity"}):
         return None
     samples = collector_streams_snapshot(status)
     if set(samples) != set(streams) or any(not sample["lines"] for sample in samples.values()):
@@ -353,7 +357,7 @@ def completion_state(evidence, operations, project, initial_status, fence):
                   and event.get("file") and event["file"].get("readable") is True
                   and not event["file"]["path_truncated"]
                   and canonical_path(event["file"]["path"]) == canonical_path(fence["path"])
-                  and source_stream(event) in ("combined", "activity")
+                  and source_stream(event) in ("combined", "read", "activity")
                   and event.get("global_seq") is not None
                   and event.get("source_run_id") for event in evidence["events"])
     cases = analyze(evidence, operations, project, initial_status, initial_status)["cases"]
@@ -387,10 +391,10 @@ def wait_for_completion(database, control_socket, operations, project, initial_s
 
 def load_evidence(database):
     # 仅从本轮匿名数据库读取；唯一写入方仍是普通用户 daemon。
-    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1) as connection:
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1)) as connection:
         schema = connection.execute("PRAGMA user_version").fetchone()[0]
-        if schema != 3:
-            raise RuntimeError("验收读取器只支持已锁定的 SQLite schema 3")
+        if schema not in SUPPORTED_SQLITE_SCHEMAS:
+            raise RuntimeError("验收读取器只支持已核对的 SQLite schema 3／4")
         events = [json.loads(row[0]) for row in connection.execute("SELECT event_json FROM events ORDER BY id")]
         alerts = [json.loads(row[0]) for row in connection.execute("SELECT alert_json FROM alerts ORDER BY rowid")]
         outbox = {row[0]: row[1] for row in connection.execute("SELECT alert_id,created_timestamp_ms FROM notification_outbox")}

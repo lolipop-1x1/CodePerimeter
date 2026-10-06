@@ -9,6 +9,28 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies without lifecycle scripts
+        working-directory: web
+        run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
+      - name: Web type checks
+        working-directory: web
+        run: npm run typecheck
+      - name: Web component tests
+        working-directory: web
+        run: npm test
+      - name: Build embedded web assets
+        working-directory: web
+        run: npm run build
+      - name: Verify tracked web assets match source
+        run: |
+          git ls-files --error-unmatch web/dist/index.html > /dev/null
+          git diff --exit-code --quiet -- web/dist
+          python3 -B -c "import subprocess; files=subprocess.check_output(['git','ls-files','--others','--exclude-standard','--','web/dist']).splitlines(); assert not files, '网页构建产生未跟踪资源，请更新构建产物'"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.88.0"

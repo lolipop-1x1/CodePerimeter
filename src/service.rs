@@ -21,6 +21,12 @@ use std::time::{Duration, Instant};
 pub const MAX_FRAME_BYTES: usize = MAX_LINE_BYTES * 6 + 4096;
 const QUEUE_CAPACITY: usize = 32;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const SOURCE_STREAMS: [SourceStream; 4] = [
+    SourceStream::Exec,
+    SourceStream::Read,
+    SourceStream::Write,
+    SourceStream::Activity,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorOptions {
@@ -682,15 +688,15 @@ impl Drop for CollectorSource {
 }
 
 fn next_source_item(
-    receivers: [&mpsc::Receiver<SourceItem>; 2],
+    receivers: [&mpsc::Receiver<SourceItem>; SOURCE_STREAMS.len()],
     next: &mut usize,
 ) -> Option<(usize, SourceItem)> {
-    // 两路均有数据时轮流处理；空路不会让另一条高频来源等待超时。
-    for offset in 0..2 {
-        let index = (*next + offset) % 2;
+    // 各路均有数据时轮流处理；空路不会让另一条高频来源等待超时。
+    for offset in 0..receivers.len() {
+        let index = (*next + offset) % receivers.len();
         match receivers[index].try_recv() {
             Ok(item) => {
-                *next = (index + 1) % 2;
+                *next = (index + 1) % receivers.len();
                 return Some((index, item));
             }
             Err(mpsc::TryRecvError::Disconnected) => return Some((index, SourceItem::End)),
@@ -698,6 +704,20 @@ fn next_source_item(
         }
     }
     None
+}
+
+fn source_event_groups() -> [Vec<&'static str>; SOURCE_STREAMS.len()] {
+    // 读取与高频写入分别订阅，避免其他活动排在同一 eslogger 的写入积压后。
+    [
+        vec!["exec"],
+        vec!["open", "mmap"],
+        vec!["write"],
+        SUBSCRIBED_EVENTS
+            .iter()
+            .copied()
+            .filter(|event| !matches!(*event, "exec" | "open" | "mmap" | "write"))
+            .collect(),
+    ]
 }
 
 fn ensure_sources_running(
@@ -734,15 +754,10 @@ pub fn run_collector(options: CollectorOptions) -> Result<()> {
     let run_id = format!("eslogger-{}-{}", std::process::id(), now_ms());
     let drops = Arc::new(AtomicU64::new(0));
     let source_timing = Arc::new(SourceTiming::default());
-    let activity_events: Vec<_> = SUBSCRIBED_EVENTS
-        .iter()
-        .copied()
-        .filter(|event| *event != "exec")
-        .collect();
     let mut sources = Vec::new();
-    for events in [&["exec"][..], activity_events.as_slice()] {
+    for events in source_event_groups() {
         sources.push(CollectorSource::start(
-            events,
+            &events,
             Arc::clone(&drops),
             Arc::clone(&source_timing),
         )?);
@@ -768,7 +783,6 @@ fn forward_sources(
     stopping: &AtomicBool,
 ) -> Result<()> {
     let mut timing = CollectorTiming::default();
-    let streams = [SourceStream::Exec, SourceStream::Activity];
     let mut next_source = 0;
     let mut client = None;
     let mut last_heartbeat = Instant::now();
@@ -817,13 +831,12 @@ fn forward_sources(
         }
         if pending.is_none() {
             pending = next_source_item(
-                [
-                    sources[0].receiver.as_ref().expect("来源接收端已建立"),
-                    sources[1].receiver.as_ref().expect("来源接收端已建立"),
-                ],
+                std::array::from_fn(|index| {
+                    sources[index].receiver.as_ref().expect("来源接收端已建立")
+                }),
                 &mut next_source,
             )
-            .map(|(index, item)| (streams[index], item));
+            .map(|(index, item)| (SOURCE_STREAMS[index], item));
             if pending.is_none() {
                 thread::sleep(Duration::from_millis(2));
             }
@@ -933,7 +946,7 @@ fn forward_sources(
         }
     }
     let requested_stop = stopping.load(Ordering::Relaxed) && !unexpected_end;
-    // 任一路结束即整体结束；不把剩余一路伪装成完整监控。
+    // 任一路结束即整体结束；不把剩余来源伪装成完整监控。
     let mut exit_code = None;
     for source in &mut sources {
         let status = source.stop()?;
@@ -1256,6 +1269,9 @@ impl ServicePlan {
         checked_root_path(&self.installed_binary)?;
         let mut steps = Vec::new();
         for job in &self.jobs {
+            if job.domain == "system" {
+                checked_root_path(&job.plist_path)?;
+            }
             let target = format!("{}/{}", job.domain, job.label);
             if !launchctl_success(&["print", &job.domain])? && job.domain.starts_with("gui/") {
                 steps.push(OperationStep {
@@ -1320,6 +1336,27 @@ impl ServicePlan {
         })
     }
 
+    /// 仅暂停采集，宿主和桌面通知保持加载；disabled 状态由 launchd 跨重启保留。
+    pub fn pause(&self) -> Result<OperationReport> {
+        require_root()?;
+        self.validate()?;
+        collector_lifecycle(self, true, launchctl_success)
+    }
+
+    /// 仅恢复采集，不重启管理宿主，也不把加载成功当作 FDA／事件采集成功。
+    pub fn resume(&self) -> Result<OperationReport> {
+        require_root()?;
+        self.validate()?;
+        checked_root_path(&self.installed_binary)?;
+        let collector = self
+            .jobs
+            .iter()
+            .find(|job| job.label == format!("com.codeperimeter.collector.{}", self.uid))
+            .ok_or_else(|| io::Error::other("服务计划缺少采集角色"))?;
+        checked_root_path(&collector.plist_path)?;
+        collector_lifecycle(self, false, launchctl_success)
+    }
+
     pub fn uninstall(&self) -> Result<OperationReport> {
         let mut report = self.stop()?;
         if report.steps.iter().any(|step| !step.success) {
@@ -1349,6 +1386,165 @@ impl ServicePlan {
             message: "已删除本服务的 job 与二进制；SQLite 和配置保留".into(),
         });
         Ok(report)
+    }
+}
+
+fn collector_lifecycle(
+    plan: &ServicePlan,
+    paused: bool,
+    mut launchctl: impl FnMut(&[&str]) -> io::Result<bool>,
+) -> Result<OperationReport> {
+    let collector = plan
+        .jobs
+        .iter()
+        .find(|job| job.label == format!("com.codeperimeter.collector.{}", plan.uid))
+        .ok_or_else(|| io::Error::other("服务计划缺少采集角色"))?;
+    let target = format!("{}/{}", collector.domain, collector.label);
+    let loaded = launchctl(&["print", &target])?;
+    let mut pause_failure = None;
+    let success = if paused {
+        if !launchctl(&["disable", &target])? {
+            pause_failure = Some("采集任务禁用请求失败，不能报告暂停成功");
+            false
+        } else if loaded && !launchctl(&["bootout", &target])? {
+            pause_failure = Some("采集任务卸载命令失败，需核对任务实际状态");
+            false
+        } else if launchctl(&["print", &target])? {
+            pause_failure = Some("卸载请求已返回，但采集任务仍显示已加载，暂停未确认");
+            false
+        } else {
+            true
+        }
+    } else {
+        let enabled = launchctl(&["enable", &target])?;
+        let ready = enabled
+            && (loaded
+                || launchctl(&[
+                    "bootstrap",
+                    &collector.domain,
+                    &collector.plist_path.to_string_lossy(),
+                ])?);
+        ready && launchctl(&["kickstart", "-k", &target])? && launchctl(&["print", &target])?
+    };
+    Ok(OperationReport {
+        steps: vec![OperationStep {
+            label: collector.label.clone(),
+            success,
+            message: match (paused, success) {
+                (true, true) => "采集已停止并保留暂停状态；管理宿主与通知未停止",
+                (false, true) => "采集 job 已加载；FDA 与事件健康仍需独立核验",
+                (true, false) => pause_failure.unwrap_or("采集暂停请求失败，不能报告暂停成功"),
+                (false, false) => "采集恢复请求失败，不能报告运行生效",
+            }
+            .into(),
+        }],
+        data_preserved: true,
+    })
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn pause_only_disables_and_unloads_collector_then_checks_it() {
+        let plan = ServicePlan::new("nobody", Path::new("/synthetic/codeperimeter")).unwrap();
+        let target = format!("system/com.codeperimeter.collector.{}", plan.uid);
+        let mut calls = Vec::new();
+        let mut prints = 0;
+        let report = collector_lifecycle(&plan, true, |args| {
+            calls.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+            if args[0] == "print" {
+                prints += 1;
+                Ok(prints == 1)
+            } else {
+                Ok(true)
+            }
+        })
+        .unwrap();
+        assert!(report.steps[0].success);
+        assert_eq!(
+            calls,
+            vec![
+                vec!["print".to_owned(), target.clone()],
+                vec!["disable".to_owned(), target.clone()],
+                vec!["bootout".to_owned(), target.clone()],
+                vec!["print".to_owned(), target],
+            ]
+        );
+        assert!(
+            calls
+                .iter()
+                .flatten()
+                .all(|arg| !arg.contains("daemon") && !arg.contains("notify"))
+        );
+        assert!(report.data_preserved);
+    }
+
+    #[test]
+    fn pause_is_not_successful_while_job_remains_loaded() {
+        let plan = ServicePlan::new("nobody", Path::new("/synthetic/codeperimeter")).unwrap();
+        let report = collector_lifecycle(&plan, true, |_| Ok(true)).unwrap();
+        assert!(!report.steps[0].success);
+    }
+
+    #[test]
+    fn resume_loads_only_collector_and_confirms_the_job_exists() {
+        let plan = ServicePlan::new("nobody", Path::new("/synthetic/codeperimeter")).unwrap();
+        let mut calls = Vec::new();
+        let mut prints = 0;
+        let report = collector_lifecycle(&plan, false, |args| {
+            calls.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+            if args[0] == "print" {
+                prints += 1;
+                Ok(prints == 2)
+            } else {
+                Ok(true)
+            }
+        })
+        .unwrap();
+        assert!(report.steps[0].success);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|args| args[0].as_str())
+                .collect::<Vec<_>>(),
+            vec!["print", "enable", "bootstrap", "kickstart", "print"]
+        );
+        assert!(
+            calls
+                .iter()
+                .flatten()
+                .all(|arg| !arg.contains("daemon") && !arg.contains("notify"))
+        );
+    }
+
+    #[test]
+    fn permission_failure_never_creates_success_or_bootouts_other_jobs() {
+        let plan = ServicePlan::new("nobody", Path::new("/synthetic/codeperimeter")).unwrap();
+        let mut calls = Vec::new();
+        let report = collector_lifecycle(&plan, true, |args| {
+            calls.push(args[0].to_string());
+            Ok(args[0] != "disable")
+        })
+        .unwrap();
+        assert!(!report.steps[0].success);
+        assert_eq!(calls, vec!["print", "disable"]);
+    }
+
+    #[test]
+    fn pause_failure_reports_the_exact_failed_stage() {
+        let plan = ServicePlan::new("nobody", Path::new("/synthetic/codeperimeter")).unwrap();
+        for (failed_command, message) in [
+            ("disable", "禁用请求失败"),
+            ("bootout", "卸载命令失败"),
+            ("loaded", "仍显示已加载"),
+        ] {
+            let report =
+                collector_lifecycle(&plan, true, |args| Ok(args[0] != failed_command)).unwrap();
+            assert!(!report.steps[0].success);
+            assert!(report.steps[0].message.contains(message));
+        }
     }
 }
 
@@ -1528,7 +1724,7 @@ fn render_plist(label: &str, argv: &[String], username: Option<&str>, agent: boo
         ""
     };
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array>\n{}\n</array>\n{}{}<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>ProcessType</key><string>Background</string>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>/dev/null</string>\n<key>StandardErrorPath</key><string>/dev/null</string>\n</dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array>\n{}\n</array>\n{}{}<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>ProcessType</key><string>Standard</string>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>/dev/null</string>\n<key>StandardErrorPath</key><string>/dev/null</string>\n</dict></plist>\n",
         xml(label),
         arguments,
         user,
@@ -1650,21 +1846,37 @@ mod tests {
     }
 
     #[test]
-    fn owned_source_is_reaped_when_an_error_returns_early() {
-        let mut pid = 0;
-        let result = (|| -> io::Result<()> {
-            let source = CollectorSource {
-                child: Command::new("/bin/sleep").arg("30").spawn()?,
-                receiver: None,
-                stdout_reader: None,
-                stderr_reader: None,
-            };
-            pid = source.child.id() as libc::pid_t;
-            Err(io::Error::other("合成 early Err"))
-        })();
-        assert!(result.is_err());
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    fn owned_sources_are_reaped_when_a_later_source_fails_to_start() {
+        let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+        for started_sources in 2..SOURCE_STREAMS.len() {
+            let mut pids = Vec::new();
+            let result = (|| -> io::Result<()> {
+                let mut sources = Vec::new();
+                for _ in 0..started_sources {
+                    let mut command = Command::new("/bin/sleep");
+                    command.arg("30");
+                    let source = CollectorSource::start_command(
+                        command,
+                        Arc::new(AtomicU64::new(0)),
+                        Arc::new(SourceTiming::default()),
+                    )?;
+                    pids.push(source.child.id() as libc::pid_t);
+                    sources.push(source);
+                }
+                CollectorSource::start_command(
+                    Command::new(directory.path().join("missing-source")),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(SourceTiming::default()),
+                )?;
+                Ok(())
+            })();
+            assert!(result.is_err());
+            assert_eq!(pids.len(), started_sources);
+            for pid in pids {
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            }
+        }
     }
 
     #[test]
@@ -1693,6 +1905,8 @@ mod tests {
         };
         let mut first = start_source();
         let mut second = start_source();
+        let third = start_source();
+        let fourth = start_source();
         let mut unrelated = CollectorSource {
             child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
             receiver: None,
@@ -1702,6 +1916,8 @@ mod tests {
         let pids = [
             first.child.id() as libc::pid_t,
             second.child.id() as libc::pid_t,
+            third.child.id() as libc::pid_t,
+            fourth.child.id() as libc::pid_t,
         ];
         for pid in pids {
             assert_eq!(unsafe { libc::getpgid(pid) }, pid);
@@ -1716,6 +1932,8 @@ mod tests {
         assert!(second.child.try_wait().unwrap().is_none());
         assert!(unrelated.child.try_wait().unwrap().is_none());
         drop(second);
+        drop(third);
+        drop(fourth);
         for pid in pids {
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
@@ -1728,39 +1946,125 @@ mod tests {
     }
 
     #[test]
-    fn two_source_queues_are_fair_and_do_not_wait_on_the_empty_lane() {
+    fn source_event_groups_preserve_coverage_and_match_stream_labels() {
+        let groups = source_event_groups();
+        assert_eq!(SOURCE_STREAMS[0], SourceStream::Exec);
+        assert_eq!(groups[0], ["exec"]);
+        assert_eq!(SOURCE_STREAMS[1], SourceStream::Read);
+        assert_eq!(groups[1], ["open", "mmap"]);
+        assert_eq!(SOURCE_STREAMS[2], SourceStream::Write);
+        assert_eq!(groups[2], ["write"]);
+        assert_eq!(SOURCE_STREAMS[3], SourceStream::Activity);
+        assert_eq!(groups[3], ["fork", "exit", "create", "rename", "close"]);
+        let mut observed: Vec<_> = groups.into_iter().flatten().collect();
+        observed.sort_unstable();
+        let mut expected = SUBSCRIBED_EVENTS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(observed, expected, "原有事件不能丢失或重复订阅");
+    }
+
+    #[test]
+    fn four_source_queues_are_fair_and_do_not_wait_on_the_empty_lane() {
         let (first_sender, first_receiver) = mpsc::sync_channel(4);
         let (second_sender, second_receiver) = mpsc::sync_channel(4);
-        for text in ["first-1", "first-2", "first-3"] {
+        let (third_sender, third_receiver) = mpsc::sync_channel(4);
+        let (fourth_sender, fourth_receiver) = mpsc::sync_channel(4);
+        for text in ["first-1", "first-2"] {
             first_sender.send(SourceItem::Line(text.into(), 1)).unwrap();
         }
         second_sender
             .send(SourceItem::Line("second-1".into(), 1))
             .unwrap();
+        for text in ["third-1", "third-2", "third-3"] {
+            third_sender.send(SourceItem::Line(text.into(), 1)).unwrap();
+        }
+        for text in ["fourth-1", "fourth-2"] {
+            fourth_sender
+                .send(SourceItem::Line(text.into(), 1))
+                .unwrap();
+        }
+        let receivers = [
+            &first_receiver,
+            &second_receiver,
+            &third_receiver,
+            &fourth_receiver,
+        ];
         let mut next = 0;
         for (expected_index, expected_text) in [
             (0, "first-1"),
             (1, "second-1"),
+            (2, "third-1"),
+            (3, "fourth-1"),
             (0, "first-2"),
-            (0, "first-3"),
+            (2, "third-2"),
+            (3, "fourth-2"),
+            (2, "third-3"),
         ] {
-            let (index, item) =
-                next_source_item([&first_receiver, &second_receiver], &mut next).unwrap();
+            let (index, item) = next_source_item(receivers, &mut next).unwrap();
             let SourceItem::Line(text, _) = item else {
-                panic!("两路应保序转发完整行")
+                panic!("四路应保序转发完整行")
             };
             assert_eq!((index, text.as_str()), (expected_index, expected_text));
         }
-        assert!(next_source_item([&first_receiver, &second_receiver], &mut next).is_none());
+        assert!(next_source_item(receivers, &mut next).is_none());
         drop(second_sender);
         assert!(matches!(
-            next_source_item([&first_receiver, &second_receiver], &mut next),
+            next_source_item(receivers, &mut next),
             Some((1, SourceItem::End))
         ));
     }
 
     #[test]
-    fn two_sources_drop_reaps_only_owned_children_and_releases_full_queues() {
+    fn busy_write_queue_does_not_starve_sparse_exec_read_and_activity() {
+        let (exec_sender, exec_receiver) = mpsc::sync_channel(1);
+        let (read_sender, read_receiver) = mpsc::sync_channel(1);
+        let (write_sender, write_receiver) = mpsc::sync_channel(1);
+        let (activity_sender, activity_receiver) = mpsc::sync_channel(1);
+        let receivers = [
+            &exec_receiver,
+            &read_receiver,
+            &write_receiver,
+            &activity_receiver,
+        ];
+        let mut next = 2;
+        for _ in 0..64 {
+            write_sender
+                .send(SourceItem::Line("write".into(), 1))
+                .unwrap();
+            assert!(matches!(
+                next_source_item(receivers, &mut next),
+                Some((2, _))
+            ));
+        }
+        exec_sender
+            .send(SourceItem::Line("exec".into(), 1))
+            .unwrap();
+        read_sender
+            .send(SourceItem::Line("open".into(), 1))
+            .unwrap();
+        write_sender
+            .send(SourceItem::Line("write".into(), 1))
+            .unwrap();
+        activity_sender
+            .send(SourceItem::Line("close".into(), 1))
+            .unwrap();
+        next = 2;
+        for (step, expected) in [2, 3, 0, 1, 2].into_iter().enumerate() {
+            assert!(matches!(
+                next_source_item(receivers, &mut next),
+                Some((index, SourceItem::Line(_, _))) if index == expected
+            ));
+            if step == 0 {
+                write_sender
+                    .send(SourceItem::Line("write".into(), 1))
+                    .unwrap();
+            }
+        }
+        assert!(next_source_item(receivers, &mut next).is_none());
+    }
+
+    #[test]
+    fn four_sources_drop_reaps_only_owned_children_and_releases_full_queues() {
         let mut unrelated = CollectorSource {
             child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
             receiver: None,
@@ -1769,7 +2073,7 @@ mod tests {
         };
         let mut pids = Vec::new();
         let mut sources = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..SOURCE_STREAMS.len() {
             let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
             pids.push(child.id() as libc::pid_t);
             let (sender, receiver) = mpsc::sync_channel(1);
@@ -1798,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn source_exit_stops_both_lanes_without_a_consumer_or_queue_capacity() {
+    fn last_source_exit_stops_all_four_lanes_without_a_consumer_or_queue_capacity() {
         let directory = tempfile::tempdir_in("/private/tmp").unwrap();
         let socket_path = directory.path().join("anonymous.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -1807,7 +2111,7 @@ mod tests {
         let timing = Arc::new(SourceTiming::default());
         let mut sources = Vec::new();
         let mut pids = Vec::new();
-        for ended in [true, false] {
+        for ended in [false, false, false, true] {
             let child = if ended {
                 Command::new("/usr/bin/true").spawn().unwrap()
             } else {
@@ -1860,84 +2164,409 @@ mod tests {
     }
 
     #[test]
-    fn source_eof_cancels_a_congested_socket_and_reaps_both_sources() {
-        let directory = tempfile::tempdir_in("/private/tmp").unwrap();
-        let socket_path = directory.path().join("anonymous.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let mut peer = UnixStream::connect(&socket_path).unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let drops = Arc::new(AtomicU64::new(0));
-        let timing = Arc::new(SourceTiming::default());
-        let (read_end, mut write_end) = synthetic_source_pipe();
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let (activity_sender, activity_receiver) = mpsc::sync_channel(1);
-        let first = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let second = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let pids = [first.id() as libc::pid_t, second.id() as libc::pid_t];
-        let sources = vec![
-            CollectorSource {
-                child: first,
-                receiver: Some(receiver),
-                stdout_reader: Some(produce_stdout(
-                    read_end,
-                    sender,
-                    Arc::clone(&drops),
-                    Arc::clone(&timing),
-                )),
-                stderr_reader: None,
-            },
-            CollectorSource {
-                child: second,
-                receiver: Some(activity_receiver),
-                stdout_reader: None,
-                stderr_reader: None,
-            },
-        ];
-        let writing = thread::spawn(move || {
-            write_end
-                .write_all(format!("{}\n", "x".repeat(512 * 1024)).as_bytes())
-                .unwrap();
-            write_end
-        });
-        let stopping = Arc::new(AtomicBool::new(false));
-        let worker_stopping = Arc::clone(&stopping);
-        let (completed_sender, completed_receiver) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let result = forward_sources(
-                &CollectorOptions {
-                    socket_path,
-                    allowed_uid: unsafe { libc::geteuid() },
-                },
-                listener,
-                sources,
-                "anonymous-congestion-run".into(),
-                drops,
-                timing,
-                &worker_stopping,
+    fn each_source_eof_cancels_a_congested_socket_and_reaps_all_four_sources() {
+        for ended_source in 0..SOURCE_STREAMS.len() {
+            let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+            let socket_path = directory.path().join("anonymous.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut peer = UnixStream::connect(&socket_path).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let drops = Arc::new(AtomicU64::new(0));
+            let timing = Arc::new(SourceTiming::default());
+            let (read_end, mut write_end) = synthetic_source_pipe();
+            let mut read_end = Some(read_end);
+            let mut pids = Vec::new();
+            let mut sources = Vec::new();
+            let mut idle_senders = Vec::new();
+            for index in 0..SOURCE_STREAMS.len() {
+                let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+                pids.push(child.id() as libc::pid_t);
+                let (sender, receiver) = mpsc::sync_channel(1);
+                let stdout_reader = if index == ended_source {
+                    Some(produce_stdout(
+                        read_end.take().unwrap(),
+                        sender,
+                        Arc::clone(&drops),
+                        Arc::clone(&timing),
+                    ))
+                } else {
+                    idle_senders.push(sender);
+                    None
+                };
+                sources.push(CollectorSource {
+                    child,
+                    receiver: Some(receiver),
+                    stdout_reader,
+                    stderr_reader: None,
+                });
+            }
+            let writing = thread::spawn(move || {
+                write_end
+                    .write_all(format!("{}\n", "x".repeat(512 * 1024)).as_bytes())
+                    .unwrap();
+                write_end
+            });
+            let stopping = Arc::new(AtomicBool::new(false));
+            let worker_stopping = Arc::clone(&stopping);
+            let (completed_sender, completed_receiver) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let result = forward_sources(
+                    &CollectorOptions {
+                        socket_path,
+                        allowed_uid: unsafe { libc::geteuid() },
+                    },
+                    listener,
+                    sources,
+                    "anonymous-congestion-run".into(),
+                    drops,
+                    timing,
+                    &worker_stopping,
+                );
+                completed_sender.send(result.is_err()).unwrap();
+            });
+            let write_end = writing.join().unwrap();
+            // 只接收帧开头，随后保持连接但不排空大帧，形成真实 socket 背压。
+            let mut prefix = [0; 4096];
+            peer.read_exact(&mut prefix).unwrap();
+            assert!(!worker.is_finished());
+            drop(write_end);
+            let completed = completed_receiver.recv_timeout(Duration::from_secs(6)).ok();
+            stopping.store(true, Ordering::Relaxed);
+            drop(peer);
+            drop(idle_senders);
+            worker.join().unwrap();
+            for pid in pids {
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            }
+            assert_eq!(
+                completed,
+                Some(true),
+                "背压写入也必须识别来源 EOF 并整体退出"
             );
-            completed_sender.send(result.is_err()).unwrap();
-        });
-        let write_end = writing.join().unwrap();
-        // 只接收帧开头，随后保持连接但不排空大帧，形成真实 socket 背压。
-        let mut prefix = [0; 4096];
-        peer.read_exact(&mut prefix).unwrap();
-        assert!(!worker.is_finished());
-        drop(write_end);
-        let completed = completed_receiver.recv_timeout(Duration::from_secs(6)).ok();
-        stopping.store(true, Ordering::Relaxed);
-        drop(peer);
-        drop(activity_sender);
-        worker.join().unwrap();
-        for pid in pids {
-            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
         }
-        assert_eq!(
-            completed,
-            Some(true),
-            "背压写入也必须识别来源 EOF 并整体退出"
-        );
+    }
+
+    #[test]
+    fn four_source_bridge_baseline_preserves_busy_and_sparse_lanes_under_backpressure() {
+        struct BridgeWorker {
+            stopping: Arc<AtomicBool>,
+            worker: Option<thread::JoinHandle<Result<()>>>,
+            producers: Vec<thread::JoinHandle<std::process::ChildStdin>>,
+        }
+        impl Drop for BridgeWorker {
+            fn drop(&mut self) {
+                // 断言失败也停止桥接并回收其自有来源，不留下基准进程。
+                self.stopping.store(true, Ordering::Relaxed);
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+                for producer in self.producers.drain(..) {
+                    let _ = producer.join();
+                }
+            }
+        }
+
+        let fixtures: Vec<serde_json::Value> =
+            include_str!("../tests/fixtures/eslogger/events.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let expected_counts = [32_u64, 64, 4096, 4096];
+        let total = expected_counts.iter().sum::<u64>();
+        for scenario in ["requested_stop", "source_eof"] {
+            let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+            let socket_path = directory.path().join("anonymous-benchmark.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let drops = Arc::new(AtomicU64::new(0));
+            let timing = Arc::new(SourceTiming::default());
+            let input_counts: Arc<[AtomicU64; SOURCE_STREAMS.len()]> =
+                Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+            let start_gate = Arc::new(std::sync::Barrier::new(SOURCE_STREAMS.len() + 1));
+            let stopping = Arc::new(AtomicBool::new(false));
+            let started = Instant::now();
+            let mut sources = Vec::new();
+            let mut producers = Vec::new();
+            let mut pids = Vec::new();
+            for (index, events) in source_event_groups().into_iter().enumerate() {
+                let templates: Vec<_> = fixtures
+                    .iter()
+                    .filter(|value| {
+                        value["event"]
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .any(|name| events.contains(&name.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                assert!(!templates.is_empty());
+                let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+                let mut child = Command::new("/bin/cat")
+                    .process_group(0)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                // 生命周期替身持有 stdout 写端，终止它即可解除来源读取等待。
+                let read_end = child.stdout.take().unwrap();
+                let mut write_end = child.stdin.take().unwrap();
+                pids.push(child.id() as libc::pid_t);
+                sources.push(CollectorSource {
+                    child,
+                    receiver: Some(receiver),
+                    stdout_reader: Some(produce_stdout(
+                        read_end,
+                        sender,
+                        Arc::clone(&drops),
+                        Arc::clone(&timing),
+                    )),
+                    stderr_reader: None,
+                });
+                let input_counts = Arc::clone(&input_counts);
+                let start_gate = Arc::clone(&start_gate);
+                let producer_stopping = Arc::clone(&stopping);
+                producers.push(thread::spawn(move || {
+                    let mut event_sequences = std::collections::HashMap::new();
+                    start_gate.wait();
+                    for sequence in 0..expected_counts[index] {
+                        if producer_stopping.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let mut row = templates[sequence as usize % templates.len()].clone();
+                        let event_type = row["event_type"].as_u64().unwrap();
+                        let event_sequence = event_sequences.entry(event_type).or_insert(0_u64);
+                        row["seq_num"] = (*event_sequence).into();
+                        *event_sequence += 1;
+                        row["global_seq_num"] = sequence.into();
+                        row["benchmark_source_us"] = (started.elapsed().as_micros() as u64).into();
+                        row["benchmark_padding"] = "x".repeat(2048).into();
+                        if let Err(error) = write_end.write_all(format!("{row}\n").as_bytes()) {
+                            if producer_stopping.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            panic!("匿名生成器写入失败：{error}");
+                        }
+                        input_counts[index].fetch_add(1, Ordering::Relaxed);
+                        if index < 2 {
+                            // 执行／读取稀疏出现，写入／其余活动持续填充有界队列。
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    // 保持 pipe 打开，排空后再单独验停止或 EOF，不提前结束来源。
+                    write_end
+                }));
+            }
+            let worker_stopping = Arc::clone(&stopping);
+            let worker_timing = Arc::clone(&timing);
+            let worker_drops = Arc::clone(&drops);
+            let worker = thread::spawn(move || {
+                forward_sources(
+                    &CollectorOptions {
+                        socket_path,
+                        allowed_uid: unsafe { libc::geteuid() },
+                    },
+                    listener,
+                    sources,
+                    "anonymous-throughput-run".into(),
+                    worker_drops,
+                    worker_timing,
+                    &worker_stopping,
+                )
+            });
+            let mut worker = BridgeWorker {
+                stopping: Arc::clone(&stopping),
+                worker: Some(worker),
+                producers,
+            };
+            let mut consumer = CollectorClient::connect_expected(
+                &directory.path().join("anonymous-benchmark.sock"),
+                unsafe { libc::geteuid() },
+            )
+            .unwrap();
+            let work_started = Instant::now();
+            start_gate.wait();
+            // 主动制造消费背压；只检验完整性和生命周期，性能数值不设 CI 阈值。
+            let pause_started = Instant::now();
+            thread::sleep(Duration::from_millis(100));
+            let consumer_pause_us = pause_started.elapsed().as_micros() as u64;
+            let consumer_resumed_us = started.elapsed().as_micros() as u64;
+            let initial_input_counts = input_counts
+                .each_ref()
+                .map(|count| count.load(Ordering::Relaxed));
+            let mut observed = [0_u64; SOURCE_STREAMS.len()];
+            let mut latencies: [Vec<(u64, u64)>; SOURCE_STREAMS.len()] =
+                std::array::from_fn(|_| Vec::new());
+            let mut adapters = SOURCE_STREAMS.map(|stream| {
+                crate::eslogger::EsloggerAdapter::new_with_stream(
+                    "anonymous-throughput-run",
+                    stream,
+                )
+            });
+            let mut seen_events = std::collections::BTreeSet::new();
+            let mut drained_us = None;
+            let mut busy_drained_us = None;
+            let mut bridge_timing = None;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while drained_us.is_none() || bridge_timing.is_none() {
+                assert!(Instant::now() < deadline, "四路桥接未能排空合成输入");
+                let frame = match consumer.read_frame() {
+                    Ok(frame) => frame,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => panic!("合成桥接读取失败：{error}"),
+                };
+                match frame {
+                    CollectorFrame::Line {
+                        run_id,
+                        source_stream,
+                        line,
+                        received_timestamp_ms,
+                    } => {
+                        assert_eq!(run_id, "anonymous-throughput-run");
+                        let index = SOURCE_STREAMS
+                            .iter()
+                            .position(|stream| *stream == source_stream)
+                            .expect("帧须保留来源标识");
+                        let row: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(row["global_seq_num"].as_u64(), Some(observed[index]));
+                        let outcome = adapters[index].parse_line(&line, received_timestamp_ms);
+                        assert!(outcome.issues.is_empty(), "匿名输入必须是有效的九类事件");
+                        assert_eq!(outcome.event.unwrap().source_stream, source_stream);
+                        seen_events.insert(outcome.event_type.unwrap());
+                        observed[index] += 1;
+                        assert!(observed[index] <= expected_counts[index]);
+                        let source_us = row["benchmark_source_us"].as_u64().unwrap();
+                        latencies[index].push((
+                            source_us,
+                            (started.elapsed().as_micros() as u64).saturating_sub(source_us),
+                        ));
+                        if observed.iter().sum::<u64>() == total {
+                            drained_us = Some(work_started.elapsed().as_micros() as u64);
+                        }
+                        if busy_drained_us.is_none() && observed[2..] == expected_counts[2..] {
+                            busy_drained_us = Some(work_started.elapsed().as_micros() as u64);
+                        }
+                    }
+                    CollectorFrame::Metrics { timing, .. } if drained_us.is_some() => {
+                        bridge_timing = Some(timing);
+                    }
+                    CollectorFrame::Heartbeat { dropped_lines, .. }
+                    | CollectorFrame::Status { dropped_lines, .. } => {
+                        assert_eq!(dropped_lines, 0);
+                    }
+                    _ => {}
+                }
+            }
+            let mut pipe_writers: Vec<_> = worker
+                .producers
+                .drain(..)
+                .map(|producer| producer.join().unwrap())
+                .collect();
+            if scenario == "source_eof" {
+                drop(pipe_writers.pop());
+                loop {
+                    match consumer.read_frame() {
+                        Ok(CollectorFrame::Status { state, .. }) if state == "stopped" => break,
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            assert!(Instant::now() < deadline, "EOF 必须终止整个桥接");
+                        }
+                        Err(error) => panic!("合成 EOF 检查失败：{error}"),
+                    }
+                }
+            } else {
+                stopping.store(true, Ordering::Relaxed);
+            }
+            let result = worker.worker.take().unwrap().join().unwrap();
+            assert_eq!(result.is_ok(), scenario == "requested_stop");
+            drop(pipe_writers);
+            for pid in pids {
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            }
+            assert_eq!(observed, expected_counts);
+            assert_eq!(
+                input_counts
+                    .each_ref()
+                    .map(|count| count.load(Ordering::Relaxed)),
+                observed
+            );
+            assert_eq!(timing.lines.load(Ordering::Relaxed), total);
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                seen_events.into_iter().collect::<Vec<_>>(),
+                [9, 10, 11, 12, 13, 15, 20, 25, 33]
+            );
+            let per_stream: Vec<_> = latencies
+                .iter_mut()
+                .enumerate()
+                .map(|(index, values)| {
+                    values.sort_unstable_by_key(|(_, latency)| *latency);
+                    let after_resume: Vec<_> = values
+                        .iter()
+                        .filter_map(|(source, latency)| {
+                            (*source >= consumer_resumed_us).then_some(*latency)
+                        })
+                        .collect();
+                    let before_resume: Vec<_> = values
+                        .iter()
+                        .filter_map(|(source, latency)| {
+                            (*source < consumer_resumed_us).then_some(*latency)
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "source_stream": SOURCE_STREAMS[index].as_str(),
+                        "input_delta": expected_counts[index],
+                        "output_delta": observed[index],
+                        "input_at_consumer_resume": initial_input_counts[index],
+                        "p95_us": values[(values.len() - 1) * 95 / 100].1,
+                        "p99_us": values[(values.len() - 1) * 99 / 100].1,
+                        "max_us": values.last().unwrap().1,
+                        "before_resume_records": before_resume.len(),
+                        "before_resume_p99_us": before_resume.get(
+                            before_resume.len().saturating_sub(1) * 99 / 100
+                        ).copied(),
+                        "after_resume_records": after_resume.len(),
+                        "after_resume_p99_us": after_resume.get(
+                            after_resume.len().saturating_sub(1) * 99 / 100
+                        ).copied(),
+                    })
+                })
+                .collect();
+            println!(
+                "ANONYMOUS_BRIDGE_BASELINE {}",
+                serde_json::json!({
+                    "scenario": scenario,
+                    "records": total,
+                    "consumer_pause_us": consumer_pause_us,
+                    "payload_bytes": timing.bytes.load(Ordering::Relaxed),
+                    "drained_us": drained_us.unwrap(),
+                    "records_per_second": total as f64 * 1_000_000.0 / drained_us.unwrap() as f64,
+                    "busy_records_per_active_second": (expected_counts[2] + expected_counts[3]) as f64
+                        * 1_000_000.0
+                        / busy_drained_us.unwrap().saturating_sub(consumer_pause_us).max(1) as f64,
+                    "source_send_total_us": timing.send_total_us.load(Ordering::Relaxed),
+                    "source_send_max_us": timing.send_max_us.load(Ordering::Relaxed),
+                    "bridge": bridge_timing.unwrap(),
+                    "streams": per_stream,
+                })
+            );
+        }
     }
 
     #[test]

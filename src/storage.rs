@@ -8,8 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: u32 = 3;
-const DEFAULT_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+const SCHEMA_VERSION: u32 = 4;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 100;
 const MAX_QUERY_LIMIT: usize = 10_000;
 const MAX_DETAIL_CHARS: usize = 1_024;
@@ -131,7 +130,7 @@ const MIGRATE_SCHEMA_V2: &str = "ALTER TABLE health_records ADD COLUMN source_js
 
 #[derive(Debug)]
 pub struct Storage {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -471,9 +470,9 @@ impl Storage {
 
     pub fn active_directory_paths(&self) -> Result<Vec<PathBuf>> {
         Ok(self
-            .list_directories()?
+            .console_directories()?
             .into_iter()
-            .filter(|directory| directory.exists)
+            .filter(|directory| directory.exists && directory.enabled)
             .map(|directory| directory.path)
             .collect())
     }
@@ -483,6 +482,17 @@ impl Storage {
         event: &ActivityEvent,
         matched_directories: &[PathBuf],
     ) -> Result<bool> {
+        self.record_event_with_identity(event, matched_directories, None)
+            .map(|(inserted, _)| inserted)
+    }
+
+    /// 回填使用本次观测的原行身份，不把无序号的独立事件合并。
+    pub(crate) fn record_event_with_identity(
+        &mut self,
+        event: &ActivityEvent,
+        matched_directories: &[PathBuf],
+        existing_event_id: Option<i64>,
+    ) -> Result<(bool, i64)> {
         let event_json = serde_json::to_string(event)?;
         let sequence_key = sequence_key(event);
         let source_timestamp_ms = event.source_timestamp_ms;
@@ -500,41 +510,68 @@ impl Storage {
             .transpose()?;
         let kind = event_kind_name(event.kind);
         let transaction = self.connection.transaction()?;
-        let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO events (
+        // 行可能已经过期或被清除；同时核对原事件，避免行号复用后误补别的记录。
+        let original_id = existing_event_id
+            .map(|id| {
+                transaction
+                    .query_row(
+                        "SELECT id FROM events WHERE id=?1 AND event_json=?2",
+                        params![id, event_json],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+            })
+            .transpose()?
+            .flatten();
+        let inserted = if original_id.is_some() {
+            0
+        } else {
+            transaction.execute(
+                "INSERT OR IGNORE INTO events (
                 source_run_id, source_timestamp_ms, received_timestamp_ms, global_seq,
                 event_seq, sequence_key, kind, pid, pid_version, file_path,
                 destination_path, event_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                event.source_run_id,
-                source_timestamp_ms,
-                event.received_timestamp_ms,
-                global_seq,
-                event_seq,
-                sequence_key,
-                kind,
-                i64::from(event.process.pid),
-                event.process.pid_version.map(i64::from),
-                file_path,
-                destination_path,
-                event_json,
-            ],
-        )?;
-        if inserted > 0 {
-            let event_id = transaction.last_insert_rowid();
-            for directory in normalize_directory_list(matched_directories)? {
-                transaction.execute(
-                    "INSERT OR IGNORE INTO event_directories (event_id, directory_path)
+                params![
+                    event.source_run_id,
+                    source_timestamp_ms,
+                    event.received_timestamp_ms,
+                    global_seq,
+                    event_seq,
+                    sequence_key,
+                    kind,
+                    i64::from(event.process.pid),
+                    event.process.pid_version.map(i64::from),
+                    file_path,
+                    destination_path,
+                    event_json,
+                ],
+            )?
+        };
+        let event_id = if let Some(id) = original_id {
+            id
+        } else if inserted > 0 {
+            transaction.last_insert_rowid()
+        } else {
+            transaction.query_row(
+                "SELECT id FROM events WHERE source_run_id=?1 AND sequence_key=?2",
+                params![event.source_run_id, sequence_key],
+                |row| row.get(0),
+            )?
+        };
+        for directory in normalize_directory_list(matched_directories)? {
+            transaction.execute(
+                "INSERT OR IGNORE INTO event_directories (event_id, directory_path)
                      VALUES (?1, ?2)",
-                    params![event_id, path_to_string(&directory)?],
-                )?;
-            }
+                params![event_id, path_to_string(&directory)?],
+            )?;
+        }
+        if inserted > 0 {
             increment_stat(&transaction, "events", 1)?;
             increment_stat(&transaction, &format!("events.{kind}"), 1)?;
         }
         transaction.commit()?;
-        Ok(inserted > 0)
+        Ok((inserted > 0, event_id))
     }
 
     pub fn record_alert(&mut self, alert: &Alert) -> Result<AlertWrite> {
@@ -551,11 +588,15 @@ impl Storage {
         let alert_json = serde_json::to_string(&persisted)?;
         let rule = alert_rule_name(alert.rule);
         let transaction = self.connection.transaction()?;
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM alerts WHERE id = ?1)",
-            params![alert.id],
-            |row| row.get(0),
-        )?;
+        let previous_json: Option<String> = transaction
+            .query_row(
+                "SELECT alert_json FROM alerts WHERE id = ?1",
+                params![alert.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let exists = previous_json.is_some();
+        let changed = previous_json.as_deref() != Some(&alert_json);
         transaction.execute(
             "INSERT INTO alerts (
                 id, rule, pid, pid_version, first_timestamp_ms,
@@ -602,6 +643,7 @@ impl Storage {
                 )?;
             }
         }
+        crate::console::record_alert_metadata(&transaction, alert, exists, changed)?;
         transaction.commit()?;
         Ok(if exists {
             AlertWrite::Updated
@@ -1052,36 +1094,16 @@ impl Storage {
     }
 
     pub fn prune_expired(&mut self, now_ms: i64) -> Result<PruneSummary> {
-        let cutoff = now_ms.saturating_sub(DEFAULT_RETENTION_MS);
+        let cutoff = now_ms.saturating_sub(i64::from(self.retention_days()?) * 86_400_000);
+        self.prune_before(cutoff)
+    }
+
+    pub(crate) fn prune_before(&mut self, cutoff: i64) -> Result<PruneSummary> {
+        let next_generation = self.cursor_generation()?.saturating_add(1);
         let transaction = self.connection.transaction()?;
-        let events = transaction.execute(
-            "DELETE FROM events WHERE received_timestamp_ms < ?1",
-            params![cutoff],
-        )?;
-        let outbox_entries = transaction.execute(
-            "DELETE FROM notification_outbox WHERE created_timestamp_ms < ?1",
-            params![cutoff],
-        )?;
-        let alerts = transaction.execute(
-            "DELETE FROM alerts WHERE last_timestamp_ms < ?1",
-            params![cutoff],
-        )?;
-        let health_records = transaction.execute(
-            "DELETE FROM health_records WHERE observed_timestamp_ms < ?1",
-            params![cutoff],
-        )?;
-        let notifications = transaction.execute(
-            "DELETE FROM notification_feedback WHERE observed_timestamp_ms < ?1",
-            params![cutoff],
-        )?;
+        let summary = prune_transaction(&transaction, cutoff, next_generation)?;
         transaction.commit()?;
-        Ok(PruneSummary {
-            events,
-            alerts,
-            health_records,
-            notifications,
-            outbox_entries,
-        })
+        Ok(summary)
     }
 
     pub fn clear_cumulative_stats(&mut self) -> Result<()> {
@@ -1095,7 +1117,7 @@ impl Storage {
         let sql = match version {
             0 => SCHEMA,
             1 => MIGRATE_SCHEMA_V1,
-            2 => "",
+            2 | 3 => "",
             value if value == i64::from(SCHEMA_VERSION) => return Ok(()),
             _ => {
                 return Err(Box::new(io::Error::new(
@@ -1109,6 +1131,7 @@ impl Storage {
         if matches!(version, 1 | 2) {
             transaction.execute_batch(MIGRATE_SCHEMA_V2)?;
         }
+        transaction.execute_batch(crate::console::CONSOLE_SCHEMA)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         Ok(())
@@ -1324,4 +1347,94 @@ fn set_database_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_database_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// 配置更新与删除可以共用同一个事务，失败时一起回滚。
+pub(crate) fn prune_transaction(
+    transaction: &Transaction<'_>,
+    cutoff: i64,
+    next_generation: u64,
+) -> Result<PruneSummary> {
+    let events = transaction.execute(
+        "DELETE FROM events WHERE received_timestamp_ms < ?1",
+        params![cutoff],
+    )?;
+    let outbox_entries = transaction.execute(
+        "DELETE FROM notification_outbox WHERE created_timestamp_ms < ?1",
+        params![cutoff],
+    )?;
+    let alerts = transaction.execute(
+        "DELETE FROM alerts WHERE last_timestamp_ms < ?1",
+        params![cutoff],
+    )?;
+    let health_records = transaction.execute(
+        "DELETE FROM health_records WHERE observed_timestamp_ms < ?1",
+        params![cutoff],
+    )?;
+    let notifications = transaction.execute(
+        "DELETE FROM notification_feedback WHERE observed_timestamp_ms < ?1",
+        params![cutoff],
+    )?;
+    if events > 0 || alerts > 0 {
+        transaction.execute("INSERT INTO console_settings(key,value) VALUES('cursor_generation',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![next_generation.to_string()])?;
+    }
+    Ok(PruneSummary {
+        events,
+        alerts,
+        health_records,
+        notifications,
+        outbox_entries,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_event_identity_cannot_add_directories_to_a_reused_row() {
+        let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+        let input_root = temp.path().join("anonymous-input");
+        let output_root = temp.path().join("anonymous-output");
+        fs::create_dir(&input_root).unwrap();
+        fs::create_dir(&output_root).unwrap();
+        let input_root = fs::canonicalize(input_root).unwrap();
+        let output_root = fs::canonicalize(output_root).unwrap();
+        let mut storage = Storage::open(temp.path().join("evidence.sqlite")).unwrap();
+        let original: ActivityEvent = serde_json::from_value(serde_json::json!({
+            "source_run_id": "synthetic-run", "source_stream": "activity",
+            "source_timestamp_ms": 1_010, "received_timestamp_ms": 2_000,
+            "global_seq": null, "event_seq": null, "kind": "create",
+            "process": {"pid": 30, "pid_version": 7},
+            "file": null, "destination": null, "modified": null, "archive": null
+        }))
+        .unwrap();
+        let (_, original_id) = storage
+            .record_event_with_identity(&original, std::slice::from_ref(&output_root), None)
+            .unwrap();
+        storage
+            .connection
+            .execute("DELETE FROM events", [])
+            .unwrap();
+        let mut unrelated = original.clone();
+        unrelated.kind = EventKind::Write;
+        let (_, reused_id) = storage
+            .record_event_with_identity(&unrelated, std::slice::from_ref(&output_root), None)
+            .unwrap();
+        assert_eq!(original_id, reused_id);
+        let (inserted, restored_id) = storage
+            .record_event_with_identity(
+                &original,
+                &[input_root.clone(), output_root.clone()],
+                Some(original_id),
+            )
+            .unwrap();
+        assert!(inserted);
+        assert_ne!(restored_id, reused_id);
+        let rows = storage.query_events(&EventFilter::default()).unwrap();
+        assert_eq!(rows.len(), 2);
+        let unrelated_row = rows.iter().find(|row| row.id == reused_id).unwrap();
+        assert_eq!(unrelated_row.directories, vec![output_root]);
+        assert_eq!(storage.cumulative_stats().unwrap().events, 3);
+    }
 }

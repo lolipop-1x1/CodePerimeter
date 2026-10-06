@@ -15,6 +15,50 @@ fn parse(value: &Value) -> codeperimeter::eslogger::ParseOutcome {
 }
 
 #[test]
+fn dedicated_read_source_accepts_only_open_and_mapping_evidence() {
+    for value in rows() {
+        let expected = matches!(value["event_type"].as_u64(), Some(10 | 20));
+        let mut adapter =
+            EsloggerAdapter::new_with_stream("synthetic-read-run", SourceStream::Read);
+        let outcome = adapter.parse_line(&value.to_string(), 1234);
+        assert_eq!(outcome.event.is_some(), expected);
+        if let Some(event) = outcome.event {
+            assert_eq!(event.source_stream, SourceStream::Read);
+            assert!(matches!(event.kind, EventKind::Open | EventKind::Mmap));
+        } else {
+            assert!(
+                outcome
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == "source_stream_event_mismatch")
+            );
+        }
+    }
+}
+
+#[test]
+fn dedicated_write_source_accepts_only_write_evidence() {
+    for value in rows() {
+        let expected = value["event_type"].as_u64() == Some(33);
+        let mut adapter =
+            EsloggerAdapter::new_with_stream("synthetic-write-run", SourceStream::Write);
+        let outcome = adapter.parse_line(&value.to_string(), 1234);
+        assert_eq!(outcome.event.is_some(), expected);
+        if let Some(event) = outcome.event {
+            assert_eq!(event.source_stream, SourceStream::Write);
+            assert_eq!(event.kind, EventKind::Write);
+        } else {
+            assert!(
+                outcome
+                    .issues
+                    .iter()
+                    .any(|issue| { issue.code == "source_stream_event_mismatch" })
+            );
+        }
+    }
+}
+
+#[test]
 fn preserves_nine_event_types_and_execution_generation() {
     let mut adapter = EsloggerAdapter::new("synthetic-run");
     let mut parsed = Vec::new();
@@ -49,6 +93,48 @@ fn preserves_nine_event_types_and_execution_generation() {
         Some(PathBuf::from("/private/tmp/synthetic-snapshot.tar"))
     );
     assert_eq!(adapter.health().parsed_events, 9);
+}
+
+#[test]
+fn source_latency_timestamps_belong_to_the_same_received_line() {
+    let mut adapter = EsloggerAdapter::new("synthetic-run");
+    let mut value = rows().remove(0);
+    let source_time = 1767225600123;
+    let received_time = source_time + 42;
+    let outcome = adapter.parse_line(&value.to_string(), received_time);
+    assert_eq!(
+        outcome.event.unwrap().source_timestamp_ms,
+        Some(source_time)
+    );
+    assert_eq!(
+        adapter.health().last_received_timestamp_ms,
+        Some(received_time)
+    );
+    assert_eq!(adapter.health().last_source_timestamp_ms, Some(source_time));
+
+    value["time"] = Value::Null;
+    let outcome = adapter.parse_line(&value.to_string(), received_time + 100);
+    assert_eq!(outcome.event.unwrap().source_timestamp_ms, None);
+    assert_eq!(
+        adapter.health().last_received_timestamp_ms,
+        Some(received_time + 100)
+    );
+    assert_eq!(adapter.health().last_source_timestamp_ms, None);
+
+    value["time"] = json!("2026-01-01T00:00:00.123Z");
+    assert!(
+        adapter
+            .parse_line(&value.to_string(), received_time + 200)
+            .event
+            .is_some()
+    );
+    assert_eq!(adapter.health().last_source_timestamp_ms, Some(source_time));
+    assert!(adapter.parse_line("{", received_time + 300).event.is_none());
+    assert_eq!(
+        adapter.health().last_received_timestamp_ms,
+        Some(received_time + 300)
+    );
+    assert_eq!(adapter.health().last_source_timestamp_ms, None);
 }
 
 #[test]

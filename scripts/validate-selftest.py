@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """验收判定器的匿名自测；不启动采集，不能作为真实 ES 或通知验收。"""
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 import hashlib
 import importlib.util
 import io
@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -80,6 +81,20 @@ class ValidationTimingTests(unittest.TestCase):
                         {"exec": sample, "activity": sample, "combined": sample}):
             self.assertFalse(validation.collector_streams_healthy(dict(status, collector_streams=streams)))
         self.assertTrue(validation.collector_streams_healthy(dict(status, collector_streams={"combined": sample})))
+        three_streams = {name: dict(sample) for name in ("exec", "read", "activity")}
+        self.assertTrue(validation.collector_streams_healthy(dict(status, collector_streams=three_streams)))
+        self.assertEqual(set(validation.collector_streams_snapshot({"collector_streams": three_streams})),
+                         {"exec", "read", "activity"})
+        for field, value in (("lines", 0), ("schema_version", None), ("sequence_gaps", 1)):
+            wrong = dict(three_streams, read=dict(sample, **{field: value}))
+            self.assertFalse(validation.collector_streams_healthy(dict(status, collector_streams=wrong)))
+        four_streams = dict(three_streams, write=dict(sample))
+        self.assertTrue(validation.collector_streams_healthy(dict(status, collector_streams=four_streams)))
+        self.assertEqual(set(validation.collector_streams_snapshot({"collector_streams": four_streams})),
+                         {"exec", "read", "write", "activity"})
+        for field, value in (("lines", 0), ("schema_version", None), ("sequence_gaps", 1)):
+            wrong = dict(four_streams, write=dict(sample, **{field: value}))
+            self.assertFalse(validation.collector_streams_healthy(dict(status, collector_streams=wrong)))
         self.assertFalse(validation.collector_streams_healthy({}))
 
     def test_trigger_order_keeps_equal_time_sequence_local_to_the_source_stream(self):
@@ -122,6 +137,70 @@ class ValidationTimingTests(unittest.TestCase):
         self.assertFalse(negative["generation_latency"]["within_3000_ms"])
         self.assertFalse(negative["notification_send_latency"]["within_3000_ms"])
         self.assertFalse(validation.latency_summary([3001], 0)["within_3000_ms"])
+
+
+class ValidationDatabaseSchemaTests(unittest.TestCase):
+    def read_evidence(self, database):
+        connect = sqlite3.connect
+        opened = []
+
+        def track_connection(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            opened.append(connection)
+            return connection
+
+        try:
+            with patch.object(validation.sqlite3, "connect", side_effect=track_connection):
+                return validation.load_evidence(database)
+        finally:
+            self.assertEqual(len(opened), 1)
+            for connection in opened:
+                try:
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        connection.execute("SELECT 1")
+                finally:
+                    connection.close()
+
+    def test_schema_three_and_four_read_the_same_core_evidence_contract(self):
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-schema-read-", dir="/private/tmp") as temporary:
+            for schema in (3, 4):
+                with self.subTest(schema=schema):
+                    database = Path(temporary) / f"schema-{schema}.sqlite"
+                    source_event = event(1000)
+                    source_alert = {"id": "anonymous-alert", "rule": "bulk_file_access"}
+                    with closing(sqlite3.connect(database)) as connection, connection:
+                        connection.executescript(
+                            f"PRAGMA user_version={schema};"
+                            "CREATE TABLE events (id INTEGER,event_json TEXT);"
+                            "CREATE TABLE alerts (alert_json TEXT);"
+                            "CREATE TABLE notification_outbox (alert_id TEXT,created_timestamp_ms INTEGER);"
+                            "CREATE TABLE notification_feedback (id INTEGER,alert_id TEXT,observed_timestamp_ms INTEGER,outcome TEXT);"
+                            "CREATE TABLE health_records (id INTEGER,observed_timestamp_ms INTEGER,component TEXT,code TEXT,state TEXT,detail TEXT,source_json TEXT);"
+                        )
+                        connection.execute("INSERT INTO events VALUES(?,?)", (1, json.dumps(source_event)))
+                        connection.execute("INSERT INTO alerts VALUES(?)", (json.dumps(source_alert),))
+                        connection.execute("INSERT INTO notification_outbox VALUES(?,?)", ("anonymous-alert", 1010))
+                        connection.execute("INSERT INTO notification_feedback VALUES(?,?,?,?)", (1, "anonymous-alert", 1020, "sent"))
+                        connection.execute("INSERT INTO health_records VALUES(?,?,?,?,?,?,?)", (1, 1005, "collector", "synthetic", "healthy", None, None))
+                        if schema == 4:
+                            connection.execute("CREATE TABLE console_settings (key TEXT,value TEXT)")
+                    loaded = self.read_evidence(database)
+                    self.assertEqual(loaded["sqlite_schema"], schema)
+                    self.assertEqual(loaded["events"], [source_event])
+                    self.assertEqual(loaded["alerts"], [source_alert])
+                    self.assertEqual(loaded["outbox"], {"anonymous-alert": 1010})
+                    self.assertEqual(loaded["notifications"][0]["outcome"], "sent")
+                    self.assertEqual(loaded["health"][0]["code"], "synthetic")
+
+    def test_unknown_schema_is_refused_before_reading_core_tables(self):
+        with tempfile.TemporaryDirectory(prefix="codeperimeter-schema-reject-", dir="/private/tmp") as temporary:
+            for schema in (0, 2, 5, 999):
+                with self.subTest(schema=schema):
+                    database = Path(temporary) / f"schema-{schema}.sqlite"
+                    with closing(sqlite3.connect(database)) as connection, connection:
+                        connection.execute(f"PRAGMA user_version={schema}")
+                    with self.assertRaisesRegex(RuntimeError, "SQLite schema 3／4"):
+                        self.read_evidence(database)
 
 
 class ValidationArchiveOutputTests(unittest.TestCase):
@@ -213,6 +292,10 @@ class ValidationCompletionTests(unittest.TestCase):
         control.assert_not_called()
 
     def test_real_fence_requires_read_flag_matching_pid_path_and_sequence(self):
+        for stream in ("combined", "activity", "read"):
+            snapshot = self.base | {"events": [self.fence_event | {"source_stream": stream}]}
+            self.assertTrue(validation.completion_state(snapshot, [self.operation], PROJECT, self.status,
+                                                       self.fence)["source_fence_crossed"])
         for replacement in ({"global_seq": None}, {"source_stream": "exec"}, {"kind": "close"}, {"process": PROCESS},
                             {"file": self.fence_event["file"] | {"readable": False}},
                             {"file": self.fence_event["file"] | {"path_truncated": True}},
@@ -701,9 +784,11 @@ class ProtectedReplacementTests(unittest.TestCase):
                 self.quiet()
         with self.assertRaisesRegex(RuntimeError, "已安装或加载"):
             self.quiet(loaded=True)
-        with self.assertRaisesRegex(RuntimeError, "进程"):
-            self.quiet(comm="/anonymous/bin/codeperimeter\n")
-        self.quiet(comm="/usr/bin/unrelated\n")
+        # 进程分支使用匿名文件状态，不能被开发机已安装的服务提前短路。
+        with patch.object(os.path, "lexists", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "进程"):
+                self.quiet(comm="/anonymous/bin/codeperimeter\n")
+            self.quiet(comm="/usr/bin/unrelated\n")
 
     def test_root_guard_rechecks_mode_and_write_acl(self):
         with patch.object(Path, "lstat", return_value=SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o775)):

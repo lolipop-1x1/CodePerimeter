@@ -145,6 +145,233 @@ fn partitioned_archive_association_uses_source_order_when_the_read_arrives_late(
 }
 
 #[test]
+fn partitioned_archive_output_survives_late_reads_and_pre_exit_stream_reordering() {
+    let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = protected_root(&temp, "anonymous-output-project");
+    for order in 0..4 {
+        let mut engine = RuleEngine::new(vec![root.clone()], rule_config(50)).unwrap();
+        let mut read = read_event(root.join("source.rs"), 1_000, 5_000, 30, Some(7));
+        read.source_stream = SourceStream::Read;
+        let mut output = event(
+            EventKind::Create,
+            Some(temp.path().join("synthetic-output.zip")),
+            Some(1_010),
+            2_000,
+            30,
+            Some(7),
+        );
+        output.source_stream = SourceStream::Activity;
+        let mut exit = event(EventKind::Exit, None, Some(1_020), 3_000, 30, Some(7));
+        exit.source_stream = SourceStream::Activity;
+        let result = match order {
+            0 => {
+                assert!(engine.process(&output).alerts.is_empty());
+                engine.process(&read)
+            }
+            1 => {
+                engine.process(&output);
+                engine.process(&exit);
+                engine.process(&read)
+            }
+            2 => {
+                engine.process(&exit);
+                engine.process(&output);
+                engine.process(&read)
+            }
+            3 => {
+                engine.process(&read);
+                engine.process(&exit);
+                output.kind = EventKind::Write;
+                output.source_stream = SourceStream::Write;
+                output.received_timestamp_ms = 6_000;
+                engine.process(&output)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(result.alerts.len(), 1, "order={order}");
+        assert_eq!(result.alerts[0].rule, AlertRule::ArchiveOutput);
+        assert_eq!(result.alerts[0].first_timestamp_ms, 1_000);
+        assert_eq!(result.alerts[0].last_timestamp_ms, 1_010);
+        assert_eq!(result.alerts[0].roots, vec![root.clone()]);
+    }
+}
+
+#[test]
+fn repeated_output_event_adds_correlated_roots_without_duplicate_rows_or_counts() {
+    let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let input_root = protected_root(&temp, "anonymous-input-project");
+    let output_root = protected_root(&temp, "anonymous-output-project");
+    let mut storage = Storage::open(temp.path().join("evidence.sqlite")).unwrap();
+    for root in [&input_root, &output_root] {
+        storage.add_directory(root, "manual", 1).unwrap();
+    }
+    let mut output = event(
+        EventKind::Create,
+        Some(output_root.join("synthetic.zip")),
+        Some(1_010),
+        2_000,
+        30,
+        Some(7),
+    );
+    output.source_stream = SourceStream::Activity;
+    output.global_seq = Some(1);
+    assert!(
+        storage
+            .record_event(&output, std::slice::from_ref(&output_root))
+            .unwrap()
+    );
+    for _ in 0..2 {
+        assert!(
+            !storage
+                .record_event(&output, &[input_root.clone(), output_root.clone()])
+                .unwrap()
+        );
+    }
+    let events = storage.query_events(&EventFilter::default()).unwrap();
+    assert_eq!(events.len(), 1);
+    let mut roots = vec![input_root, output_root];
+    roots.sort();
+    assert_eq!(events[0].directories, roots);
+    assert_eq!(storage.cumulative_stats().unwrap().events, 1);
+}
+
+#[test]
+fn late_archive_outputs_reject_unproven_paths_identity_time_and_exit_boundaries() {
+    let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = protected_root(&temp, "anonymous-output-boundaries");
+    let excluded = root.join("excluded");
+    std::fs::create_dir(&excluded).unwrap();
+    for case in 0..24 {
+        let mut config = rule_config(50);
+        if case == 21 {
+            config.max_process_states = 1;
+        }
+        let mut engine = RuleEngine::new(vec![root.clone()], config).unwrap();
+        let mut read = read_event(root.join("source.rs"), 1_000, 5_000, 30, Some(7));
+        read.source_stream = SourceStream::Read;
+        let mut original = event(
+            EventKind::Create,
+            Some(temp.path().join("synthetic.zip")),
+            Some(1_010),
+            2_000,
+            30,
+            Some(7),
+        );
+        original.source_stream = SourceStream::Activity;
+        let mut exit = event(EventKind::Exit, None, Some(1_020), 3_000, 30, Some(7));
+        exit.source_stream = SourceStream::Activity;
+        match case {
+            0 => read.source_timestamp_ms = Some(1_020),
+            1 => original.source_timestamp_ms = Some(100_000),
+            2 => read.source_timestamp_ms = None,
+            3 => original.source_timestamp_ms = None,
+            4 => {
+                read.process.pid_version = None;
+                original.process.pid_version = None;
+            }
+            5 => read.process.pid_version = Some(8),
+            6 => read.process.pid = 31,
+            7 => read.source_run_id = "synthetic-other-run".into(),
+            8 => {
+                read.source_stream = SourceStream::Combined;
+                original.source_stream = SourceStream::Combined;
+            }
+            9 => read.source_stream = SourceStream::Combined,
+            10 => read.file.as_mut().unwrap().readable = Some(false),
+            11 => read.file.as_mut().unwrap().path_truncated = true,
+            12 => original.file.as_mut().unwrap().path_truncated = true,
+            13 => original.file.as_mut().unwrap().is_regular = Some(false),
+            14 => {
+                engine
+                    .replace_scope(vec![root.clone()], vec![excluded.clone()])
+                    .unwrap();
+                read.file.as_mut().unwrap().path = excluded.join("source.rs");
+            }
+            15 => {
+                engine
+                    .replace_scope(vec![root.clone()], vec![excluded.clone()])
+                    .unwrap();
+                original.file.as_mut().unwrap().path = excluded.join("synthetic.zip");
+            }
+            16 => read.file.as_mut().unwrap().is_regular = Some(false),
+            17 => exit.source_timestamp_ms = Some(990),
+            18 => {
+                exit.source_timestamp_ms = Some(1_005);
+                engine.process(&exit);
+            }
+            19 => exit.source_timestamp_ms = None,
+            20 => exit.source_stream = SourceStream::Combined,
+            21 => {}
+            22 => read.source_stream = SourceStream::Write,
+            23 => original.source_stream = SourceStream::Read,
+            _ => unreachable!(),
+        }
+        assert!(engine.process(&original).alerts.is_empty());
+        if matches!(case, 17 | 19 | 20) {
+            engine.process(&exit);
+        }
+        if case == 21 {
+            engine.process(&read_event(
+                root.join("other.rs"),
+                1_000,
+                4_000,
+                31,
+                Some(8),
+            ));
+        }
+        let result = engine.process(&read);
+        assert!(result.reassociated_outputs.is_empty(), "case={case}");
+        assert!(
+            !result
+                .alerts
+                .iter()
+                .any(|alert| alert.rule == AlertRule::ArchiveOutput),
+            "case={case}"
+        );
+    }
+}
+
+#[test]
+fn pending_archive_output_capacity_is_bounded_and_reports_lost_candidates() {
+    let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = protected_root(&temp, "anonymous-output-capacity");
+    let mut engine = RuleEngine::new(
+        vec![root.clone()],
+        RuleConfig {
+            max_evidence_paths: 2,
+            ..rule_config(50)
+        },
+    )
+    .unwrap();
+    for index in 0..3 {
+        let mut original = event(
+            EventKind::Create,
+            Some(temp.path().join(format!("synthetic-{index}.zip"))),
+            Some(1_010 + index),
+            2_000 + index,
+            30,
+            Some(7),
+        );
+        original.source_stream = SourceStream::Activity;
+        let result = engine.process(&original);
+        assert_eq!(
+            result
+                .health
+                .iter()
+                .any(|item| item.code == "archive_output_state_capacity"),
+            index == 2
+        );
+    }
+    let mut read = read_event(root.join("source.rs"), 1_000, 5_000, 30, Some(7));
+    read.source_stream = SourceStream::Read;
+    let result = engine.process(&read);
+    assert_eq!(result.reassociated_outputs.len(), 2);
+    assert_eq!(result.alerts.len(), 2);
+    assert_eq!(result.alerts[1].activity_count, 2);
+    assert!(engine.process(&read).reassociated_outputs.is_empty());
+}
+
+#[test]
 fn late_archive_association_rejects_unproven_identity_time_and_read_evidence() {
     let temp = fixture();
     let root = protected_root(&temp, "anonymous-late-project");
@@ -189,7 +416,7 @@ fn late_archive_association_rejects_unproven_identity_time_and_read_evidence() {
         }
         assert!(engine.process(&command).alerts.is_empty());
         if case == 12 {
-            let mut exit = event(EventKind::Exit, None, Some(1_030), 3_000, 30, Some(7));
+            let mut exit = event(EventKind::Exit, None, Some(990), 3_000, 30, Some(7));
             exit.source_stream = SourceStream::Activity;
             engine.process(&exit);
         } else if case == 13 {
@@ -771,7 +998,7 @@ fn sqlite_directory_event_alert_notification_and_retention_apis_are_atomic() {
     let root_alias = temp.path().join("project");
     let database = temp.path().join("monitor.sqlite");
     let mut storage = Storage::open(&database).unwrap();
-    assert_eq!(storage.schema_version().unwrap(), 3);
+    assert_eq!(storage.schema_version().unwrap(), 4);
     assert!(storage.add_directory(&root, "manual", 100).unwrap());
     assert!(!storage.add_directory(&root_alias, "manual", 101).unwrap());
     assert!(!storage.add_directory(&root_alias, "codex", 102).unwrap());
@@ -950,7 +1177,7 @@ fn sqlite_partitioned_sequences_are_distinct_and_combined_accepts_legacy_rows() 
     activity.source_stream = SourceStream::Activity;
     assert!(storage.record_event(&activity, &[]).unwrap());
     assert!(!storage.record_event(&activity, &[]).unwrap());
-    assert_eq!(storage.schema_version().unwrap(), 3);
+    assert_eq!(storage.schema_version().unwrap(), 4);
     let rows = storage.query_events(&EventFilter::default()).unwrap();
     assert_eq!(rows.len(), 3);
     for source_stream in [
@@ -1259,7 +1486,7 @@ fn schema_v1_migration_preserves_evidence_feedback_and_pending_outbox() {
     drop(legacy);
 
     let mut migrated = Storage::open(&database).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 3);
+    assert_eq!(migrated.schema_version().unwrap(), 4);
     assert_eq!(migrated.list_directories().unwrap(), directories);
     assert_eq!(
         migrated.query_events(&EventFilter::default()).unwrap(),
@@ -1311,7 +1538,7 @@ fn schema_v1_migration_preserves_evidence_feedback_and_pending_outbox() {
     );
     drop(migrated);
     let reopened = Storage::open(database).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 3);
+    assert_eq!(reopened.schema_version().unwrap(), 4);
     assert_eq!(reopened.pending_notification_summary().unwrap().count, 1);
 }
 
@@ -1354,7 +1581,7 @@ fn schema_v2_migration_preserves_legacy_rows_statistics_and_new_source_context()
         PRAGMA user_version = 2; COMMIT;").unwrap();
     drop(legacy);
     let mut migrated = Storage::open(&database).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 3);
+    assert_eq!(migrated.schema_version().unwrap(), 4);
     assert_eq!(
         migrated.query_events(&EventFilter::default()).unwrap(),
         events
