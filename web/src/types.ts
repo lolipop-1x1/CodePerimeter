@@ -35,6 +35,7 @@ export interface Alert {
   unique_files: number;
   activity_count: number;
   evidence_paths: string[];
+  archive_output_paths?: string[];
 }
 export interface RulesSettings {
   version: number;

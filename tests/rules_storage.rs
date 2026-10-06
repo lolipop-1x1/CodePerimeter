@@ -193,6 +193,10 @@ fn partitioned_archive_output_survives_late_reads_and_pre_exit_stream_reordering
         assert_eq!(result.alerts[0].first_timestamp_ms, 1_000);
         assert_eq!(result.alerts[0].last_timestamp_ms, 1_010);
         assert_eq!(result.alerts[0].roots, vec![root.clone()]);
+        assert_eq!(
+            result.alerts[0].archive_output_paths,
+            vec![temp.path().join("synthetic-output.zip")]
+        );
     }
 }
 
@@ -965,6 +969,7 @@ fn sample_alert(id: &str, root: &Path, pid: u32, timestamp_ms: i64) -> Alert {
         unique_files: 50,
         activity_count: 50,
         evidence_paths: vec![root.join("file.rs")],
+        archive_output_paths: vec![],
         is_new: true,
     }
 }

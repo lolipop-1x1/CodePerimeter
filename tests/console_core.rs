@@ -57,6 +57,7 @@ fn alert(id: &str, time: i64) -> Alert {
         unique_files: 50,
         activity_count: 50,
         evidence_paths: vec!["/private/tmp/synthetic-project/source.rs".into()],
+        archive_output_paths: vec![],
         is_new: true,
     }
 }

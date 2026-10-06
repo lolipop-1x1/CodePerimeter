@@ -44,7 +44,12 @@ pub struct WebOptions {
     pub codex_home: Option<PathBuf>,
     pub claude_home: Option<PathBuf>,
     pub zcode_db: Option<PathBuf>,
+    pub alert_id: Option<String>,
+    pub alerts: bool,
 }
+
+// 版本 2 才支持通知告警详情入口，更新后不复用旧页面服务。
+const WEB_ENTRY_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Session {
@@ -70,6 +75,13 @@ struct AppState {
 }
 
 pub fn run(options: WebOptions) -> Result<()> {
+    if options
+        .alert_id
+        .as_deref()
+        .is_some_and(|id| !crate::model::valid_alert_id(id))
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "告警入口标识不合法").into());
+    }
     let account = current_account()?;
     if account.uid == 0 {
         return Err(io::Error::other("网页控制台必须以普通用户运行").into());
@@ -93,7 +105,7 @@ pub fn run(options: WebOptions) -> Result<()> {
     if let Some(session) = read_session(&session_path)? {
         if session.host_socket == options.host_socket && probe_session(&session) {
             if !options.no_browser {
-                open_browser(&session)?;
+                open_browser(&session, options.alert_id.as_deref(), options.alerts)?;
             }
             println!("本机网页控制台已打开；关闭网页后监控继续运行。");
             return Ok(());
@@ -136,7 +148,7 @@ pub fn run(options: WebOptions) -> Result<()> {
         if let Some(session) = read_session(&session_path)? {
             if session.pid == child.id() && probe_session(&session) {
                 if !options.no_browser {
-                    open_browser(&session)?;
+                    open_browser(&session, options.alert_id.as_deref(), options.alerts)?;
                 }
                 println!("本机网页控制台已启动；关闭网页后监控继续运行。");
                 return Ok(());
@@ -231,7 +243,7 @@ fn nonce() -> io::Result<String> {
 }
 
 fn probe_session(session: &Session) -> bool {
-    if session.version != 1 || session.token.len() != 64 {
+    if session.version != WEB_ENTRY_VERSION || session.token.len() != 64 {
         return false;
     }
     let Some(address) = session
@@ -258,12 +270,23 @@ fn probe_session(session: &Session) -> bool {
     response.starts_with("HTTP/1.1 200") && response.contains(&format!("\"pid\":{}", session.pid))
 }
 
-fn open_browser(session: &Session) -> io::Result<()> {
+fn browser_entry(session: &Session, alert_id: Option<&str>, alerts: bool) -> String {
+    let target = if let Some(id) = alert_id {
+        format!("?alert={id}")
+    } else if alerts {
+        "?view=alerts".into()
+    } else {
+        String::new()
+    };
+    format!("{}/{target}#token={}", session.origin, session.token)
+}
+
+fn open_browser(session: &Session, alert_id: Option<&str>, alerts: bool) -> io::Result<()> {
     if !cfg!(target_os = "macos") {
         return Err(io::Error::other("请在本机浏览器打开私有入口文件中的地址"));
     }
     let status = Command::new("/usr/bin/open")
-        .arg(format!("{}/#token={}", session.origin, session.token))
+        .arg(browser_entry(session, alert_id, alerts))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -299,7 +322,7 @@ async fn serve(
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, options.port)).await?;
     let port = listener.local_addr()?.port();
     let session = Session {
-        version: 1,
+        version: WEB_ENTRY_VERSION,
         pid: std::process::id(),
         origin: format!("http://127.0.0.1:{port}"),
         token: nonce()?,
@@ -364,7 +387,7 @@ async fn serve(
         pid: session.pid,
     };
     if !options.no_browser {
-        open_browser(&session)?;
+        open_browser(&session, options.alert_id.as_deref(), options.alerts)?;
     }
     println!("本机网页控制台已启动；入口令牌只保存在私有会话文件中。");
     axum::serve(listener, app)
@@ -504,6 +527,9 @@ async fn host_call(state: &AppState, value: Value) -> std::result::Result<Value,
     .await;
     match result {
         Ok(Ok(response)) if response.ok => Ok(response.data.unwrap_or(Value::Null)),
+        Ok(Ok(response)) if response.error.as_deref() == Some("alert_unavailable") => {
+            Err(failure(StatusCode::NOT_FOUND, "alert_unavailable"))
+        }
         Ok(Ok(_)) => Err(failure(StatusCode::BAD_REQUEST, "host_request_rejected")),
         _ => Err(failure(StatusCode::SERVICE_UNAVAILABLE, "host_unavailable")),
     }
@@ -1038,7 +1064,7 @@ fn csv_record(value: &Value, kind: &str) -> String {
     let evidence = if kind == "events" {
         json!({"file":event["file"],"destination":event["destination"],"archive":event["archive"],"directories":value["directories"]})
     } else {
-        json!({"paths":event["evidence_paths"],"roots":event["roots"],"rule_version":value["rule_version"],"is_read":value["is_read"],"processed":value["processed"],"note":value["note"]})
+        json!({"paths":event["evidence_paths"],"archive_output_paths":event["archive_output_paths"],"roots":event["roots"],"rule_version":value["rule_version"],"is_read":value["is_read"],"processed":value["processed"],"note":value["note"]})
     };
     [
         value.get("id").unwrap_or(&event["id"]).to_string(),
@@ -1132,6 +1158,29 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn notification_entry_keeps_authentication_in_fragment_and_links_to_one_alert() {
+        let session = Session {
+            version: 1,
+            pid: 1,
+            origin: "http://127.0.0.1:12345".into(),
+            token: "synthetic-token".into(),
+            host_socket: "/private/tmp/synthetic-host.sock".into(),
+        };
+        assert_eq!(
+            browser_entry(&session, Some("synthetic:1"), false),
+            "http://127.0.0.1:12345/?alert=synthetic:1#token=synthetic-token"
+        );
+        assert_eq!(
+            browser_entry(&session, None, true),
+            "http://127.0.0.1:12345/?view=alerts#token=synthetic-token"
+        );
+        assert_eq!(
+            browser_entry(&session, None, false),
+            "http://127.0.0.1:12345/#token=synthetic-token"
+        );
+    }
     #[test]
     fn cancelled_history_request_holds_quota_until_queued_discovery_finishes() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1200,7 +1249,7 @@ mod tests {
     }
     #[test]
     fn anonymous_export_removes_identity_paths_and_notes() {
-        let mut value = json!({"id":"row-1","kind":"open","process":{"pid":99,"executable":"/opt/sample/reader","signing_id":"example.reader"},"file":{"path":"/sample/project/source.txt"},"note":"private note","handling_history":[{"note":"private history"}]});
+        let mut value = json!({"id":"row-1","kind":"open","process":{"pid":99,"executable":"/opt/sample/reader","signing_id":"example.reader"},"file":{"path":"/sample/project/source.txt"},"archive_output_paths":["/sample/output.zip"],"note":"private note","handling_history":[{"note":"private history"}]});
         anonymize(&mut value, "synthetic-salt", None);
         let text = value.to_string();
         assert!(
@@ -1209,6 +1258,10 @@ mod tests {
                 && !text.contains("example.reader")
         );
         assert_eq!(value["kind"], "open");
+        assert_eq!(
+            value["archive_output_paths"][0],
+            alias("/sample/output.zip", "synthetic-salt")
+        );
         assert_ne!(value["process"]["pid"], 99);
         assert_eq!(value["id"], alias("row-1", "synthetic-salt"));
     }

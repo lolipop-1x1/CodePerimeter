@@ -140,6 +140,7 @@ struct AlertCandidate {
     unique_files: usize,
     activity_count: u64,
     evidence_paths: Vec<PathBuf>,
+    archive_output_paths: Vec<PathBuf>,
 }
 
 pub struct RuleEngine {
@@ -833,6 +834,7 @@ impl RuleEngine {
                     unique_files: state.bulk_files.len(),
                     activity_count,
                     evidence_paths,
+                    archive_output_paths: Vec::new(),
                 })
             }
         };
@@ -922,6 +924,7 @@ impl RuleEngine {
             },
             activity_count: 1,
             evidence_paths,
+            archive_output_paths: Vec::new(),
         })
     }
 
@@ -939,7 +942,7 @@ impl RuleEngine {
             .unwrap_or(event_timestamp_ms);
         roots.extend(self.matching_roots(&output));
         sort_dedup_paths(&mut roots);
-        read_paths.push(output);
+        read_paths.push(output.clone());
         sort_dedup_paths(&mut read_paths);
         read_paths.truncate(self.config.max_evidence_paths);
         Some(AlertCandidate {
@@ -952,6 +955,7 @@ impl RuleEngine {
             unique_files: 1,
             activity_count: 1,
             evidence_paths: read_paths,
+            archive_output_paths: vec![output],
         })
     }
 
@@ -1176,6 +1180,15 @@ impl RuleEngine {
                     .alert
                     .evidence_paths
                     .truncate(self.config.max_evidence_paths);
+                pending
+                    .alert
+                    .archive_output_paths
+                    .extend(candidate.archive_output_paths);
+                sort_dedup_paths(&mut pending.alert.archive_output_paths);
+                pending
+                    .alert
+                    .archive_output_paths
+                    .truncate(self.config.max_evidence_paths);
                 pending.last_event_timestamp_ms = pending
                     .last_event_timestamp_ms
                     .max(candidate.event_timestamp_ms);
@@ -1224,6 +1237,7 @@ impl RuleEngine {
             unique_files: candidate.unique_files,
             activity_count: candidate.activity_count,
             evidence_paths: candidate.evidence_paths,
+            archive_output_paths: candidate.archive_output_paths,
             is_new: true,
         };
         self.alerts.insert(

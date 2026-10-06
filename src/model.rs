@@ -123,7 +123,18 @@ pub struct Alert {
     pub unique_files: usize,
     pub activity_count: u64,
     pub evidence_paths: Vec<PathBuf>,
+    /// 仅保存实际关联的候选输出，避免把读过的归档文件当作新输出。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_output_paths: Vec<PathBuf>,
     pub is_new: bool,
+}
+
+pub fn valid_alert_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
 pub fn now_ms() -> i64 {

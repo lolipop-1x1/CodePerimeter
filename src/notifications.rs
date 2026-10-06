@@ -1,6 +1,7 @@
 //! 普通用户的原生通知应用：显式授权、有界请求与系统提交回执。
 
 use crate::Result;
+use crate::runtime::NotificationTarget;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -47,6 +48,8 @@ struct Request<'a> {
     title: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'a NotificationTarget>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,13 +97,13 @@ impl NativeNotificationSender {
 
     /// 只有通知会话明确要求时调用；拒绝、关闭提醒或超时均返回失败。
     pub fn request_authorization(&self) -> Result<()> {
-        self.request("authorize", None, None, Duration::from_secs(65))?;
+        self.request("authorize", None, None, None, Duration::from_secs(65))?;
         Ok(())
     }
 
     /// 状态查询不会触发权限窗口。
     pub fn status(&self) -> Result<NotificationStatus> {
-        let reply = self.request("status", None, None, Duration::from_secs(6))?;
+        let reply = self.request("status", None, None, None, Duration::from_secs(6))?;
         Ok(NotificationStatus {
             authorization: reply
                 .authorization
@@ -113,10 +116,25 @@ impl NativeNotificationSender {
 
     /// 成功仅表示 UNUserNotificationCenter 接受提交，不等同于到屏。
     pub fn send(&self, title: &str, body: &str) -> Result<()> {
+        self.send_to(title, body, &NotificationTarget::Alerts)
+    }
+
+    pub fn send_to(&self, title: &str, body: &str, target: &NotificationTarget) -> Result<()> {
         if title.is_empty() || title.len() > 512 || body.is_empty() || body.len() > 8192 {
             return Err(failure("notification_request_invalid"));
         }
-        self.request("send", Some(title), Some(body), Duration::from_secs(6))?;
+        if let NotificationTarget::Alert { id } = target
+            && !crate::model::valid_alert_id(id)
+        {
+            return Err(failure("notification_target_invalid"));
+        }
+        self.request(
+            "send",
+            Some(title),
+            Some(body),
+            Some(target),
+            Duration::from_secs(6),
+        )?;
         Ok(())
     }
 
@@ -125,6 +143,7 @@ impl NativeNotificationSender {
         operation: &str,
         title: Option<&str>,
         body: Option<&str>,
+        target: Option<&NotificationTarget>,
         timeout: Duration,
     ) -> Result<Reply> {
         let bytes = serde_json::to_vec(&Request {
@@ -132,12 +151,14 @@ impl NativeNotificationSender {
             operation,
             title,
             body,
+            target,
         })?;
         if bytes.len() > MAX_REQUEST {
             return Err(failure("notification_request_invalid"));
         }
         let deadline = Instant::now() + timeout;
         let mut child = Command::new(&self.executable)
+            .arg("--request-stdin")
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -181,8 +202,8 @@ impl NativeNotificationSender {
 }
 
 impl crate::runtime::NotificationSender for NativeNotificationSender {
-    fn send(&mut self, title: &str, body: &str) -> Result<()> {
-        NativeNotificationSender::send(self, title, body)
+    fn send(&mut self, title: &str, body: &str, target: &NotificationTarget) -> Result<()> {
+        self.send_to(title, body, target)
     }
 }
 
@@ -513,13 +534,50 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let sender = fixture(
             directory.path(),
-            "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 3\nIFS= read -r request\ncase \"$request\" in *'\"title\":\"匿名告警\"'*'\"body\":\"合成证据\"'*) ;; *) exit 4;; esac\nprintf '%s\\n' '{\"version\":1,\"ok\":true,\"code\":\"accepted\"}'\n",
+            "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = --request-stdin ] || exit 3\nIFS= read -r request\ncase \"$request\" in *'\"title\":\"匿名告警\"'*'\"body\":\"合成证据\"'*) ;; *) exit 4;; esac\nprintf '%s\\n' '{\"version\":1,\"ok\":true,\"code\":\"accepted\"}'\n",
         );
         sender.send("匿名告警", "合成证据").unwrap();
         assert!(sender.send("", "合成证据").is_err());
         assert!(sender.send("匿名告警", &"x".repeat(8193)).is_err());
         // JSON 转义后的总量也有界，不只检查原始字符串字节。
         assert!(sender.send("匿名告警", &"\u{0001}".repeat(8192)).is_err());
+    }
+
+    #[test]
+    fn alert_navigation_is_bounded_stdin_metadata_without_web_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let sender = fixture(
+            directory.path(),
+            "#!/bin/sh\nIFS= read -r request\ncase \"$request\" in *'\"target\":{\"kind\":\"alert\",\"id\":\"synthetic-run:1:v1:archive_output:engine:1\"}'*) ;; *) exit 4;; esac\ncase \"$request\" in *token*|*http*|*launcher*) exit 5;; esac\nprintf '%s\\n' '{\"version\":1,\"ok\":true,\"code\":\"accepted\"}'\n",
+        );
+        sender
+            .send_to(
+                "合成告警",
+                "点击查看详情",
+                &NotificationTarget::Alert {
+                    id: "synthetic-run:1:v1:archive_output:engine:1".into(),
+                },
+            )
+            .unwrap();
+        for id in [
+            "",
+            "https://attacker.example",
+            "../other",
+            "bad\nidentifier",
+            &"x".repeat(513),
+        ] {
+            assert_eq!(
+                sender
+                    .send_to(
+                        "合成告警",
+                        "点击查看详情",
+                        &NotificationTarget::Alert { id: id.into() }
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                "notification_target_invalid"
+            );
+        }
     }
 
     #[test]
@@ -577,7 +635,7 @@ mod tests {
         );
         let started = Instant::now();
         let error = stalled
-            .request("status", None, None, Duration::from_millis(100))
+            .request("status", None, None, None, Duration::from_millis(100))
             .unwrap_err();
         assert_eq!(error.to_string(), "notification_timeout");
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -610,6 +668,7 @@ mod tests {
                 "send",
                 Some("匿名告警"),
                 Some("合成证据"),
+                None,
                 Duration::from_millis(100),
             )
             .unwrap_err();

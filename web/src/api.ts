@@ -29,6 +29,7 @@ export function errorMessage(code?: string | null): string {
   if (!code) return '操作未完成，请查看诊断状态。';
   const messages: Record<string, string> = {
     entry_expired: '控制台入口已失效，请重新运行 codeperimeter ui。',
+    alert_unavailable: '这条告警明细暂不可用，可能已过期、被清除或尚未保存。请关闭详情查看告警列表。',
     origin_rejected: '浏览器请求来源校验失败，请使用当前本机入口，并检查是否有扩展修改请求。',
     origin_required: '浏览器没有提供有效的同源信息，请使用当前本机入口。',
     host_rejected: '入口地址与当前控制台不一致，请重新运行 codeperimeter ui。',

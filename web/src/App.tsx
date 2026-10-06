@@ -12,6 +12,7 @@ import { RecordsPage } from './records';
 import { RulesPage } from './rules';
 import { serviceLabels, SettingsPage, type ServiceAction } from './settings';
 import type { ServiceOperation, Status } from './types';
+import { alertLocation, alertRoute } from './route';
 
 const pages = [
   { key: 'overview', label: '概览', title: '监控概览', description: '文件活动与归档线索', icon: Dashboard },
@@ -25,8 +26,9 @@ const pages = [
 
 export function App() {
   const [authenticated, setAuthenticated] = useState(initializeSession);
-  const [page, setPage] = useState<string>('overview');
-  const [selection, setSelection] = useState<Selection>(null);
+  const [page, setPage] = useState<string>(() => alertRoute(window.location.search).page);
+  const [selection, setSelection] = useState<Selection>(() => { const id = alertRoute(window.location.search).alert; return id ? { kind: 'alert', id } : null; });
+  const [routeError, setRouteError] = useState<string | undefined>(() => alertRoute(window.location.search).invalid ? '通知中的告警入口无效，请在告警中心查找记录。' : undefined);
   const [recordScope, setRecordScope] = useState<RecordScope>();
   const [operation, setOperation] = useState<ServiceOperation>();
   const [operationError, setOperationError] = useState<string>();
@@ -47,6 +49,15 @@ export function App() {
     return () => { window.removeEventListener('codeperimeter-session-expired', expired); media.removeEventListener('change', changed); };
   }, []);
   useEffect(() => { document.documentElement.dataset.theme = dark ? 'dark' : 'light'; try { localStorage.setItem('codeperimeter-theme', theme); } catch { /* 无持久存储时沿用本次选择。 */ } }, [dark, theme]);
+  useEffect(() => {
+    const restore = () => {
+      const route = alertRoute(window.location.search);
+      setPage(route.page); setSelection(route.alert ? { kind: 'alert', id: route.alert } : null);
+      setRouteError(route.invalid ? '通知中的告警入口无效，请在告警中心查找记录。' : undefined);
+    };
+    window.addEventListener('popstate', restore);
+    return () => window.removeEventListener('popstate', restore);
+  }, []);
   async function operate(action: ServiceAction) {
     if (starting || operation?.state === 'running') return;
     setStarting(true); setOperationError(undefined);
@@ -54,7 +65,12 @@ export function App() {
     catch (error) { setOperationError(error instanceof Error ? error.message : '无法启动服务操作。'); }
     finally { setStarting(false); }
   }
-  const navigate = (next: string) => { setPage(next); setSelection(null); };
+  const select = (next: Selection) => {
+    setSelection(next); setRouteError(undefined);
+    if (next?.kind === 'alert') setPage('alerts');
+    history.pushState(null, '', alertLocation(window.location, next?.kind === 'alert' ? next.id : undefined, next === null && page === 'alerts'));
+  };
+  const navigate = (next: string) => { setPage(next); setSelection(null); setRouteError(undefined); history.replaceState(null, '', alertLocation(window.location, undefined, next === 'alerts')); };
   const navigateRecords = (scope?: Omit<RecordScope, 'key'>) => { setRecordScope({ ...scope, key: Date.now() }); navigate('events'); };
   const current = pages.find(item => item.key === page)!;
   const statusData = status.data;
@@ -68,19 +84,19 @@ export function App() {
     <main id="main-content" tabIndex={-1} className="main-content">
       <header className="page-heading"><div><h1>{current.title}</h1><p>{current.description}</p></div><div className="actions"><Button kind="tertiary" size="sm" disabled={!authenticated || !mainAction || !statusData?.service_actions_enabled || starting || operation?.state === 'running'} onClick={() => mainAction && void operate(mainAction)}>{starting || operation?.state === 'running' ? '正在操作' : mainAction ? serviceLabels[mainAction] : '服务状态未知'}</Button><Tag type="gray">仅本机访问</Tag></div></header>
       {!authenticated ? <section className="panel entry-expired"><h2>请重新打开控制台</h2><p>当前标签页缺少有效入口。请在本机终端运行 <code>codeperimeter ui</code>，通过新打开的页面继续使用。</p><p className="helper">网页不接收管理员密码。</p></section> : <>
-        <Notice error={status.error ?? operationError} success={operation?.state === 'cancelled' ? '管理员操作已取消，未报告成功。' : undefined} />
+        <Notice error={routeError ?? status.error ?? operationError} success={operation?.state === 'cancelled' ? '管理员操作已取消，未报告成功。' : undefined} />
         {operation?.state === 'running' && <div className="operation-progress" role="status">服务操作进行中，请查看系统授权窗口；也可在系统窗口取消。</div>}
         <HealthStrip status={statusData} />
         {statusData && !statusData.host && <section className="host-unavailable"><h2>{statusData.service.status_error ? '后台服务状态暂时未知' : statusData.service.installed ? '管理宿主暂时不可用' : '后台服务尚未安装'}</h2><p>{statusData.host_error ? errorMessage(statusData.host_error) : '历史查询和监控配置需要管理宿主运行。可以继续查看实际安装状态与恢复入口。'}</p><Button kind="ghost" size="sm" onClick={() => navigate('settings')}>查看设置与诊断</Button></section>}
         <div className={`workspace${selection ? ' has-detail' : ''}`}><div className="page-content">
-          <section hidden={page !== 'overview'} aria-label="概览"><OverviewPage active={page === 'overview'} select={setSelection} navigateRecords={navigateRecords} /></section>
+          <section hidden={page !== 'overview'} aria-label="概览"><OverviewPage active={page === 'overview'} select={select} navigateRecords={navigateRecords} /></section>
           <section hidden={page !== 'directories'} aria-label="监控目录"><DirectoriesPage active={page === 'directories'} /></section>
-          <section hidden={page !== 'events'} aria-label="文件活动"><RecordsPage active={page === 'events'} select={setSelection} initialScope={recordScope} /></section>
-          <section hidden={page !== 'archives'} aria-label="归档迹象"><RecordsPage active={page === 'archives'} archive select={setSelection} /></section>
-          <section hidden={page !== 'alerts'} aria-label="告警中心"><RecordsPage active={page === 'alerts'} alerts select={setSelection} /></section>
+          <section hidden={page !== 'events'} aria-label="文件活动"><RecordsPage active={page === 'events'} select={select} initialScope={recordScope} /></section>
+          <section hidden={page !== 'archives'} aria-label="归档迹象"><RecordsPage active={page === 'archives'} archive select={select} /></section>
+          <section hidden={page !== 'alerts'} aria-label="告警中心"><RecordsPage active={page === 'alerts'} alerts select={select} /></section>
           <section hidden={page !== 'rules'} aria-label="规则中心"><RulesPage active={page === 'rules'} /></section>
           <section hidden={page !== 'settings'} aria-label="设置与诊断"><SettingsPage active={page === 'settings'} status={statusData} operation={operation} operate={action => void operate(action)} operationError={operationError} /></section>
-        </div><DetailPane selection={selection} select={setSelection} close={() => setSelection(null)} viewRule={() => navigate('rules')} viewProcess={pid => navigateRecords({ pid: String(pid) })} /></div>
+        </div><DetailPane selection={selection} select={select} close={() => select(null)} viewRule={() => navigate('rules')} viewProcess={pid => navigateRecords({ pid: String(pid) })} /></div>
         <footer>文件活动和归档迹象用于发现与追溯；当前观察能力不执行外传拦截。</footer>
       </>}
     </main>

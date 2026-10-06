@@ -206,3 +206,51 @@ test('无入口令牌明确展示恢复路径，不触发未授权的业务请�
   await expect(page.getByRole('heading', { name: '请重新打开控制台', exact: true })).toBeVisible();
   await expect(page.getByText('codeperimeter ui', { exact: true })).toBeVisible();
 });
+
+test('通知深链接打开指定告警，刷新与过期记录均有明确结果', async ({ page }) => {
+  const { directory, data } = fixture();
+  const headers = { Authorization: `Bearer ${data.session.token}`, Origin: data.session.origin };
+  const current = await page.request.post(`${data.session.origin}/api/console`, { headers, data: { action: 'rules_get' } });
+  const settings = (await current.json()).data;
+  const saved = await page.request.post(`${data.session.origin}/api/console`, { headers, data: { action: 'rules_set', payload: { settings: { ...settings, bulk_enabled: true, bulk_file_threshold: 50 } } } });
+  expect((await saved.json()).ok, '匿名通知测试恢复标准批量门槛').toBeTruthy();
+  const database = new DatabaseSync(join(data.root, 'events.sqlite'), { readOnly: true });
+  try {
+    const before = Number(database.prepare('SELECT COUNT(*) AS count FROM events').get()?.count);
+    writeFileSync(join(directory, 'inject'), '', { mode: 0o600 });
+    await expect.poll(() => Number(database.prepare('SELECT COUNT(*) AS count FROM events').get()?.count), { message: '等待本轮合成事件保存' }).toBe(before + 50);
+    const query = database.prepare('SELECT id,alert_json FROM alerts ORDER BY last_timestamp_ms DESC LIMIT 1');
+    await expect.poll(() => Boolean(query.get()), { message: '等待合成告警保存' }).toBeTruthy();
+    const alert = query.get()!;
+    const id = String(alert.id);
+    const record = JSON.parse(String(alert.alert_json));
+    const metadata = database.prepare('SELECT is_read,processed FROM alert_metadata WHERE alert_id=?');
+    const baseline = metadata.get(id);
+    try { await page.goto(`${data.session.origin}/?alert=${encodeURIComponent(id)}#token=${encodeURIComponent(data.session.token)}`); }
+    catch { throw new Error('无法打开匿名通知详情入口。'); }
+    await page.bringToFront();
+    await expect(page.getByRole('heading', { name: '告警中心', exact: true })).toBeVisible();
+    const detail = page.getByRole('complementary', { name: '记录详情' });
+    await expect(detail.getByLabel('处理备注', { exact: true })).toBeVisible();
+    await expect(detail.getByText(new RegExp(`\\(${record.process.pid}\\)`))).toBeVisible();
+    expect(new URL(page.url()).hash.length === 0, '入口令牌已从地址栏移除').toBeTruthy();
+    expect(metadata.get(id)).toEqual(baseline);
+    const foreground = await page.context().newPage();
+    try {
+      const loaded = page.waitForResponse(response => response.url().endsWith('/api/console') && response.request().postDataJSON()?.action === 'alert_detail');
+      await page.reload();
+      expect((await loaded).status(), '后台标签页首次加载仍读取详情').toBe(200);
+    } finally { await foreground.close(); await page.bringToFront(); }
+    await expect(detail.getByLabel('处理备注', { exact: true })).toBeVisible();
+    await detail.getByRole('button', { name: '关闭', exact: true }).click();
+    await expect(detail).not.toBeVisible();
+    await page.goBack();
+    await expect(detail.getByLabel('处理备注', { exact: true })).toBeVisible();
+    await page.goto(`${data.session.origin}/?alert=synthetic-expired`);
+    await expect(page.getByText('这条告警明细暂不可用，可能已过期、被清除或尚未保存。请关闭详情查看告警列表。')).toBeVisible();
+    await detail.getByRole('button', { name: '关闭', exact: true }).click();
+    await expect(page.getByRole('table', { name: '告警记录' })).toBeVisible();
+    await page.goto(`${data.session.origin}/?alert=${encodeURIComponent('../other')}`);
+    await expect(page.getByText('通知中的告警入口无效，请在告警中心查找记录。')).toBeVisible();
+  } finally { database.close(); }
+});

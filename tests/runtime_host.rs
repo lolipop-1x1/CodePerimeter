@@ -91,13 +91,21 @@ impl SyntheticSource {
     }
 }
 
+#[derive(Default)]
 struct RecordingSender {
     messages: Vec<(String, String)>,
+    targets: Vec<codeperimeter::runtime::NotificationTarget>,
 }
 
 impl NotificationSender for RecordingSender {
-    fn send(&mut self, title: &str, body: &str) -> codeperimeter::Result<()> {
+    fn send(
+        &mut self,
+        title: &str,
+        body: &str,
+        target: &codeperimeter::runtime::NotificationTarget,
+    ) -> codeperimeter::Result<()> {
         self.messages.push((title.to_owned(), body.to_owned()));
+        self.targets.push(target.clone());
         Ok(())
     }
 }
@@ -850,6 +858,7 @@ fn selected_directory_events_trigger_alerts_once_and_reconnects_are_visible() {
 
     let mut sender = RecordingSender {
         messages: Vec::new(),
+        ..Default::default()
     };
     send_batch(&source, &files, 702, 8, 0);
     wait_until(
@@ -870,7 +879,7 @@ fn selected_directory_events_trigger_alerts_once_and_reconnects_are_visible() {
     assert_eq!(alerts[0]["rule"], "bulk_file_access");
     assert!(notify_once_with_sender(&control_socket, "helper-session-a", &mut sender).unwrap());
     assert_eq!(sender.messages.len(), 1);
-    assert!(sender.messages[0].0.contains("摘要"));
+    assert!(sender.messages[0].0.contains("此前"));
     assert!(
         !notify_once_with_sender(&control_socket, "helper-session-a", &mut sender).unwrap(),
         "历史快照汇总成功后不应重发"
@@ -907,7 +916,14 @@ fn selected_directory_events_trigger_alerts_once_and_reconnects_are_visible() {
     );
     assert!(notify_once_with_sender(&control_socket, "helper-session-a", &mut sender).unwrap());
     assert_eq!(sender.messages.len(), 2);
-    assert!(sender.messages[1].0.contains("批量"));
+    assert!(sender.messages[1].0.contains("大量"));
+    assert_eq!(
+        sender.targets[0],
+        codeperimeter::runtime::NotificationTarget::Alerts
+    );
+    assert!(
+        matches!(&sender.targets[1], codeperimeter::runtime::NotificationTarget::Alert { id } if codeperimeter::model::valid_alert_id(id))
+    );
 
     let merged_files = create_files(&project, "merged");
     send_batch(&source, &merged_files, 703, 9, 201);
@@ -1092,13 +1108,14 @@ fn database_lock_does_not_stop_analysis_or_ephemeral_notification() {
 
     let mut sender = RecordingSender {
         messages: Vec::new(),
+        ..Default::default()
     };
     assert!(
         notify_once_with_sender(&control_socket, "helper-db-down", &mut sender).unwrap(),
         "SQLite降级时新告警仍应走有界内存通知"
     );
     assert_eq!(sender.messages.len(), 1);
-    assert!(sender.messages[0].0.contains("批量"));
+    assert!(sender.messages[0].0.contains("大量"));
 
     lock.execute_batch("ROLLBACK").unwrap();
     drop(lock);
@@ -1278,6 +1295,7 @@ fn merged_alert_recovers_outbox_across_restart_and_sent_alert_does_not_repeat() 
         );
         let mut sender = RecordingSender {
             messages: Vec::new(),
+            ..Default::default()
         };
         if sent_during_failure {
             assert!(

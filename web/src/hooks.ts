@@ -19,8 +19,9 @@ export function usePolling<T>(path: string, body: unknown, active = true, interv
       setLoading(true);
       lastBody.current = path + serialized;
     }
-    const load = async () => {
-      if (document.hidden) return;
+    const load = async (initial = false) => {
+      // 通知可能打开后台标签页，首次加载不能因可见性变化而永久停在骨架屏。
+      if (document.hidden && !initial) return;
       controller = new AbortController();
       try {
         const result = path === '/api/console'
@@ -34,7 +35,7 @@ export function usePolling<T>(path: string, body: unknown, active = true, interv
       }
     };
     const visibility = () => { if (!document.hidden) { clearTimeout(timer); controller?.abort(); void load(); } };
-    void load();
+    void load(true);
     document.addEventListener('visibilitychange', visibility);
     return () => { alive = false; clearTimeout(timer); controller?.abort(); document.removeEventListener('visibilitychange', visibility); };
   }, [path, serialized, active, interval, revision]);

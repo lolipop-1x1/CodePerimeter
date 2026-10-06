@@ -517,6 +517,18 @@ fn actual_host_pagination_export_rules_and_handling_are_connected() {
     assert!(!alerts["items"].as_array().unwrap().is_empty());
     let alert = &alerts["items"][0];
     let id = alert["alert"]["id"].clone();
+    let (missing_status, missing_body) = rig.http(
+        "POST",
+        "/api/console",
+        Some(json!({"action":"alert_detail","payload":{"id":"synthetic-missing"}})),
+        None,
+        None,
+    );
+    assert_eq!(missing_status, 404);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&missing_body).unwrap()["error"],
+        "alert_unavailable"
+    );
     let processed=rig.console("alert_update",json!({"id":id,"is_read":true,"processed":true,"note":"synthetic note","expected_revision":alert["revision"]}));
     assert_eq!(processed["processed"], true);
     rig.send_open(125, 126);
@@ -643,8 +655,20 @@ fn cli_detaches_reuses_private_entry_and_closing_ui_keeps_host_running() {
     assert!(second.status.success());
     let repeated: Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
     assert_eq!(session["pid"], repeated["pid"]);
+    let mut legacy = repeated.clone();
+    legacy["version"] = json!(1);
+    fs::write(&entry, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(open().status.success());
+    let upgraded: Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
+    assert_ne!(
+        upgraded["pid"], session["pid"],
+        "旧入口不能处理通知详情，需启动新版页面"
+    );
     let pid = session["pid"].as_u64().unwrap() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert!(entry.exists(), "旧服务退出不能移除新版入口");
+    let new_pid = upgraded["pid"].as_u64().unwrap() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(new_pid, libc::SIGTERM) }, 0);
     wait(|| !entry.exists());
     rig.send_open(0, 1);
     wait(|| rig.console("events_page", json!({"filter":{}}))["total"] == 1);

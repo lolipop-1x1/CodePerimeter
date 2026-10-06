@@ -192,7 +192,14 @@ pub enum NotifyPollResult {
 }
 
 pub trait NotificationSender {
-    fn send(&mut self, title: &str, body: &str) -> Result<()>;
+    fn send(&mut self, title: &str, body: &str, target: &NotificationTarget) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NotificationTarget {
+    Alerts,
+    Alert { id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -1084,10 +1091,17 @@ impl DaemonState {
 
     fn handle_control(&mut self, request: ControlRequest) -> (ControlResponse, bool) {
         if let ControlRequest::Console { request } = request {
+            let alert_detail = matches!(request, ConsoleRequest::AlertDetail { .. });
             let response = match self.handle_console(request) {
                 Ok(data) => response_ok(&data),
                 Err(error) => {
-                    if let Some(error) = error.downcast_ref::<io::Error>()
+                    if alert_detail
+                        && error
+                            .downcast_ref::<io::Error>()
+                            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+                    {
+                        response_error("alert_unavailable")
+                    } else if let Some(error) = error.downcast_ref::<io::Error>()
                         && error.kind() == io::ErrorKind::InvalidInput
                     {
                         response_error(&error.to_string())
@@ -2071,7 +2085,9 @@ pub fn notify_once_with_sender(
     match result {
         NotifyPollResult::Summary { summary, sequence } => {
             let body = summary_notification_body(&summary);
-            let sent = sender.send("CodePerimeter 活动摘要", &body).is_ok();
+            let sent = sender
+                .send("此前发现了项目文件活动", &body, &NotificationTarget::Alerts)
+                .is_ok();
             notify_send_result(
                 control_socket,
                 ControlRequest::NotifySummaryResult {
@@ -2083,22 +2099,11 @@ pub fn notify_once_with_sender(
             Ok(sent)
         }
         NotifyPollResult::Alert { alert, persisted } => {
-            let title = match alert.rule {
-                crate::model::AlertRule::BulkFileAccess => "检测到批量文件访问",
-                crate::model::AlertRule::ArchiveCommand => "归档命令迹象",
-                crate::model::AlertRule::ArchiveOutput => "归档输出迹象",
+            let (title, body) = alert_notification_text(&alert, persisted);
+            let target = NotificationTarget::Alert {
+                id: alert.id.clone(),
             };
-            let body = format!(
-                "PID {} · {} 个文件 · {}",
-                alert.process.pid,
-                alert.unique_files,
-                if persisted {
-                    "已记录"
-                } else {
-                    "暂存于内存"
-                }
-            );
-            let sent = sender.send(title, &body).is_ok();
+            let sent = sender.send(title, &body, &target).is_ok();
             notify_send_result(
                 control_socket,
                 ControlRequest::NotifyAlertResult {
@@ -2111,6 +2116,70 @@ pub fn notify_once_with_sender(
         }
         NotifyPollResult::Idle { .. } => Ok(false),
     }
+}
+
+fn notification_name(path: &Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let cleaned: String = name.chars().filter(|character| {
+        !character.is_control() && !matches!(*character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    }).collect();
+    let mut short: String = cleaned.chars().take(40).collect();
+    if cleaned.chars().count() > 40 {
+        short.push('…');
+    }
+    if short.trim().is_empty() {
+        "名称未知".into()
+    } else {
+        short
+    }
+}
+
+fn alert_notification_text(alert: &Alert, persisted: bool) -> (&'static str, String) {
+    let program = alert
+        .process
+        .executable
+        .as_deref()
+        .map(notification_name)
+        .unwrap_or_else(|| "未知程序".into());
+    let project = alert
+        .roots
+        .first()
+        .map(|root| notification_name(root))
+        .unwrap_or_else(|| "未知项目".into());
+    let project = if alert.roots.len() > 1 {
+        format!("「{project}」等 {} 个项目", alert.roots.len())
+    } else {
+        format!("「{project}」")
+    };
+    let (title, mut body) = match alert.rule {
+        crate::model::AlertRule::BulkFileAccess => (
+            "大量访问项目文件",
+            format!(
+                "{program} 在{project}短时间内打开或映射了 {} 个文件。",
+                alert.unique_files
+            ),
+        ),
+        crate::model::AlertRule::ArchiveCommand => (
+            "启动项目压缩／打包命令",
+            format!("{program} 启动了涉及{project}的压缩／打包命令。"),
+        ),
+        crate::model::AlertRule::ArchiveOutput => {
+            let output = alert
+                .archive_output_paths
+                .first()
+                .map(|path| format!("疑似压缩文件 {}", notification_name(path)))
+                .unwrap_or_else(|| "疑似压缩文件".into());
+            (
+                "发现疑似压缩文件生成／修改",
+                format!("{program} 访问{project}后，出现{output}的生成或修改记录。"),
+            )
+        }
+    };
+    if !persisted {
+        body.push_str("记录暂未保存，详情可能不可用。");
+    }
+    body.push_str("点击查看详情。");
+    (title, body)
 }
 
 /// 连续发送有限数量的待处理通知，生产helper用它降低告警突发时的排队延迟。
@@ -2149,13 +2218,23 @@ fn summary_notification_body(summary: &PendingNotificationSummary) -> String {
     let rules = summary
         .by_rule
         .iter()
-        .map(|count| format!("{:?}: {}", count.rule, count.count))
+        .map(|count| {
+            let behavior = match count.rule {
+                crate::model::AlertRule::BulkFileAccess => "大量文件访问",
+                crate::model::AlertRule::ArchiveCommand => "压缩／打包命令",
+                crate::model::AlertRule::ArchiveOutput => "疑似压缩文件生成／修改",
+            };
+            format!("{behavior} {} 条", count.count)
+        })
         .collect::<Vec<_>>()
         .join("，");
     if rules.is_empty() {
-        format!("有 {} 条待处理活动告警", summary.count)
+        format!("此前发现 {} 条活动告警。点击查看告警。", summary.count)
     } else {
-        format!("有 {} 条待处理活动告警（{}）", summary.count, rules)
+        format!(
+            "此前发现 {} 条活动告警：{}。点击查看告警。",
+            summary.count, rules
+        )
     }
 }
 
@@ -2191,6 +2270,97 @@ pub fn run_notify(control_socket: &Path) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod notification_text_tests {
+    use super::*;
+
+    fn alert(rule: crate::model::AlertRule) -> Alert {
+        Alert {
+            id: "synthetic-run:100:v1:archive_output:engine:1".into(),
+            rule,
+            process: crate::model::ProcessIdentity {
+                pid: 100,
+                pid_version: Some(1),
+                ppid: None,
+                executable: Some("/private/tmp/synthetic-tools/python3".into()),
+                signing_id: None,
+                team_id: None,
+            },
+            roots: vec!["/private/tmp/synthetic-project".into()],
+            first_timestamp_ms: 1,
+            last_timestamp_ms: 2,
+            unique_files: 60,
+            activity_count: 60,
+            evidence_paths: vec!["/private/tmp/synthetic-project/input.zip".into()],
+            archive_output_paths: vec!["/private/tmp/synthetic-project/output.7z".into()],
+            is_new: true,
+        }
+    }
+
+    #[test]
+    fn messages_explain_behavior_without_claiming_compression_success_or_input_count() {
+        for rule in [
+            crate::model::AlertRule::BulkFileAccess,
+            crate::model::AlertRule::ArchiveCommand,
+            crate::model::AlertRule::ArchiveOutput,
+        ] {
+            let (title, body) = alert_notification_text(&alert(rule), true);
+            assert!(
+                body.contains("python3")
+                    && body.contains("synthetic-project")
+                    && body.contains("点击查看详情")
+            );
+            assert!(
+                !body.contains("/private/tmp")
+                    && !body.contains("PID")
+                    && !body.contains("input.zip")
+            );
+            match rule {
+                crate::model::AlertRule::BulkFileAccess => {
+                    assert!(title.contains("大量") && body.contains("打开或映射了 60 个文件"))
+                }
+                crate::model::AlertRule::ArchiveCommand => {
+                    assert!(title.contains("命令") && !body.contains("60 个文件"))
+                }
+                crate::model::AlertRule::ArchiveOutput => assert!(
+                    title.contains("疑似")
+                        && body.contains("output.7z")
+                        && !body.contains("60 个文件")
+                ),
+            }
+            assert!(!body.contains("已压缩") && !body.contains("已外传"));
+        }
+    }
+
+    #[test]
+    fn old_alerts_have_unknown_outputs_and_unsaved_details_are_explicit() {
+        let mut value =
+            serde_json::to_value(alert(crate::model::AlertRule::ArchiveOutput)).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("archive_output_paths");
+        let old: Alert = serde_json::from_value(value).unwrap();
+        assert!(old.archive_output_paths.is_empty());
+        let (_, body) = alert_notification_text(&old, false);
+        assert!(!body.contains("input.zip"));
+        assert!(body.contains("记录暂未保存，详情可能不可用"));
+    }
+
+    #[test]
+    fn displayed_names_are_bounded_and_remove_controls_and_bidi_overrides() {
+        let name = notification_name(Path::new("/private/tmp/line\n\t\u{202e}name.zip"));
+        assert_eq!(name, "linename.zip");
+        assert_eq!(notification_name(Path::new("/")), "名称未知");
+        assert_eq!(
+            notification_name(Path::new(&"字".repeat(100)))
+                .chars()
+                .count(),
+            41
+        );
     }
 }
 

@@ -754,7 +754,7 @@ impl Storage {
     }
 
     pub fn console_alert_entry(&self, id: &str, detail: bool) -> Result<AlertEntry> {
-        let (text,is_read,processed,note,revision,rule_version,snapshot): (String,bool,bool,String,u64,u64,Option<String>) = self.connection.query_row("SELECT a.alert_json,m.is_read,m.processed,m.note,m.revision,m.rule_version,m.rule_snapshot FROM alerts a JOIN alert_metadata m ON a.id=m.alert_id WHERE a.id=?1", params![id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
+        let (text,is_read,processed,note,revision,rule_version,snapshot): (String,bool,bool,String,u64,u64,Option<String>) = self.connection.query_row("SELECT a.alert_json,m.is_read,m.processed,m.note,m.revision,m.rule_version,m.rule_snapshot FROM alerts a JOIN alert_metadata m ON a.id=m.alert_id WHERE a.id=?1", params![id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).optional()?.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "alert_unavailable"))?;
         let alert: Alert = serde_json::from_str(&text)?;
         let mut history = {
             let mut statement=self.connection.prepare("SELECT timestamp_ms,is_read,processed,note FROM alert_handling_history WHERE alert_id=?1 ORDER BY id DESC LIMIT 101")?;

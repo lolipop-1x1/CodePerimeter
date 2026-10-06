@@ -200,6 +200,12 @@ struct UserOption {
 
 #[derive(Debug, Args)]
 struct UiCommand {
+    /// 打开某条告警详情，入口令牌仍由本机控制台创建。
+    #[arg(long, value_name = "ID", conflicts_with = "alerts")]
+    alert_id: Option<String>,
+    /// 打开告警中心，用于历史摘要或缺少标识的旧通知。
+    #[arg(long)]
+    alerts: bool,
     #[arg(long, default_value_t = 0)]
     port: u16,
     #[arg(long)]
@@ -426,6 +432,8 @@ fn run(cli: Cli) -> CliResult<()> {
             codex_home: command.codex_home,
             claude_home: command.claude_home,
             zcode_db: command.zcode_db,
+            alert_id: command.alert_id,
+            alerts: command.alerts,
         }),
         Command::Service { command } => run_service(command),
         Command::Collector(command) => service::run_collector(CollectorOptions {
@@ -741,6 +749,15 @@ fn print_json(value: &Value) -> CliResult<()> {
 mod tests {
     use super::*;
     use codeperimeter::service::OperationStep;
+
+    #[test]
+    fn notification_alert_identifier_is_always_one_option_value() {
+        let cli = Cli::try_parse_from(["codeperimeter", "ui", "--alert-id=--help"]).unwrap();
+        let Command::Ui(command) = cli.command else {
+            panic!("应解析为网页入口")
+        };
+        assert_eq!(command.alert_id.as_deref(), Some("--help"));
+    }
 
     #[test]
     fn failed_service_step_causes_cli_failure() {

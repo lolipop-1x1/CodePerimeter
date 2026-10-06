@@ -7,6 +7,31 @@ private struct Request: Decodable {
     let operation: String
     let title: String?
     let body: String?
+    let target: Target?
+}
+
+private struct Target: Decodable {
+    let kind: String
+    let id: String?
+
+    var valid: Bool {
+        if kind == "alerts" { return id == nil }
+        return kind == "alert" && id.map(validAlertID) == true
+    }
+}
+
+private func validAlertID(_ value: String) -> Bool {
+    let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-".utf8)
+    return !value.isEmpty && value.utf8.count <= 512
+        && value.utf8.allSatisfy { allowed.contains($0) }
+}
+
+private func hasRequestInput() -> Bool {
+    if CommandLine.arguments.contains("--request-stdin") { return true }
+    // 旧版 Rust 使用 stdin 管道且没有标志，更新助手时仍接受这种发送请求。
+    var metadata = stat()
+    return fstat(STDIN_FILENO, &metadata) == 0
+        && metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFIFO)
 }
 
 private struct Reply: Encodable {
@@ -27,14 +52,39 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
     private var finished = false
     private let maximumInput = 16 * 1024
     private var center: UNUserNotificationCenter!
+    private var receivedActivation = false
+    private var activeLaunchers = 0
+    private let lifecycle = NSLock()
+    private var pendingActivations = 0
+    private var pendingFinish: (() -> Void)?
+    private let requestMode = hasRequestInput()
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        guard Bundle.main.bundleIdentifier == "com.codeperimeter.notifications" else { return }
+        // 冷启动的点击响应也需要在启动完成前注册 delegate。
+        center = UNUserNotificationCenter.current()
+        center.delegate = self
+        let detail = UNNotificationAction(identifier: "view_detail", title: "查看详情", options: [.foreground])
+        center.setNotificationCategories([
+            UNNotificationCategory(identifier: "project_alert", actions: [detail], intentIdentifiers: []),
+            UNNotificationCategory(identifier: "project_summary", actions: [
+                UNNotificationAction(identifier: "view_detail", title: "查看告警", options: [.foreground])
+            ], intentIdentifiers: [])
+        ])
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard Bundle.main.bundleIdentifier == "com.codeperimeter.notifications" else {
             finish(false, "invalid_bundle")
             return
         }
-        center = UNUserNotificationCenter.current()
-        center.delegate = self
+        // 通知中心重新启动应用时没有 stdin 请求，等待 didReceive，不能按空请求退出。
+        if !requestMode {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
+                if !self.receivedActivation { exit(0) }
+            }
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
             self.finish(false, "timed_out")
         }
@@ -89,7 +139,8 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
         case "send":
             guard let title = request.title, let body = request.body,
                 !title.isEmpty, title.utf8.count <= 512,
-                !body.isEmpty, body.utf8.count <= 8192 else {
+                !body.isEmpty, body.utf8.count <= 8192,
+                request.target?.valid != false else {
                 finish(false, "invalid_request")
                 return
             }
@@ -108,6 +159,12 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
                     content.title = title
                     content.body = body
                     content.sound = .default
+                    if let target = request.target, target.kind == "alert", let id = target.id {
+                        content.userInfo = ["alert_id": id]
+                        content.categoryIdentifier = "project_alert"
+                    } else {
+                        content.categoryIdentifier = "project_summary"
+                    }
                     let notification = UNNotificationRequest(
                         identifier: UUID().uuidString, content: content, trigger: nil
                     )
@@ -138,6 +195,13 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
     private func finish(_ ok: Bool, _ code: String,
         _ settings: UNNotificationSettings? = nil) {
         DispatchQueue.main.async {
+            self.lifecycle.lock()
+            if self.pendingActivations > 0 {
+                if self.pendingFinish == nil { self.pendingFinish = { self.finish(ok, code, settings) } }
+                self.lifecycle.unlock()
+                return
+            }
+            self.lifecycle.unlock()
             guard !self.finished else { return }
             self.finished = true
             let response = Reply(ok: ok, code: code,
@@ -147,6 +211,120 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
             bytes.append(10)
             FileHandle.standardOutput.write(bytes)
             exit(ok ? 0 : 1)
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void) {
+        lifecycle.lock()
+        pendingActivations += 1
+        lifecycle.unlock()
+        DispatchQueue.main.async { self.activate(response, completionHandler) }
+    }
+
+    private func activate(_ response: UNNotificationResponse,
+        _ completionHandler: @escaping () -> Void) {
+        defer {
+            lifecycle.lock()
+            pendingActivations -= 1
+            let finish = pendingActivations == 0 ? pendingFinish : nil
+            if pendingActivations == 0 { pendingFinish = nil }
+            let idle = pendingActivations == 0 && activeLaunchers == 0
+            lifecycle.unlock()
+            finish?()
+            if !requestMode && idle { exit(0) }
+        }
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier
+            || response.actionIdentifier == "view_detail" else {
+            completionHandler()
+            return
+        }
+        receivedActivation = true
+        let fields = response.notification.request.content.userInfo
+        if let value = fields["alert_id"] {
+            guard let id = value as? String, validAlertID(id) else {
+                activationFailed(completionHandler)
+                return
+            }
+        }
+        let arguments = (fields["alert_id"] as? String).map { ["ui", "--alert-id=\($0)"] }
+            ?? ["ui", "--alerts"]
+        // 不从通知元数据接受 URL、令牌或可执行路径，启动位置只由本机 UID 决定。
+        let executable = "/Library/CodePerimeter/\(getuid())/codeperimeter"
+        guard getuid() != 0, trustedLauncher(executable) else {
+            activationFailed(completionHandler)
+            return
+        }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = arguments
+        task.standardInput = FileHandle.nullDevice
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            // 在主队列上完成启动，再允许发送回执退出，避免点击任务还未创建就退出。
+            try task.run()
+            if requestMode {
+                // 发送实例只确认点击已启动；网页启动器继续运行，不延长通知提交期限。
+                completionHandler()
+                DispatchQueue.global(qos: .utility).async { task.waitUntilExit() }
+                return
+            }
+            activeLaunchers += 1
+            DispatchQueue.global(qos: .userInitiated).async {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                    if task.isRunning { task.terminate() }
+                }
+                task.waitUntilExit()
+                DispatchQueue.main.async {
+                    self.activeLaunchers -= 1
+                    if task.terminationStatus == 0 {
+                        completionHandler()
+                        self.lifecycle.lock()
+                        let idle = self.pendingActivations == 0 && self.activeLaunchers == 0
+                        self.lifecycle.unlock()
+                        if idle { exit(0) }
+                    } else {
+                        self.activationFailed(completionHandler)
+                    }
+                }
+            }
+        } catch {
+            activationFailed(completionHandler)
+        }
+    }
+
+    private func trustedLauncher(_ executable: String) -> Bool {
+        var path = executable
+        while !path.isEmpty {
+            var metadata = stat()
+            guard lstat(path, &metadata) == 0, metadata.st_uid == 0,
+                metadata.st_mode & 0o022 == 0,
+                metadata.st_mode & mode_t(S_IFMT) != mode_t(S_IFLNK) else { return false }
+            if path == executable {
+                guard metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                    metadata.st_mode & 0o111 != 0 else { return false }
+            } else if metadata.st_mode & mode_t(S_IFMT) != mode_t(S_IFDIR) { return false }
+            if path == "/" { break }
+            path = (path as NSString).deletingLastPathComponent
+        }
+        return true
+    }
+
+    private func activationFailed(_ completionHandler: @escaping () -> Void) {
+        let alert = NSAlert()
+        alert.messageText = "未能打开 CodePerimeter 告警"
+        alert.informativeText = "请从本机启动 CodePerimeter 控制台并检查后台安装状态。通知中的记录可能已过期或清除。"
+        alert.addButton(withTitle: "知道了")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+        completionHandler()
+        if !requestMode && activeLaunchers == 0 {
+            lifecycle.lock()
+            let idle = pendingActivations == 0
+            lifecycle.unlock()
+            if idle { exit(1) }
         }
     }
 
