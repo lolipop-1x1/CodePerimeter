@@ -19,5 +19,5 @@ export default defineConfig({
   expect: { timeout: 10000 },
   reporter: [['list']],
   outputDir: output,
-  use: { channel: 'chrome', headless: false, reducedMotion: 'reduce', viewport: { width: 1440, height: 960 }, screenshot: 'off', trace: 'off', video: 'off', acceptDownloads: true },
+  use: { locale: 'zh-CN', channel: 'chrome', headless: false, reducedMotion: 'reduce', viewport: { width: 1440, height: 960 }, screenshot: 'off', trace: 'off', video: 'off', acceptDownloads: true },
 });

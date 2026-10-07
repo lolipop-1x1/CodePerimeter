@@ -86,13 +86,15 @@ button:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px soli
 .nav-links { display: flex; flex-direction: column; gap: 5px; }
 .nav-links button { border: 0; border-radius: 6px; background: transparent; color: var(--muted); min-height: 42px; text-align: left; display: flex; align-items: center; gap: 12px; padding: 10px 12px; font-size: 14px; transition: background 120ms ease, color 120ms ease; }
 .nav-links button svg { flex: none; }
+.nav-links button span { min-width: 0; overflow-wrap: anywhere; }
 .nav-links button:hover { background: var(--hover); color: var(--text); }
 .nav-links button[aria-current] { background: var(--selected); color: var(--accent); font-weight: 600; }
 .nav-bottom { margin-top: auto; padding-top: 24px; color: var(--muted); }
 .theme-control { position: relative; border-top: 1px solid var(--border); padding-top: 14px; }
+.theme-control + .theme-control { margin-top: 8px; }
 .theme-icon { position: absolute; top: 21px; left: 12px; pointer-events: none; z-index: 1; }
 .theme-menu, .theme-menu > .cds--btn { width: 100%; }
-.theme-menu > .cds--btn { color: var(--muted); padding-left: 40px; font-size: 12px; }
+.theme-menu > .cds--btn { color: var(--muted); padding-left: 40px; font-size: 12px; height: auto; min-height: 32px; padding-top: 8px; padding-bottom: 8px; white-space: normal; overflow-wrap: anywhere; }
 .theme-menu > .cds--btn:hover { background: var(--hover); color: var(--text); }
 .main-content { margin-left: 232px; padding: 32px 36px; max-width: 1832px; outline: none; }
 .page-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 24px; }

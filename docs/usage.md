@@ -1,5 +1,7 @@
 # CodePerimeter 命令行使用说明
 
+[English](usage.en.md) · 简体中文 · [项目首页](../README.zh-CN.md)
+
 当前交付是 macOS 本机文件活动观察版。它记录选定目录内可见的文件打开、映射等系统事件，展示来源进程，并汇总批量访问或疑似打包迹象。文件打开或映射是访问证据，不代表读完了文件；批量访问和归档迹象也不证明内容已经压缩或外传。
 
 ## 构建与命令帮助
@@ -13,6 +15,21 @@ cargo clippy --locked --all-targets -- -D warnings
 ~~~
 
 二进制位于 target/release/codeperimeter。运行 codeperimeter --help 或 codeperimeter <命令> --help 查看参数。查询和目录配置命令通过普通用户宿主的 Unix socket 工作；可以在全局参数中指定 --host-socket PATH。默认位置为当前用户的 ~/Library/Application Support/CodePerimeter/host.sock。
+
+## 语言与显示
+
+支持简体中文与英文，首次默认跟随 macOS 首选语言；未支持的语言回退英文。网页侧栏底部的“跟随系统／简体中文／English”菜单保存当前 Mac 用户的统一偏好，后续通知、产品生成的原生提示与默认 CLI 人类提示使用同一语言，关闭网页及重启后保留。
+
+CLI 的全局 `--language` 可为本次调用临时选择语言，不修改保存的偏好：
+
+~~~sh
+codeperimeter --language en --help
+codeperimeter --language zh-CN history --help
+~~~
+
+帮助和产品人类提示随语言变化；JSON 字段、错误码、时间戳、路径、进程身份及原始记录保持原值。网页按当前语言解释历史事件／状态代码，原文仍可查看；未知旧提示、第三方文本和用户备注保留原文。日期数字按显示语言格式化，保留本机时区与 24 小时制。macOS 自己生成的授权窗口遵循系统语言，已经送达的通知不追溯重写。
+
+语言切换不重启采集、不扩大监控范围、不改写历史证据。本轮跨网页、CLI 与后台通知的多语言端到端及重启持久化结论仍以整合验证记录为准。
 
 ## 逐项归档命令验收
 

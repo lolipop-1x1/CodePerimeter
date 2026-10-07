@@ -50,6 +50,31 @@ struct Request<'a> {
     body: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<&'a NotificationTarget>,
+    localization: NotificationLocalization,
+}
+
+#[derive(Serialize)]
+struct NotificationLocalization {
+    locale: String,
+    detail_action: String,
+    alerts_action: String,
+    activation_failed_title: String,
+    activation_failed_body: String,
+    acknowledge: String,
+}
+
+impl NotificationLocalization {
+    fn for_locale(locale: &str) -> Self {
+        let text = |key| crate::i18n::message(locale, key, &[]);
+        Self {
+            locale: locale.into(),
+            detail_action: text("notification.action.detail"),
+            alerts_action: text("notification.action.alerts"),
+            activation_failed_title: text("notification.activation_failed.title"),
+            activation_failed_body: text("notification.activation_failed.body"),
+            acknowledge: text("notification.activation_failed.acknowledge"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +145,16 @@ impl NativeNotificationSender {
     }
 
     pub fn send_to(&self, title: &str, body: &str, target: &NotificationTarget) -> Result<()> {
+        self.send_to_in_locale(title, body, target, &crate::i18n::current_locale())
+    }
+
+    fn send_to_in_locale(
+        &self,
+        title: &str,
+        body: &str,
+        target: &NotificationTarget,
+        locale: &str,
+    ) -> Result<()> {
         if title.is_empty() || title.len() > 512 || body.is_empty() || body.len() > 8192 {
             return Err(failure("notification_request_invalid"));
         }
@@ -128,11 +163,15 @@ impl NativeNotificationSender {
         {
             return Err(failure("notification_target_invalid"));
         }
-        self.request(
-            "send",
-            Some(title),
-            Some(body),
-            Some(target),
+        self.request_payload(
+            Request {
+                version: 1,
+                operation: "send",
+                title: Some(title),
+                body: Some(body),
+                target: Some(target),
+                localization: NotificationLocalization::for_locale(locale),
+            },
             Duration::from_secs(6),
         )?;
         Ok(())
@@ -146,13 +185,21 @@ impl NativeNotificationSender {
         target: Option<&NotificationTarget>,
         timeout: Duration,
     ) -> Result<Reply> {
-        let bytes = serde_json::to_vec(&Request {
-            version: 1,
-            operation,
-            title,
-            body,
-            target,
-        })?;
+        self.request_payload(
+            Request {
+                version: 1,
+                operation,
+                title,
+                body,
+                target,
+                localization: NotificationLocalization::for_locale(&crate::i18n::current_locale()),
+            },
+            timeout,
+        )
+    }
+
+    fn request_payload(&self, request: Request<'_>, timeout: Duration) -> Result<Reply> {
+        let bytes = serde_json::to_vec(&request)?;
         if bytes.len() > MAX_REQUEST {
             return Err(failure("notification_request_invalid"));
         }
@@ -197,13 +244,23 @@ impl NativeNotificationSender {
         let received = received
             .map_err(|_| failure("notification_io_failed"))?
             .map_err(|_| failure("notification_io_failed"))?;
-        parse_reply(&received, status.success(), operation)
+        parse_reply(&received, status.success(), request.operation)
     }
 }
 
 impl crate::runtime::NotificationSender for NativeNotificationSender {
     fn send(&mut self, title: &str, body: &str, target: &NotificationTarget) -> Result<()> {
         self.send_to(title, body, target)
+    }
+
+    fn send_in_locale(
+        &mut self,
+        title: &str,
+        body: &str,
+        target: &NotificationTarget,
+        locale: &str,
+    ) -> Result<()> {
+        self.send_to_in_locale(title, body, target, locale)
     }
 }
 
@@ -541,6 +598,63 @@ mod tests {
         assert!(sender.send("匿名告警", &"x".repeat(8193)).is_err());
         // JSON 转义后的总量也有界，不只检查原始字符串字节。
         assert!(sender.send("匿名告警", &"\u{0001}".repeat(8192)).is_err());
+    }
+
+    #[test]
+    fn native_actions_and_activation_prompts_travel_with_the_notification_language() {
+        let target = NotificationTarget::Alert {
+            id: "synthetic-run:1:v1:bulk_file_access:engine:1".into(),
+        };
+        for (locale, action, acknowledgement) in [
+            ("en", "View details", "OK"),
+            ("zh-CN", "查看详情", "知道了"),
+        ] {
+            let request = Request {
+                version: 1,
+                operation: "send",
+                title: Some("synthetic"),
+                body: Some("synthetic"),
+                target: Some(&target),
+                localization: NotificationLocalization::for_locale(locale),
+            };
+            let value = serde_json::to_value(request).unwrap();
+            assert_eq!(value["version"], 1);
+            assert_eq!(
+                value["target"]["id"],
+                "synthetic-run:1:v1:bulk_file_access:engine:1"
+            );
+            assert_eq!(value["localization"]["locale"], locale);
+            assert_eq!(value["localization"]["detail_action"], action);
+            assert_eq!(value["localization"]["acknowledge"], acknowledgement);
+            assert!(
+                value["localization"]["activation_failed_body"]
+                    .as_str()
+                    .unwrap()
+                    .len()
+                    > 30
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_notification_locale_keeps_actions_in_the_same_snapshot() {
+        for (locale, action) in [("en", "View details"), ("zh-CN", "查看详情")] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut sender = fixture(
+                directory.path(),
+                &format!(
+                    "#!/bin/sh\nIFS= read -r request\ncase \"$request\" in *'\"localization\":{{\"locale\":\"{locale}\",\"detail_action\":\"{action}\"'*) ;; *) exit 4;; esac\nprintf '%s\\n' '{{\"version\":1,\"ok\":true,\"code\":\"accepted\"}}'\n"
+                ),
+            );
+            crate::runtime::NotificationSender::send_in_locale(
+                &mut sender,
+                "Synthetic alert",
+                "Synthetic body",
+                &NotificationTarget::Alerts,
+                locale,
+            )
+            .unwrap();
+        }
     }
 
     #[test]

@@ -1,6 +1,8 @@
+import { Trans } from 'react-i18next';
+import { i18n, t, useLocale } from './i18n';
 import { useEffect, useState } from 'react';
 import { Button, GlobalTheme, MenuButton, MenuItemRadioGroup } from '@carbon/react';
-import { Dashboard, Folder, Document, Archive, WarningAlt, Settings, Tools, Sun, Moon, Screen } from '@carbon/react/icons';
+import { Dashboard, Folder, Document, Archive, WarningAlt, Settings, Tools, Sun, Moon, Screen, Language } from '@carbon/react/icons';
 import { api, errorMessage, initializeSession } from './api';
 import { Notice } from './components';
 import { DetailPane, type Selection } from './details';
@@ -13,23 +15,26 @@ import { RulesPage } from './rules';
 import { serviceLabels, SettingsPage, type ServiceAction } from './settings';
 import type { ServiceOperation, Status } from './types';
 import { alertLocation, alertRoute } from './route';
+import { useLanguagePreference } from './language';
 
 const pages = [
-  { key: 'overview', label: '概览', title: '监控概览', description: '文件活动与归档线索', icon: Dashboard },
-  { key: 'directories', label: '监控目录', title: '监控目录', description: '项目范围、历史来源与子树排除', icon: Folder },
-  { key: 'events', label: '文件活动', title: '文件活动', description: '真实事件记录与进程身份', icon: Document },
-  { key: 'archives', label: '归档迹象', title: '归档迹象', description: '命令与输出行为线索', icon: Archive },
-  { key: 'alerts', label: '告警中心', title: '告警中心', description: '阅读、处理及证据追溯', icon: WarningAlt },
-  { key: 'rules', label: '规则中心', title: '规则中心', description: '内置规则开关与全局参数', icon: Settings },
-  { key: 'settings', label: '设置与诊断', title: '设置与诊断', description: '系统服务、数据管理与覆盖缺口', icon: Tools },
+  { key: 'overview', get label() { return t('app.overview'); }, get title() { return t('app.monitoringOverview'); }, get description() { return t('app.fileActivityAndArchiveIndicators'); }, icon: Dashboard },
+  { key: 'directories', get label() { return t('app.monitoredDirectories'); }, get title() { return t('app.monitoredDirectories'); }, get description() { return t('app.projectScopeHistorySourcesAndSubtreeExclusions'); }, icon: Folder },
+  { key: 'events', get label() { return t('app.fileActivity'); }, get title() { return t('app.fileActivity'); }, get description() { return t('app.observedEventsAndProcessIdentities'); }, icon: Document },
+  { key: 'archives', get label() { return t('app.archiveIndicators'); }, get title() { return t('app.archiveIndicators'); }, get description() { return t('app.commandAndOutputBehaviorIndicators'); }, icon: Archive },
+  { key: 'alerts', get label() { return t('app.alertCenter'); }, get title() { return t('app.alertCenter'); }, get description() { return t('app.readHandleAndTraceEvidence'); }, icon: WarningAlt },
+  { key: 'rules', get label() { return t('app.ruleCenter'); }, get title() { return t('app.ruleCenter'); }, get description() { return t('app.builtInRulesAndGlobalParameters'); }, icon: Settings },
+  { key: 'settings', get label() { return t('app.settingsAndDiagnostics'); }, get title() { return t('app.settingsAndDiagnostics'); }, get description() { return t('app.systemServicesDataAndCoverageGaps'); }, icon: Tools },
 ] as const;
-const themeLabels: Record<string, string> = { system: '跟随系统', light: '浅色', dark: '深色' };
+const themeLabels: Record<string, string> = { get system() { return t('app.followSystem'); }, get light() { return t('app.light'); }, get dark() { return t('app.dark'); } };
 
 export function App() {
+  useLocale();
   const [authenticated, setAuthenticated] = useState(initializeSession);
+  const language = useLanguagePreference(authenticated);
   const [page, setPage] = useState<string>(() => alertRoute(window.location.search).page);
   const [selection, setSelection] = useState<Selection>(() => { const id = alertRoute(window.location.search).alert; return id ? { kind: 'alert', id } : null; });
-  const [routeError, setRouteError] = useState<string | undefined>(() => alertRoute(window.location.search).invalid ? '通知中的告警入口无效，请在告警中心查找记录。' : undefined);
+  const [routeError, setRouteError] = useState<string | undefined>(() => alertRoute(window.location.search).invalid ? 'app.theAlertLinkInThisNotificationIs' : undefined);
   const [recordScope, setRecordScope] = useState<RecordScope>();
   const [operation, setOperation] = useState<ServiceOperation>();
   const [operationError, setOperationError] = useState<string>();
@@ -39,8 +44,8 @@ export function App() {
   const dark = theme === 'dark' || (theme === 'system' && darkSystem);
   const status = usePolling<Status>('/api/status', undefined, authenticated);
   const operationState = usePolling<ServiceOperation>(`/api/service/${operation?.id ?? ''}`, undefined, authenticated && operation?.state === 'running');
-  useEffect(() => { if (operationState.data) { setOperation(operationState.data); if (operationState.data.state === 'failed') setOperationError(errorMessage(operationState.data.error)); if (operationState.data.state !== 'running') status.refresh(); } }, [operationState.data]);
-  useEffect(() => { if (operationState.error) setOperationError(operationState.error); }, [operationState.error]);
+  useEffect(() => { if (operationState.data) { setOperation(operationState.data); if (operationState.data.state === 'failed') setOperationError(operationState.data.error ?? 'api.theOperationDidNotCompleteCheckDiagnostics'); if (operationState.data.state !== 'running') status.refresh(); } }, [operationState.data]);
+  useEffect(() => { if (operationState.errorCode) setOperationError(operationState.errorCode); }, [operationState.errorCode]);
   useEffect(() => {
     const expired = () => setAuthenticated(false);
     window.addEventListener('codeperimeter-session-expired', expired);
@@ -54,7 +59,7 @@ export function App() {
     const restore = () => {
       const route = alertRoute(window.location.search);
       setPage(route.page); setSelection(route.alert ? { kind: 'alert', id: route.alert } : null);
-      setRouteError(route.invalid ? '通知中的告警入口无效，请在告警中心查找记录。' : undefined);
+      setRouteError(route.invalid ? 'app.theAlertLinkInThisNotificationIs' : undefined);
     };
     window.addEventListener('popstate', restore);
     return () => window.removeEventListener('popstate', restore);
@@ -63,7 +68,7 @@ export function App() {
     if (starting || operation?.state === 'running') return;
     setStarting(true); setOperationError(undefined);
     try { setOperation(await api<ServiceOperation>('/api/service', { operation: action })); }
-    catch (error) { setOperationError(error instanceof Error ? error.message : '无法启动服务操作。'); }
+    catch (error) { setOperationError(error instanceof Error ? error.message : t('app.unableToStartTheServiceOperation')); }
     finally { setStarting(false); }
   }
   const select = (next: Selection) => {
@@ -78,28 +83,28 @@ export function App() {
   const mainAction = status.error ? null : primaryServiceAction(statusData?.service);
   const ThemeIcon = theme === 'system' ? Screen : theme === 'dark' ? Moon : Sun;
   return <GlobalTheme theme={dark ? 'g100' : 'g10'}><div className="console-shell">
-    <a className="skip-link" href="#main-content">跳到主要内容</a>
-    <nav className="side-nav" aria-label="主要导航"><div className="brand"><img className="brand-icon" src="/codeperimeter.svg" alt="" width="32" height="32" /><div><strong>CodePerimeter</strong><span>本机监控控制台</span></div></div>
+    <a className="skip-link" href="#main-content">{t('app.skipToMainContent')}</a>
+    <nav className="side-nav" aria-label={t('app.mainNavigation')}><div className="brand"><img className="brand-icon" src="/codeperimeter.svg" alt="" width="32" height="32" /><div><strong>CodePerimeter</strong><span>{t('app.localMonitoringConsole')}</span></div></div>
       <div className="nav-links">{pages.map(item => <button key={item.key} type="button" aria-current={page === item.key ? 'page' : undefined} onClick={() => navigate(item.key)}><item.icon size={20} /><span>{item.label}</span></button>)}</div>
-      <div className="nav-bottom"><div className="theme-control"><ThemeIcon className="theme-icon" size={18} aria-hidden="true" /><MenuButton className="theme-menu" label={`外观：${themeLabels[theme]}`} kind="ghost" size="sm" menuAlignment="top-start" menuBorder><MenuItemRadioGroup label="外观模式" items={['system', 'light', 'dark']} itemToString={item => themeLabels[String(item)]} selectedItem={theme} onChange={item => setTheme(String(item))} /></MenuButton></div></div>
+      <div className="nav-bottom"><div className="theme-control"><Language className="theme-icon" size={18} aria-hidden="true" /><MenuButton className="theme-menu" label={t('language.menuLabel', { language: language.label })} kind="ghost" size="sm" disabled={!authenticated || language.saving} menuAlignment="top-start" menuBorder><MenuItemRadioGroup label={t('language.menuTitle')} items={['system', ...language.languages.map(item => item.id)]} itemToString={item => String(item) === 'system' ? t('language.followSystem') : language.languages.find(value => value.id === item)?.name ?? String(item)} selectedItem={language.preference} onChange={item => void language.select(String(item))} /></MenuButton></div><div className="theme-control"><ThemeIcon className="theme-icon" size={18} aria-hidden="true" /><MenuButton className="theme-menu" label={t('app.appearance', { mode: themeLabels[theme] })} kind="ghost" size="sm" menuAlignment="top-start" menuBorder><MenuItemRadioGroup label={t('app.appearanceMode')} items={['system', 'light', 'dark']} itemToString={item => themeLabels[String(item)]} selectedItem={theme} onChange={item => setTheme(String(item))} /></MenuButton></div></div>
     </nav>
     <main id="main-content" tabIndex={-1} className="main-content">
-      <header className="page-heading"><div><h1>{current.title}</h1><p>{current.description}</p></div><div className="actions"><Button kind="tertiary" size="sm" disabled={!authenticated || !mainAction || !statusData?.service_actions_enabled || starting || operation?.state === 'running'} onClick={() => mainAction && void operate(mainAction)}>{starting || operation?.state === 'running' ? '正在操作' : mainAction ? serviceLabels[mainAction] : '服务状态未知'}</Button></div></header>
-      {!authenticated ? <section className="panel entry-expired"><h2>请重新打开控制台</h2><p>当前标签页缺少有效入口。请在本机终端运行 <code>codeperimeter ui</code>，通过新打开的页面继续使用。</p><p className="helper">网页不接收管理员密码。</p></section> : <>
-        <Notice error={routeError ?? status.error ?? operationError} success={operation?.state === 'cancelled' ? '管理员操作已取消，未报告成功。' : undefined} />
-        {operation?.state === 'running' && <div className="operation-progress" role="status">服务操作进行中，请查看系统授权窗口；也可在系统窗口取消。</div>}
+      <header className="page-heading"><div><h1>{current.title}</h1><p>{current.description}</p></div><div className="actions"><Button kind="tertiary" size="sm" disabled={!authenticated || !mainAction || !statusData?.service_actions_enabled || starting || operation?.state === 'running'} onClick={() => mainAction && void operate(mainAction)}>{starting || operation?.state === 'running' ? t('app.working') : mainAction ? serviceLabels[mainAction] : t('app.serviceStateUnknown')}</Button></div></header>
+      {!authenticated ? <section className="panel entry-expired"><h2>{t('app.reopenTheConsole')}</h2><p><Trans i18n={i18n} i18nKey="app.reopenInstructions" values={{ command: 'codeperimeter ui' }} components={{ command: <code /> }} /></p><p className="helper">{t('app.theWebConsoleDoesNotReceiveAdministrator')}</p></section> : <>
+        <Notice error={routeError ?? status.error ?? (operationError ? errorMessage(operationError) : undefined) ?? language.error} success={operation?.state === 'cancelled' ? t('app.theAdministratorOperationWasCancelledSuccessWas') : undefined} />
+        {operation?.state === 'running' && <div className="operation-progress" role="status">{t('app.aServiceOperationIsInProgressCheck')}</div>}
         <HealthStrip status={statusData} />
-        {statusData && !statusData.host && <section className="host-unavailable"><h2>{statusData.service.status_error ? '后台服务状态暂时未知' : statusData.service.installed ? '管理宿主暂时不可用' : '后台服务尚未安装'}</h2><p>{statusData.host_error ? errorMessage(statusData.host_error) : '历史查询和监控配置需要管理宿主运行。可以继续查看实际安装状态与恢复入口。'}</p><Button kind="ghost" size="sm" onClick={() => navigate('settings')}>查看设置与诊断</Button></section>}
+        {statusData && !statusData.host && <section className="host-unavailable"><h2>{statusData.service.status_error ? t('app.backgroundServiceStateIsCurrentlyUnknown') : statusData.service.installed ? t('app.theManagementHostIsCurrentlyUnavailable') : t('app.backgroundServiceIsNotInstalled')}</h2><p>{statusData.host_error ? errorMessage(statusData.host_error) : t('app.historyQueriesAndMonitoringSettingsNeedThe')}</p><Button kind="ghost" size="sm" onClick={() => navigate('settings')}>{t('app.openSettingsAndDiagnostics')}</Button></section>}
         <div className={`workspace${selection ? ' has-detail' : ''}`}><div className="page-content">
-          <section hidden={page !== 'overview'} aria-label="概览"><OverviewPage active={page === 'overview'} select={select} navigateRecords={navigateRecords} /></section>
-          <section hidden={page !== 'directories'} aria-label="监控目录"><DirectoriesPage active={page === 'directories'} /></section>
-          <section hidden={page !== 'events'} aria-label="文件活动"><RecordsPage active={page === 'events'} select={select} initialScope={recordScope} /></section>
-          <section hidden={page !== 'archives'} aria-label="归档迹象"><RecordsPage active={page === 'archives'} archive select={select} /></section>
-          <section hidden={page !== 'alerts'} aria-label="告警中心"><RecordsPage active={page === 'alerts'} alerts select={select} /></section>
-          <section hidden={page !== 'rules'} aria-label="规则中心"><RulesPage active={page === 'rules'} /></section>
-          <section hidden={page !== 'settings'} aria-label="设置与诊断"><SettingsPage active={page === 'settings'} status={statusData} operation={operation} operate={action => void operate(action)} operationError={operationError} /></section>
+          <section hidden={page !== 'overview'} aria-label={t('app.overview')}><OverviewPage active={page === 'overview'} select={select} navigateRecords={navigateRecords} /></section>
+          <section hidden={page !== 'directories'} aria-label={t('app.monitoredDirectories')}><DirectoriesPage active={page === 'directories'} /></section>
+          <section hidden={page !== 'events'} aria-label={t('app.fileActivity')}><RecordsPage active={page === 'events'} select={select} initialScope={recordScope} /></section>
+          <section hidden={page !== 'archives'} aria-label={t('app.archiveIndicators')}><RecordsPage active={page === 'archives'} archive select={select} /></section>
+          <section hidden={page !== 'alerts'} aria-label={t('app.alertCenter')}><RecordsPage active={page === 'alerts'} alerts select={select} /></section>
+          <section hidden={page !== 'rules'} aria-label={t('app.ruleCenter')}><RulesPage active={page === 'rules'} /></section>
+          <section hidden={page !== 'settings'} aria-label={t('app.settingsAndDiagnostics')}><SettingsPage active={page === 'settings'} status={statusData} operation={operation} operate={action => void operate(action)} operationError={operationError ? errorMessage(operationError) : undefined} /></section>
         </div><DetailPane selection={selection} select={select} close={() => select(null)} viewRule={() => navigate('rules')} viewProcess={pid => navigateRecords({ pid: String(pid) })} /></div>
-        <footer>文件活动和归档迹象用于发现与追溯；当前观察能力不执行外传拦截。</footer>
+        <footer>{t('app.fileActivityAndArchiveIndicatorsSupportDiscovery')}</footer>
       </>}
     </main>
   </div></GlobalTheme>;

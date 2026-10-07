@@ -8,7 +8,8 @@ description = "macOS 项目文件活动与归档迹象监控"
 [dependencies]
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "string"] }
+intl_pluralrules = "7.0.2"
 libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -16,6 +17,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "time", "sync"] }
 tokio-stream = "0.1"
+unic-langid = "0.9"
 zstd = "0.13"
 
 [dev-dependencies]

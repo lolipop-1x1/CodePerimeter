@@ -34,6 +34,7 @@ fn start_ipc_stub(socket_path: &Path, responses: Vec<Value>) -> (Receiver<Value>
 
 fn invoke(socket_path: &Path, args: &[String]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_codeperimeter"))
+        .args(["--language", "zh-CN"])
         .arg("--host-socket")
         .arg(socket_path)
         .args(args)
@@ -43,6 +44,7 @@ fn invoke(socket_path: &Path, args: &[String]) -> Output {
 
 fn invoke_without_socket(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_codeperimeter"))
+        .args(["--language", "zh-CN"])
         .args(args)
         .output()
         .unwrap()
@@ -557,4 +559,98 @@ fn host_socket_option_is_global_and_missing_socket_fails() {
     let missing_socket = temp.path().join("missing.sock");
     let output = invoke(&missing_socket, &["status".into()]);
     assert!(!output.status.success());
+}
+
+#[test]
+fn human_help_is_localized_including_nested_commands_and_clap_labels() {
+    for (locale, usage, options, default_label) in [
+        ("en", "Usage:", "Options:", "Default:"),
+        ("zh-CN", "用法：", "选项:", "默认："),
+    ] {
+        for args in [
+            vec!["--help"],
+            vec!["ui", "--help"],
+            vec!["daemon", "--help"],
+            vec!["history", "preview", "--help"],
+            vec!["help", "events"],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_codeperimeter"))
+                .args(["--language", locale])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let help = String::from_utf8(output.stdout).unwrap();
+            assert!(help.contains(usage) && help.contains(options), "{help}");
+            assert!(help.contains("--language"), "{help}");
+            assert!(!help.contains("Message unavailable"), "{help}");
+            if help.contains("--limit")
+                || help.contains("--port")
+                || help.contains("--bulk-window-ms")
+            {
+                assert!(help.contains(default_label), "{help}");
+            }
+            if locale == "en" {
+                assert!(
+                    !help
+                        .chars()
+                        .any(|value| ('\u{4e00}'..='\u{9fff}').contains(&value)),
+                    "{help}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cli_override_changes_human_messages_without_saving_or_changing_machine_values() {
+    let preference = codeperimeter::i18n::preference_path().unwrap();
+    let before = fs::read(&preference).ok();
+    for (locale, failure) in [("en", "Command failed:"), ("zh-CN", "执行失败：")] {
+        let temp = TempDir::new().unwrap();
+        let socket = temp.path().join("synthetic-host.sock");
+        let (requests, worker) = start_ipc_stub(
+            &socket,
+            vec![success_response(
+                json!({"code": "bulk_file_access", "note": "合成原文"}),
+            )],
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_codeperimeter"))
+            .args(["--language", locale, "--host-socket"])
+            .arg(&socket)
+            .arg("status")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["data"]["code"], "bulk_file_access");
+        assert_eq!(value["data"]["note"], "合成原文");
+        assert_eq!(requests.recv().unwrap()["operation"], "status");
+        worker.join().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_codeperimeter"))
+            .args(["--language", locale, "--host-socket"])
+            .arg(temp.path().join("missing.sock"))
+            .arg("status")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(failure));
+    }
+    assert_eq!(fs::read(preference).ok(), before);
+    let invalid = Command::new(env!("CARGO_BIN_EXE_codeperimeter"))
+        .args([
+            "--language=en",
+            "status",
+            "--unexpected",
+            "PRIVATE_ARGUMENT_SENTINEL",
+        ])
+        .output()
+        .unwrap();
+    let diagnostic = String::from_utf8_lossy(&invalid.stderr);
+    assert!(!invalid.status.success() && diagnostic.contains("Invalid command arguments"));
+    assert!(!diagnostic.contains("PRIVATE_ARGUMENT_SENTINEL"));
 }

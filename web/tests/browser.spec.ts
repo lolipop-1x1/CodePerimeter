@@ -17,6 +17,8 @@ function fixture(): { directory: string; data: Fixture } {
   return { directory: location, data };
 }
 async function open(page: Page, data: Fixture) {
+  const language = await page.request.post(`${data.session.origin}/api/language`, { headers: { Authorization: `Bearer ${data.session.token}`, Origin: data.session.origin }, data: { preference: 'zh-CN' } });
+  expect(language.ok(), '匿名验收明确使用简体中文，不依赖本机首选语言').toBeTruthy();
   try { await page.goto(`${data.session.origin}/#token=${encodeURIComponent(data.session.token)}`); }
   catch { throw new Error('无法打开匿名本机控制台。'); }
   await expect(page.getByRole('heading', { name: '监控概览', exact: true })).toBeVisible();
@@ -353,4 +355,98 @@ test('通知深链接打开指定告警，刷新与过期记录均有明确结�
     await page.goto(`${data.session.origin}/?alert=${encodeURIComponent('../other')}`);
     await expect(page.getByText('通知中的告警入口无效，请在告警中心查找记录。')).toBeVisible();
   } finally { database.close(); }
+});
+
+async function chooseLanguage(page: Page, name: string) {
+  await page.getByRole('button', { name: /^(语言：|Language:)/ }).click();
+  await page.getByRole('menuitemradio', { name, exact: true }).click();
+}
+
+test('中英文覆盖七页、详情弹窗、旧错误、偏好同步和英文长文本排版', async ({ page }, info) => {
+  test.setTimeout(240000);
+  const { directory, data } = fixture();
+  const headers = { Authorization: `Bearer ${data.session.token}`, Origin: data.session.origin };
+  writeFileSync(join(directory, 'inject'), '', { mode: 0o600 });
+  const errors: string[] = [];
+  page.on('pageerror', () => errors.push('页面运行异常'));
+  await open(page, data);
+  await navigate(page, '监控目录');
+  await page.getByLabel('目录完整路径', { exact: true }).fill('synthetic-relative-path');
+  await page.getByRole('button', { name: '添加', exact: true }).click();
+  await expect(page.getByText('请输入以 / 开头的完整目录路径。', { exact: true }).filter({ visible: true })).toBeVisible();
+  await chooseLanguage(page, 'English');
+  await expect(page.getByRole('heading', { name: 'Monitored directories', exact: true })).toBeVisible();
+  await expect(page.getByText('Enter a full directory path starting with /.', { exact: true }).filter({ visible: true })).toBeVisible();
+  await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Monitoring overview', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Language: English', exact: true })).toBeVisible();
+
+  const second = await page.context().newPage();
+  try {
+    await second.goto(`${data.session.origin}/#token=${encodeURIComponent(data.session.token)}`);
+    await expect(second.getByRole('heading', { name: 'Monitoring overview', exact: true })).toBeVisible();
+    await chooseLanguage(page, '简体中文');
+    await second.bringToFront();
+    await expect(second.getByRole('heading', { name: '监控概览', exact: true })).toBeVisible();
+    await chooseLanguage(second, 'English');
+    await page.bringToFront();
+    await expect(page.getByRole('heading', { name: 'Monitoring overview', exact: true })).toBeVisible();
+  } finally { await second.close(); }
+
+  await page.route('**/api/language', async route => {
+    if (route.request().method() === 'POST') await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ ok: false, data: null, error: 'language_save_failed' }) });
+    else await route.continue();
+  });
+  await chooseLanguage(page, '简体中文');
+  await expect(page.getByRole('button', { name: 'Language: English', exact: true })).toBeVisible();
+  await expect(page.getByText('Language preferences could not be saved. The previous language has been restored.', { exact: true })).toBeVisible();
+  await page.unroute('**/api/language');
+
+  const pages = ['Overview', 'Monitored directories', 'File activity', 'Archive indicators', 'Alert center', 'Rule center', 'Settings and diagnostics'];
+  for (const theme of ['Light', 'Dark']) {
+    await page.getByRole('button', { name: /^Appearance:/ }).click();
+    await page.getByRole('menuitemradio', { name: theme, exact: true }).click();
+    for (const width of [1920, 1440, 1024, 720]) {
+      await page.setViewportSize({ width, height: 960 });
+      for (const name of pages) {
+        await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name, exact: true }).click();
+        await expect(page.locator('.page-content > section:not([hidden]) .loading')).toHaveCount(0);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${name}/${theme}/${width}px`).toBeTruthy();
+        const visibleText = await page.locator('.page-content > section:not([hidden])').innerText();
+        expect(visibleText, '英文产品页面没有内部文案key泄漏').not.toMatch(/\b(?:app|components|details|directories|overview|records|rules|settings|format|api)\.[a-zA-Z]+/);
+        if (name === 'Rule center') {
+          await expect(page.getByRole('switch')).toHaveCount(3);
+          expect(await page.locator('.rule-row').evaluateAll(rows => rows.every(row => {
+            const bounds = row.getBoundingClientRect(), toggle = row.querySelector('.cds--toggle')!.getBoundingClientRect();
+            return toggle.right <= bounds.right + 1 && row.scrollWidth <= row.clientWidth + 1;
+          })), '英文规则开关没有溢出').toBeTruthy();
+          await expect(page.getByRole('heading', { name: 'Bulk file access', exact: true })).toBeVisible();
+        }
+      }
+      await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'File activity', exact: true }).click();
+      const table = page.getByRole('table', { name: 'File activity records' });
+      await table.getByRole('button', { name: 'View', exact: true }).first().click();
+      const detail = page.getByRole('complementary', { name: 'Record details' });
+      await expect(detail.getByText('Readable open', { exact: true })).toBeVisible();
+      expect(await detail.evaluate(element => element.scrollWidth <= element.clientWidth + 1), '英文详情与长路径没有溢出').toBeTruthy();
+      await detail.getByRole('button', { name: 'Close', exact: true }).click();
+      await page.getByRole('button', { name: 'Export', exact: true }).click();
+      const dialog = page.getByRole('dialog', { name: 'Export current results' });
+      await expect(dialog.getByLabel('Anonymous sharing mode', { exact: true })).toBeChecked();
+      const bounds = (await dialog.boundingBox())!;
+      expect(bounds.x >= 0 && bounds.x + bounds.width <= width, '英文弹窗保留在窗口内').toBeTruthy();
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      if (width === 1440) await page.screenshot({ path: info.outputPath(`localization-${theme.toLowerCase()}.png`), fullPage: true });
+    }
+  }
+  await page.setViewportSize({ width: 1440, height: 960 });
+  const preference = await page.request.get(`${data.session.origin}/api/language`, { headers });
+  expect((await preference.json()).data.preference).toBe('en');
+  await chooseLanguage(page, 'Follow system');
+  await expect(page.getByRole('button', { name: /^(语言：跟随系统|Language: Follow system)$/ })).toBeVisible();
+  await expect.poll(async () => (await (await page.request.get(`${data.session.origin}/api/language`, { headers })).json()).data.preference).toBe('system');
+  // 恢复中文匿名fixture，后续测试不会依赖本机的系统语言。
+  await page.request.post(`${data.session.origin}/api/language`, { headers, data: { preference: 'zh-CN' } });
+  expect(errors).toEqual([]);
 });

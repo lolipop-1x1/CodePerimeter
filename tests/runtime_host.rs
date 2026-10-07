@@ -879,7 +879,14 @@ fn selected_directory_events_trigger_alerts_once_and_reconnects_are_visible() {
     assert_eq!(alerts[0]["rule"], "bulk_file_access");
     assert!(notify_once_with_sender(&control_socket, "helper-session-a", &mut sender).unwrap());
     assert_eq!(sender.messages.len(), 1);
-    assert!(sender.messages[0].0.contains("此前"));
+    assert_eq!(
+        sender.messages[0].0,
+        codeperimeter::i18n::message(
+            &codeperimeter::i18n::current_locale(),
+            "notification.summary.title",
+            &[]
+        )
+    );
     assert!(
         !notify_once_with_sender(&control_socket, "helper-session-a", &mut sender).unwrap(),
         "历史快照汇总成功后不应重发"
@@ -916,7 +923,14 @@ fn selected_directory_events_trigger_alerts_once_and_reconnects_are_visible() {
     );
     assert!(notify_once_with_sender(&control_socket, "helper-session-a", &mut sender).unwrap());
     assert_eq!(sender.messages.len(), 2);
-    assert!(sender.messages[1].0.contains("大量"));
+    assert_eq!(
+        sender.messages[1].0,
+        codeperimeter::i18n::message(
+            &codeperimeter::i18n::current_locale(),
+            "notification.bulk.title",
+            &[]
+        )
+    );
     assert_eq!(
         sender.targets[0],
         codeperimeter::runtime::NotificationTarget::Alerts
@@ -1115,7 +1129,14 @@ fn database_lock_does_not_stop_analysis_or_ephemeral_notification() {
         "SQLite降级时新告警仍应走有界内存通知"
     );
     assert_eq!(sender.messages.len(), 1);
-    assert!(sender.messages[0].0.contains("大量"));
+    assert_eq!(
+        sender.messages[0].0,
+        codeperimeter::i18n::message(
+            &codeperimeter::i18n::current_locale(),
+            "notification.bulk.title",
+            &[]
+        )
+    );
 
     lock.execute_batch("ROLLBACK").unwrap();
     drop(lock);

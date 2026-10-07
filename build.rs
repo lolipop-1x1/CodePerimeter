@@ -17,6 +17,27 @@ fn collect(root: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=locales");
+    let mut catalogs = String::from("pub static NATIVE_CATALOGS: &[(&str, &str)] = &[\n");
+    let mut locale_files = Vec::new();
+    collect(Path::new("locales/native"), &mut locale_files);
+    locale_files.sort();
+    for file in locale_files {
+        if file.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        catalogs.push_str(&format!(
+            "({:?}, include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), {:?}))),\n",
+            file.file_stem().unwrap().to_str().unwrap(),
+            format!("/{}", file.to_str().unwrap())
+        ));
+    }
+    catalogs.push_str("];\n");
+    fs::write(
+        PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("language_catalogs.rs"),
+        catalogs,
+    )
+    .unwrap();
     println!("cargo:rerun-if-changed=web/dist");
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {

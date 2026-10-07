@@ -20,6 +20,10 @@ jobs:
       - name: Web type checks
         working-directory: web
         run: npm run typecheck
+      - name: Check offline language resources
+        run: |
+          python3 -B scripts/check-locales.py
+          python3 -B -m unittest discover -s tests -p test_locale_resources.py -v
       - name: Web component tests
         working-directory: web
         run: npm test

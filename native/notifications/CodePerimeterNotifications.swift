@@ -8,6 +8,56 @@ private struct Request: Decodable {
     let title: String?
     let body: String?
     let target: Target?
+    let localization: Localization?
+}
+
+private struct Localization: Decodable {
+    let locale: String
+    let detailAction: String
+    let alertsAction: String
+    let activationFailedTitle: String
+    let activationFailedBody: String
+    let acknowledge: String
+
+    enum CodingKeys: String, CodingKey {
+        case locale, acknowledge
+        case detailAction = "detail_action"
+        case alertsAction = "alerts_action"
+        case activationFailedTitle = "activation_failed_title"
+        case activationFailedBody = "activation_failed_body"
+    }
+
+    // 旧协议发送的是中文通知；保留它的按钮与点击失败提示。
+    static let legacy = Localization(locale: "", detailAction: "查看详情", alertsAction: "查看告警",
+        activationFailedTitle: "未能打开 CodePerimeter 告警",
+        activationFailedBody: "请从本机启动 CodePerimeter 控制台并检查后台安装状态。通知中的记录可能已过期或清除。",
+        acknowledge: "知道了")
+
+    var valid: Bool {
+        !locale.isEmpty && locale.utf8.count <= 64
+            && locale.utf8.allSatisfy { (65...90).contains($0) || (97...122).contains($0)
+                || (48...57).contains($0) || $0 == 45 || $0 == 95 }
+            && [detailAction, alertsAction, activationFailedTitle, acknowledge]
+                .allSatisfy { !$0.isEmpty && $0.utf8.count <= 512 }
+            && !activationFailedBody.isEmpty && activationFailedBody.utf8.count <= 4096
+    }
+
+    var fields: [String: String] {
+        ["locale": locale, "detail_action": detailAction, "alerts_action": alertsAction,
+            "activation_failed_title": activationFailedTitle,
+            "activation_failed_body": activationFailedBody, "acknowledge": acknowledge]
+    }
+
+    var alertCategory: String { locale.isEmpty ? "project_alert" : "project_alert_\(locale)" }
+    var summaryCategory: String { locale.isEmpty ? "project_summary" : "project_summary_\(locale)" }
+
+    static func from(_ fields: Any?) -> Localization {
+        guard let fields = fields as? [String: String],
+            let bytes = try? JSONSerialization.data(withJSONObject: fields),
+            let value = try? JSONDecoder().decode(Localization.self, from: bytes),
+            value.valid else { return .legacy }
+        return value
+    }
 }
 
 private struct Target: Decodable {
@@ -64,13 +114,6 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
         // 冷启动的点击响应也需要在启动完成前注册 delegate。
         center = UNUserNotificationCenter.current()
         center.delegate = self
-        let detail = UNNotificationAction(identifier: "view_detail", title: "查看详情", options: [.foreground])
-        center.setNotificationCategories([
-            UNNotificationCategory(identifier: "project_alert", actions: [detail], intentIdentifiers: []),
-            UNNotificationCategory(identifier: "project_summary", actions: [
-                UNNotificationAction(identifier: "view_detail", title: "查看告警", options: [.foreground])
-            ], intentIdentifiers: [])
-        ])
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -140,45 +183,65 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
             guard let title = request.title, let body = request.body,
                 !title.isEmpty, title.utf8.count <= 512,
                 !body.isEmpty, body.utf8.count <= 8192,
-                request.target?.valid != false else {
+                request.target?.valid != false, request.localization?.valid != false else {
                 finish(false, "invalid_request")
                 return
             }
-            center.getNotificationSettings { settings in
-                switch settings.authorizationStatus {
-                case .notDetermined:
-                    self.finish(false, "authorization_required", settings)
-                case .denied:
-                    self.finish(false, "permission_denied", settings)
-                case .authorized, .provisional:
-                    guard settings.alertSetting == .enabled else {
-                        self.finish(false, "alerts_disabled", settings)
-                        return
+            let localization = request.localization ?? .legacy
+            registerCategories(localization) {
+                self.center.getNotificationSettings { settings in
+                    switch settings.authorizationStatus {
+                    case .notDetermined:
+                        self.finish(false, "authorization_required", settings)
+                    case .denied:
+                        self.finish(false, "permission_denied", settings)
+                    case .authorized, .provisional:
+                        guard settings.alertSetting == .enabled else {
+                            self.finish(false, "alerts_disabled", settings)
+                            return
+                        }
+                        let content = UNMutableNotificationContent()
+                        content.title = title
+                        content.body = body
+                        content.sound = .default
+                        if let target = request.target, target.kind == "alert", let id = target.id {
+                            content.userInfo = ["alert_id": id, "localization": localization.fields]
+                            content.categoryIdentifier = localization.alertCategory
+                        } else {
+                            content.userInfo = ["localization": localization.fields]
+                            content.categoryIdentifier = localization.summaryCategory
+                        }
+                        let notification = UNNotificationRequest(
+                            identifier: UUID().uuidString, content: content, trigger: nil
+                        )
+                        self.center.add(notification) { error in
+                            // add 回执只证明系统接受提交，不能证明用户已看到通知。
+                            self.finish(error == nil,
+                                error == nil ? "accepted" : "submission_failed", settings)
+                        }
+                    @unknown default:
+                        self.finish(false, "unsupported_authorization", settings)
                     }
-                    let content = UNMutableNotificationContent()
-                    content.title = title
-                    content.body = body
-                    content.sound = .default
-                    if let target = request.target, target.kind == "alert", let id = target.id {
-                        content.userInfo = ["alert_id": id]
-                        content.categoryIdentifier = "project_alert"
-                    } else {
-                        content.categoryIdentifier = "project_summary"
-                    }
-                    let notification = UNNotificationRequest(
-                        identifier: UUID().uuidString, content: content, trigger: nil
-                    )
-                    self.center.add(notification) { error in
-                        // add 回执只证明系统接受提交，不能证明用户已看到通知。
-                        self.finish(error == nil,
-                            error == nil ? "accepted" : "submission_failed", settings)
-                    }
-                @unknown default:
-                    self.finish(false, "unsupported_authorization", settings)
                 }
             }
         default:
             finish(false, "invalid_request")
+        }
+    }
+
+    private func registerCategories(_ localization: Localization, completion: @escaping () -> Void) {
+        // 不覆盖其他语言的类别；已送达通知的操作按钮保留原语言。
+        center.getNotificationCategories { existing in
+            var categories = existing.filter { $0.identifier != localization.alertCategory
+                && $0.identifier != localization.summaryCategory }
+            categories.insert(UNNotificationCategory(identifier: localization.alertCategory, actions: [
+                UNNotificationAction(identifier: "view_detail", title: localization.detailAction, options: [.foreground])
+            ], intentIdentifiers: []))
+            categories.insert(UNNotificationCategory(identifier: localization.summaryCategory, actions: [
+                UNNotificationAction(identifier: "view_detail", title: localization.alertsAction, options: [.foreground])
+            ], intentIdentifiers: []))
+            self.center.setNotificationCategories(categories)
+            completion()
         }
     }
 
@@ -242,9 +305,10 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
         }
         receivedActivation = true
         let fields = response.notification.request.content.userInfo
+        let localization = Localization.from(fields["localization"])
         if let value = fields["alert_id"] {
             guard let id = value as? String, validAlertID(id) else {
-                activationFailed(completionHandler)
+                activationFailed(completionHandler, localization)
                 return
             }
         }
@@ -253,7 +317,7 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
         // 不从通知元数据接受 URL、令牌或可执行路径，启动位置只由本机 UID 决定。
         let executable = "/Library/CodePerimeter/\(getuid())/codeperimeter"
         guard getuid() != 0, trustedLauncher(executable) else {
-            activationFailed(completionHandler)
+            activationFailed(completionHandler, localization)
             return
         }
         let task = Process()
@@ -286,12 +350,12 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
                         self.lifecycle.unlock()
                         if idle { exit(0) }
                     } else {
-                        self.activationFailed(completionHandler)
+                        self.activationFailed(completionHandler, localization)
                     }
                 }
             }
         } catch {
-            activationFailed(completionHandler)
+            activationFailed(completionHandler, localization)
         }
     }
 
@@ -312,11 +376,12 @@ private final class NotificationApplication: NSObject, NSApplicationDelegate,
         return true
     }
 
-    private func activationFailed(_ completionHandler: @escaping () -> Void) {
+    private func activationFailed(_ completionHandler: @escaping () -> Void,
+        _ localization: Localization) {
         let alert = NSAlert()
-        alert.messageText = "未能打开 CodePerimeter 告警"
-        alert.informativeText = "请从本机启动 CodePerimeter 控制台并检查后台安装状态。通知中的记录可能已过期或清除。"
-        alert.addButton(withTitle: "知道了")
+        alert.messageText = localization.activationFailedTitle
+        alert.informativeText = localization.activationFailedBody
+        alert.addButton(withTitle: localization.acknowledge)
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
         completionHandler()

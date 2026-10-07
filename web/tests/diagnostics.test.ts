@@ -76,7 +76,8 @@ test('部分失败的服务操作保留具体步骤，不显示完成', () => {
     id: 'synthetic-operation', operation: 'pause', state: 'failed', error: 'service_steps_failed',
     report: { data_preserved: true, steps: [{ label: 'collector', success: false, message: '采集任务卸载命令失败，需核对任务实际状态' }] },
   } }));
-  assert.ok(markup.includes('失败：采集任务卸载命令失败，需核对任务实际状态'));
+  assert.ok(markup.includes('失败'));
+  assert.ok(markup.includes('原始提示（未翻译）：采集任务卸载命令失败，需核对任务实际状态'));
   assert.ok(!markup.includes('服务操作已完成'));
 });
 

@@ -413,8 +413,17 @@ pub fn choose_directory() -> Result<DirectoryChoice> {
 }
 
 fn directory_script() -> String {
+    directory_script_for_locale(&crate::i18n::current_locale())
+}
+
+fn directory_script_for_locale(locale: &str) -> String {
     standard_additions_terms(&format!(
-        "try\nset chosenFolder to choose folder with prompt \"选择需要监控的目录\"\nreturn \"__CODEPERIMETER_DIRECTORY__\" & linefeed & POSIX path of chosenFolder\non error number errorNumber\nif errorNumber is -128 then\nreturn \"{CANCELLED}\"\nelse\nreturn \"{FAILED}\"\nend if\nend try"
+        "try\nset chosenFolder to choose folder with prompt {}\nreturn \"__CODEPERIMETER_DIRECTORY__\" & linefeed & POSIX path of chosenFolder\non error number errorNumber\nif errorNumber is -128 then\nreturn \"{CANCELLED}\"\nelse\nreturn \"{FAILED}\"\nend if\nend try",
+        applescript_string(&crate::i18n::message(
+            locale,
+            "native.directory_prompt",
+            &[]
+        ))
     ))
 }
 
@@ -488,7 +497,8 @@ mod tests {
                 Path::new("/synthetic/bin/a'\"$(marker);x"),
             )
             .unwrap(),
-            directory_script(),
+            directory_script_for_locale("zh-CN"),
+            directory_script_for_locale("en"),
         ];
         for (index, script) in scripts.iter().enumerate() {
             let status = Command::new("/usr/bin/osacompile")
@@ -502,6 +512,16 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "原生脚本语法必须通过系统编译器");
         }
+    }
+
+    #[test]
+    fn directory_prompt_follows_the_product_language() {
+        let chinese = directory_script_for_locale("zh-CN");
+        let english = directory_script_for_locale("en");
+        assert!(chinese.contains("选择需要监控的目录"));
+        assert!(english.contains("Choose a directory to monitor"));
+        assert!(!english.contains("选择需要监控的目录"));
+        assert!(chinese.contains(CANCELLED) && english.contains(CANCELLED));
     }
 
     #[test]

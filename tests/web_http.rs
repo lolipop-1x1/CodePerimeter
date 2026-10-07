@@ -308,6 +308,92 @@ fn http_with_metadata(
 }
 
 #[test]
+fn language_preference_is_authenticated_persistent_and_preserves_evidence() {
+    let mut rig = Rig::new();
+    let original = rig.console("directories", json!({}));
+    let rules = rig.console("rules_get", json!({}));
+    rig.send_open(0, 1);
+    wait(|| rig.console("events_page", json!({"filter":{}}))["total"] == 1);
+    let events = rig.console("events_page", json!({"filter":{}}));
+    assert_eq!(
+        http(
+            &rig.session,
+            "GET",
+            "/api/language",
+            None,
+            None,
+            None,
+            false
+        )
+        .0,
+        401
+    );
+    let initial: Value =
+        serde_json::from_slice(&rig.http("GET", "/api/language", None, None, None).1).unwrap();
+    assert_eq!(initial["data"]["preference"], "system");
+    for preference in ["en", "zh-CN"] {
+        let (status, body) = rig.http(
+            "POST",
+            "/api/language",
+            Some(json!({"preference":preference})),
+            None,
+            None,
+        );
+        assert_eq!(status, 200);
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["data"]["locale"], preference);
+        assert_eq!(rig.console("directories", json!({})), original);
+        assert_eq!(rig.console("rules_get", json!({})), rules);
+        assert_eq!(rig.console("events_page", json!({"filter":{}})), events);
+    }
+    for invalid in [
+        json!({"preference":"unknown"}),
+        json!({"preference":"en","extra":true}),
+    ] {
+        assert_eq!(
+            rig.http("POST", "/api/language", Some(invalid), None, None)
+                .0,
+            400
+        );
+    }
+    assert_eq!(
+        rig.http(
+            "POST",
+            "/api/language",
+            Some(json!({"preference":"en"})),
+            None,
+            Some("http://untrusted.invalid")
+        )
+        .0,
+        403
+    );
+    let preference = rig.temp.path().join("language.json");
+    assert_eq!(fs::metadata(&preference).unwrap().mode() & 0o777, 0o600);
+    rig.ui.kill().unwrap();
+    rig.ui.wait().unwrap();
+    let entry = rig.temp.path().join("ui.json");
+    fs::remove_file(&entry).unwrap();
+    rig.ui = Command::new(env!("CARGO_BIN_EXE_codeperimeter"))
+        .arg("--host-socket")
+        .arg(&rig.host_socket)
+        .args(["ui", "--foreground", "--no-browser", "--session-file"])
+        .arg(&entry)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait(|| entry.exists());
+    rig.session = serde_json::from_slice(&fs::read(entry).unwrap()).unwrap();
+    wait(|| rig.http("GET", "/api/ping", None, None, None).0 == 200);
+    let restarted: Value =
+        serde_json::from_slice(&rig.http("GET", "/api/language", None, None, None).1).unwrap();
+    assert_eq!(restarted["data"]["preference"], "zh-CN");
+    assert_eq!(restarted["data"]["locale"], "zh-CN");
+    assert_eq!(rig.console("events_page", json!({"filter":{}})), events);
+}
+
+#[test]
 fn loopback_http_enforces_credentials_origin_and_internal_operation_boundary() {
     let rig = Rig::new();
     let (status, html) = http(

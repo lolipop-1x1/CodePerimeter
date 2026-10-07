@@ -48,8 +48,8 @@ pub struct WebOptions {
     pub alerts: bool,
 }
 
-// 版本 2 才支持通知告警详情入口，更新后不复用旧页面服务。
-const WEB_ENTRY_VERSION: u32 = 2;
+// 版本 3 支持统一语言偏好，更新后不复用缺少该接口的旧页面服务。
+const WEB_ENTRY_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Session {
@@ -63,6 +63,7 @@ struct Session {
 #[derive(Clone)]
 struct AppState {
     session: Session,
+    language_path: PathBuf,
     username: String,
     binary: PathBuf,
     history: HistoryOptions,
@@ -107,7 +108,10 @@ pub fn run(options: WebOptions) -> Result<()> {
             if !options.no_browser {
                 open_browser(&session, options.alert_id.as_deref(), options.alerts)?;
             }
-            println!("本机网页控制台已打开；关闭网页后监控继续运行。");
+            println!(
+                "{}",
+                crate::i18n::message(&crate::i18n::current_locale(), "web.opened", &[])
+            );
             return Ok(());
         }
     }
@@ -150,7 +154,10 @@ pub fn run(options: WebOptions) -> Result<()> {
                 if !options.no_browser {
                     open_browser(&session, options.alert_id.as_deref(), options.alerts)?;
                 }
-                println!("本机网页控制台已启动；关闭网页后监控继续运行。");
+                println!(
+                    "{}",
+                    crate::i18n::message(&crate::i18n::current_locale(), "web.started", &[])
+                );
                 return Ok(());
             }
         }
@@ -344,6 +351,10 @@ async fn serve(
         } else {
             defaults
         },
+        language_path: session_path
+            .parent()
+            .expect("已验证的入口目录")
+            .join("language.json"),
         // 独立宿主验收禁止修改机器上已安装的生产服务。
         native_enabled: options.host_socket
             == account
@@ -358,6 +369,7 @@ async fn serve(
     let app = Router::new()
         .route("/api/ping", get(ping))
         .route("/api/status", get(status))
+        .route("/api/language", get(language_get).post(language_set))
         .route("/api/control", post(control))
         .route("/api/console", post(console))
         .route("/api/history/preview", post(history_preview))
@@ -389,7 +401,10 @@ async fn serve(
     if !options.no_browser {
         open_browser(&session, options.alert_id.as_deref(), options.alerts)?;
     }
-    println!("本机网页控制台已启动；入口令牌只保存在私有会话文件中。");
+    println!(
+        "{}",
+        crate::i18n::message(&crate::i18n::current_locale(), "web.serving", &[])
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
@@ -509,6 +524,30 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
 
 async fn ping(State(state): State<AppState>) -> Response {
     reply(json!({"pid":state.session.pid}))
+}
+
+async fn language_get(State(state): State<AppState>) -> Response {
+    match crate::i18n::preferred_state(&state.language_path) {
+        Ok(language) => reply(json!(language)),
+        Err(_) => failure(StatusCode::INTERNAL_SERVER_ERROR, "language_load_failed"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LanguageRequest {
+    preference: String,
+}
+
+async fn language_set(State(state): State<AppState>, body: Bytes) -> Response {
+    let request = match serde_json::from_slice::<LanguageRequest>(&body) {
+        Ok(request) if crate::i18n::valid_preference(&request.preference) => request,
+        _ => return failure(StatusCode::BAD_REQUEST, "invalid_language_preference"),
+    };
+    match crate::i18n::save_preference(&state.language_path, &request.preference) {
+        Ok(language) => reply(json!(language)),
+        Err(_) => failure(StatusCode::INTERNAL_SERVER_ERROR, "language_save_failed"),
+    }
 }
 
 async fn host_call(state: &AppState, value: Value) -> std::result::Result<Value, Response> {
@@ -1201,6 +1240,7 @@ mod tests {
         wait_started.recv_timeout(Duration::from_secs(2)).unwrap();
         let blocking = Arc::new(Semaphore::new(1));
         let state = AppState {
+            language_path: PathBuf::from("/private/tmp/synthetic/language.json"),
             session: Session {
                 version: 1,
                 pid: 1,

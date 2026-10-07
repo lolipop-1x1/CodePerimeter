@@ -34,7 +34,7 @@ test('产品提示把静态内部错误码翻译为中文', () => {
   assert.match(errorMessage('host_unavailable'), /宿主不可用/);
   assert.match(errorMessage('preview_expired'), /预览已失效/);
   assert.doesNotMatch(errorMessage('unknown_internal_code'), /unknown_internal_code/);
-  assert.equal(errorMessage('规则版本冲突，请刷新后重试'), '规则版本冲突，请刷新后重试');
+  assert.equal(errorMessage('规则版本冲突，请刷新后重试'), '原始提示（未翻译）：规则版本冲突，请刷新后重试');
 });
 
 test('顶部服务操作区分安装、启用、明确暂停和未知状态', () => {

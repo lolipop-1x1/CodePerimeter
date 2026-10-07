@@ -13,8 +13,10 @@
   "dependencies": {
     "@carbon/react": "^1.0.0",
     "@carbon/styles": "^1.0.0",
+    "i18next": "^26.4.2",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-i18next": "^17.0.16"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

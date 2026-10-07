@@ -193,6 +193,17 @@ pub enum NotifyPollResult {
 
 pub trait NotificationSender {
     fn send(&mut self, title: &str, body: &str, target: &NotificationTarget) -> Result<()>;
+
+    fn send_in_locale(
+        &mut self,
+        title: &str,
+        body: &str,
+        target: &NotificationTarget,
+        locale: &str,
+    ) -> Result<()> {
+        let _ = locale;
+        self.send(title, body, target)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2084,9 +2095,15 @@ pub fn notify_once_with_sender(
     )?;
     match result {
         NotifyPollResult::Summary { summary, sequence } => {
-            let body = summary_notification_body(&summary);
+            let locale = crate::i18n::current_locale();
+            let body = summary_notification_body_for_locale(&summary, &locale);
             let sent = sender
-                .send("此前发现了项目文件活动", &body, &NotificationTarget::Alerts)
+                .send_in_locale(
+                    &crate::i18n::message(&locale, "notification.summary.title", &[]),
+                    &body,
+                    &NotificationTarget::Alerts,
+                    &locale,
+                )
                 .is_ok();
             notify_send_result(
                 control_socket,
@@ -2099,11 +2116,14 @@ pub fn notify_once_with_sender(
             Ok(sent)
         }
         NotifyPollResult::Alert { alert, persisted } => {
-            let (title, body) = alert_notification_text(&alert, persisted);
+            let locale = crate::i18n::current_locale();
+            let (title, body) = alert_notification_text_for_locale(&alert, persisted, &locale);
             let target = NotificationTarget::Alert {
                 id: alert.id.clone(),
             };
-            let sent = sender.send(title, &body, &target).is_ok();
+            let sent = sender
+                .send_in_locale(&title, &body, &target, &locale)
+                .is_ok();
             notify_send_result(
                 control_socket,
                 ControlRequest::NotifyAlertResult {
@@ -2118,7 +2138,7 @@ pub fn notify_once_with_sender(
     }
 }
 
-fn notification_name(path: &Path) -> String {
+fn notification_name(path: &Path, locale: &str) -> String {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let cleaned: String = name.chars().filter(|character| {
         !character.is_control() && !matches!(*character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
@@ -2128,58 +2148,89 @@ fn notification_name(path: &Path) -> String {
         short.push('…');
     }
     if short.trim().is_empty() {
-        "名称未知".into()
+        crate::i18n::message(locale, "notification.name_unknown", &[])
     } else {
         short
     }
 }
 
-fn alert_notification_text(alert: &Alert, persisted: bool) -> (&'static str, String) {
+fn alert_notification_text_for_locale(
+    alert: &Alert,
+    persisted: bool,
+    locale: &str,
+) -> (String, String) {
     let program = alert
         .process
         .executable
         .as_deref()
-        .map(notification_name)
-        .unwrap_or_else(|| "未知程序".into());
+        .map(|path| notification_name(path, locale))
+        .unwrap_or_else(|| crate::i18n::message(locale, "notification.program_unknown", &[]));
     let project = alert
         .roots
         .first()
-        .map(|root| notification_name(root))
-        .unwrap_or_else(|| "未知项目".into());
-    let project = if alert.roots.len() > 1 {
-        format!("「{project}」等 {} 个项目", alert.roots.len())
+        .map(|root| notification_name(root, locale))
+        .unwrap_or_else(|| crate::i18n::message(locale, "notification.project_unknown", &[]));
+    let project_key = if alert.roots.len() > 1 {
+        "notification.projects"
     } else {
-        format!("「{project}」")
+        "notification.project"
     };
-    let (title, mut body) = match alert.rule {
+    let project = crate::i18n::message(
+        locale,
+        project_key,
+        &[
+            ("project", project),
+            ("count", alert.roots.len().to_string()),
+        ],
+    );
+    let (title_key, body_key, extra) = match alert.rule {
         crate::model::AlertRule::BulkFileAccess => (
-            "大量访问项目文件",
-            format!(
-                "{program} 在{project}短时间内打开或映射了 {} 个文件。",
-                alert.unique_files
-            ),
+            "notification.bulk.title",
+            "notification.bulk.body",
+            vec![("count", alert.unique_files.to_string())],
         ),
         crate::model::AlertRule::ArchiveCommand => (
-            "启动项目压缩／打包命令",
-            format!("{program} 启动了涉及{project}的压缩／打包命令。"),
+            "notification.command.title",
+            "notification.command.body",
+            vec![],
         ),
         crate::model::AlertRule::ArchiveOutput => {
             let output = alert
                 .archive_output_paths
                 .first()
-                .map(|path| format!("疑似压缩文件 {}", notification_name(path)))
-                .unwrap_or_else(|| "疑似压缩文件".into());
+                .map(|path| {
+                    crate::i18n::message(
+                        locale,
+                        "notification.output.name",
+                        &[("file", notification_name(path, locale))],
+                    )
+                })
+                .unwrap_or_else(|| {
+                    crate::i18n::message(locale, "notification.output.unknown", &[])
+                });
             (
-                "发现疑似压缩文件生成／修改",
-                format!("{program} 访问{project}后，出现{output}的生成或修改记录。"),
+                "notification.output.title",
+                "notification.output.body",
+                vec![("output", output)],
             )
         }
     };
+    let mut args = vec![("program", program), ("project", project)];
+    args.extend(extra);
+    let mut body = crate::i18n::message(locale, body_key, &args);
     if !persisted {
-        body.push_str("记录暂未保存，详情可能不可用。");
+        body.push_str(&crate::i18n::message(
+            locale,
+            "notification.details_unsaved",
+            &[],
+        ));
     }
-    body.push_str("点击查看详情。");
-    (title, body)
+    body.push_str(&crate::i18n::message(
+        locale,
+        "notification.open_details",
+        &[],
+    ));
+    (crate::i18n::message(locale, title_key, &[]), body)
 }
 
 /// 连续发送有限数量的待处理通知，生产helper用它降低告警突发时的排队延迟。
@@ -2214,28 +2265,37 @@ fn notify_send_result(control_socket: &Path, request: ControlRequest) -> Result<
     Ok(())
 }
 
-fn summary_notification_body(summary: &PendingNotificationSummary) -> String {
+fn summary_notification_body_for_locale(
+    summary: &PendingNotificationSummary,
+    locale: &str,
+) -> String {
     let rules = summary
         .by_rule
         .iter()
         .map(|count| {
-            let behavior = match count.rule {
-                crate::model::AlertRule::BulkFileAccess => "大量文件访问",
-                crate::model::AlertRule::ArchiveCommand => "压缩／打包命令",
-                crate::model::AlertRule::ArchiveOutput => "疑似压缩文件生成／修改",
+            let key = match count.rule {
+                crate::model::AlertRule::BulkFileAccess => "notification.summary.bulk",
+                crate::model::AlertRule::ArchiveCommand => "notification.summary.command",
+                crate::model::AlertRule::ArchiveOutput => "notification.summary.output",
             };
-            format!("{behavior} {} 条", count.count)
+            crate::i18n::message(locale, key, &[("count", count.count.to_string())])
         })
         .collect::<Vec<_>>()
-        .join("，");
-    if rules.is_empty() {
-        format!("此前发现 {} 条活动告警。点击查看告警。", summary.count)
+        .join(&crate::i18n::message(
+            locale,
+            "notification.summary.separator",
+            &[],
+        ));
+    let key = if rules.is_empty() {
+        "notification.summary.body"
     } else {
-        format!(
-            "此前发现 {} 条活动告警：{}。点击查看告警。",
-            summary.count, rules
-        )
-    }
+        "notification.summary.rules"
+    };
+    crate::i18n::message(
+        locale,
+        key,
+        &[("count", summary.count.to_string()), ("rules", rules)],
+    )
 }
 
 /// 生产通知helper；保持轮询直到launchd停止该用户进程。
@@ -2243,7 +2303,15 @@ pub fn run_notify(control_socket: &Path) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = control_socket;
-        Err(io::Error::new(io::ErrorKind::Unsupported, "系统通知仅支持 macOS").into())
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::i18n::message(
+                &crate::i18n::current_locale(),
+                "notification.platform_unsupported",
+                &[],
+            ),
+        )
+        .into())
     }
     #[cfg(target_os = "macos")]
     {
@@ -2253,7 +2321,14 @@ pub fn run_notify(control_socket: &Path) -> Result<()> {
         ))?;
         // 先申请普通通知权限；拒绝不影响采集，后续发送仍记录失败而非伪成功。
         if sender.request_authorization().is_err() {
-            eprintln!("CodePerimeter 系统通知授权未完成，发送结果将保留失败。");
+            eprintln!(
+                "{}",
+                crate::i18n::message(
+                    &crate::i18n::current_locale(),
+                    "notification.authorization_incomplete",
+                    &[]
+                )
+            );
         }
         loop {
             match notify_burst_with_sender(
@@ -2265,7 +2340,14 @@ pub fn run_notify(control_socket: &Path) -> Result<()> {
                 Ok(sent) if sent > 0 => continue,
                 Ok(_) => thread::sleep(Duration::from_millis(250)),
                 Err(_) => {
-                    eprintln!("CodePerimeter 通知宿主暂不可用，将重试。");
+                    eprintln!(
+                        "{}",
+                        crate::i18n::message(
+                            &crate::i18n::current_locale(),
+                            "notification.host_retry",
+                            &[]
+                        )
+                    );
                     thread::sleep(Duration::from_secs(1));
                 }
             }
@@ -2307,7 +2389,7 @@ mod notification_text_tests {
             crate::model::AlertRule::ArchiveCommand,
             crate::model::AlertRule::ArchiveOutput,
         ] {
-            let (title, body) = alert_notification_text(&alert(rule), true);
+            let (title, body) = alert_notification_text_for_locale(&alert(rule), true, "zh-CN");
             assert!(
                 body.contains("python3")
                     && body.contains("synthetic-project")
@@ -2345,22 +2427,80 @@ mod notification_text_tests {
             .remove("archive_output_paths");
         let old: Alert = serde_json::from_value(value).unwrap();
         assert!(old.archive_output_paths.is_empty());
-        let (_, body) = alert_notification_text(&old, false);
+        let (_, body) = alert_notification_text_for_locale(&old, false, "zh-CN");
         assert!(!body.contains("input.zip"));
         assert!(body.contains("记录暂未保存，详情可能不可用"));
     }
 
     #[test]
     fn displayed_names_are_bounded_and_remove_controls_and_bidi_overrides() {
-        let name = notification_name(Path::new("/private/tmp/line\n\t\u{202e}name.zip"));
+        let name = notification_name(Path::new("/private/tmp/line\n\t\u{202e}name.zip"), "zh-CN");
         assert_eq!(name, "linename.zip");
-        assert_eq!(notification_name(Path::new("/")), "名称未知");
+        assert_eq!(notification_name(Path::new("/"), "zh-CN"), "名称未知");
         assert_eq!(
-            notification_name(Path::new(&"字".repeat(100)))
+            notification_name(Path::new(&"字".repeat(100)), "zh-CN")
                 .chars()
                 .count(),
             41
         );
+    }
+
+    #[test]
+    fn english_notifications_use_plural_forms_and_preserve_evidence() {
+        let mut event = alert(crate::model::AlertRule::BulkFileAccess);
+        event.unique_files = 1;
+        let original = serde_json::to_value(&event).unwrap();
+        let (title, body) = alert_notification_text_for_locale(&event, true, "en");
+        assert_eq!(title, "Many project files accessed");
+        assert!(body.contains("opened or mapped 1 file in “synthetic-project”"));
+        assert!(!body.contains("1 files") && !body.contains("/private/tmp"));
+        event.unique_files = 2;
+        event
+            .roots
+            .push("/private/tmp/synthetic-other-project".into());
+        let (_, body) = alert_notification_text_for_locale(&event, false, "en");
+        assert!(body.contains("opened or mapped 2 files"));
+        assert!(body.contains("2 projects in total"));
+        assert!(body.contains("The record has not been saved"));
+        assert!(body.contains("Click to view details"));
+        let (_, chinese) = alert_notification_text_for_locale(&event, false, "zh-CN");
+        assert!(chinese.contains("等 2 个项目") && chinese.contains("2 个文件"));
+        event.unique_files = 1;
+        event.roots.pop();
+        assert_eq!(serde_json::to_value(&event).unwrap(), original);
+    }
+
+    #[test]
+    fn english_summary_and_archive_messages_describe_indicators() {
+        for rule in [
+            crate::model::AlertRule::ArchiveCommand,
+            crate::model::AlertRule::ArchiveOutput,
+        ] {
+            let (title, body) = alert_notification_text_for_locale(&alert(rule), true, "en");
+            assert!(body.contains("python3") && body.contains("synthetic-project"));
+            assert!(!body.contains("60 files") && !body.contains("exfiltrated"));
+            if rule == crate::model::AlertRule::ArchiveOutput {
+                assert!(title.contains("Possible") && body.contains("output.7z"));
+            } else {
+                assert!(body.contains("command involving"));
+            }
+        }
+        let mut summary = PendingNotificationSummary {
+            count: 1,
+            ..Default::default()
+        };
+        assert!(
+            summary_notification_body_for_locale(&summary, "en")
+                .contains("1 earlier activity alert was found")
+        );
+        summary.count = 2;
+        summary.by_rule.push(crate::storage::NotificationRuleCount {
+            rule: crate::model::AlertRule::ArchiveCommand,
+            count: 2,
+        });
+        let body = summary_notification_body_for_locale(&summary, "en");
+        assert!(body.contains("2 earlier activity alerts were found"));
+        assert!(body.contains("2 compression / archive command alerts"));
     }
 }
 

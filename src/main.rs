@@ -1,8 +1,9 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use codeperimeter::history::{
     self, DirectoryCandidate, DirectoryStatus, DiscoveryCounts, DiscoveryGap, HistoryOptions,
     ObservedVersion,
 };
+use codeperimeter::i18n;
 use codeperimeter::model::{AlertRule, EventKind, now_ms};
 use codeperimeter::runtime::{self, ControlRequest, DirectoryImport, RuntimeOptions};
 use codeperimeter::service::{self, CollectorOptions, OperationReport, ServicePlan};
@@ -30,6 +31,8 @@ type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
     about = "CodePerimeter 本机文件活动观察工具"
 )]
 struct Cli {
+    #[arg(long, global = true, value_name = "LANGUAGE")]
+    language: Option<String>,
     #[arg(long, global = true, value_name = "PATH")]
     host_socket: Option<PathBuf>,
     #[command(subcommand)]
@@ -336,7 +339,16 @@ struct IndexedCandidate {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let args: Vec<_> = std::env::args_os().collect();
+    // 帮助也遵循临时选择；非法参数仅显示产品说明，不回显可能含隐私的参数值。
+    let requested_language = language_argument(&args);
+    let _ = i18n::try_set_cli_override(requested_language);
+    let locale = i18n::current_locale();
+    let command = localized_cli(&locale);
+    let cli = match command
+        .try_get_matches_from(args)
+        .and_then(|matches| Cli::from_arg_matches(&matches))
+    {
         Ok(cli) => cli,
         Err(error) => {
             let code = error.exit_code();
@@ -347,18 +359,171 @@ fn main() -> ExitCode {
                 let _ = error.print();
                 return ExitCode::SUCCESS;
             }
-            eprintln!("命令参数无效；运行 codeperimeter --help 查看用法。");
+            eprintln!("{}", i18n::message(&locale, "cli.invalid_arguments", &[]));
             return ExitCode::from(code as u8);
         }
     };
 
+    if i18n::try_set_cli_override(cli.language.clone()).is_err() {
+        eprintln!("{}", i18n::message(&locale, "cli.invalid_arguments", &[]));
+        return ExitCode::FAILURE;
+    }
+
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("执行失败：{error}");
+            let product_message = error
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::get_ref)
+                .is_some_and(|inner| inner.is::<CliMessage>());
+            let detail = if product_message {
+                error.to_string()
+            } else {
+                i18n::message(
+                    &i18n::current_locale(),
+                    "cli.raw_error",
+                    &[("error", error.to_string())],
+                )
+            };
+            eprintln!(
+                "{}",
+                i18n::message(
+                    &i18n::current_locale(),
+                    "cli.execution_failed",
+                    &[("error", detail)]
+                )
+            );
             ExitCode::FAILURE
         }
     }
+}
+
+fn language_argument(args: &[std::ffi::OsString]) -> Option<String> {
+    let mut values = args.iter().skip(1);
+    while let Some(value) = values.next() {
+        let Some(value) = value.to_str() else {
+            continue;
+        };
+        if value == "--" {
+            break;
+        }
+        if value == "--language" {
+            return values
+                .next()
+                .and_then(|value| value.to_str())
+                .map(str::to_owned);
+        }
+        if let Some(value) = value.strip_prefix("--language=") {
+            return Some(value.into());
+        }
+    }
+    None
+}
+
+fn localized_cli(locale: &str) -> clap::Command {
+    let values = std::iter::once("system".to_owned()).chain(i18n::supported_locales());
+    let mut command = Cli::command().mut_arg("language", |arg| {
+        arg.value_parser(clap::builder::PossibleValuesParser::new(values))
+    });
+    // 先生成 Clap 自带帮助与版本参数，再一同设置语言，保留 help 子命令行为。
+    command.build();
+    localize_command(command, locale, "")
+}
+
+fn localize_command(command: clap::Command, locale: &str, path: &str) -> clap::Command {
+    let key = if path.is_empty() {
+        "cli.about".into()
+    } else if path.rsplit('.').next() == Some("help") {
+        "cli.command.help".into()
+    } else {
+        format!("cli.command.{path}")
+    };
+    let mut command = command
+        .about(i18n::message(locale, &key, &[]))
+        .help_template(i18n::message(locale, "cli.help.template", &[]))
+        .subcommand_help_heading(i18n::message(locale, "cli.help.commands", &[]))
+        .subcommand_value_name(i18n::message(locale, "cli.help.command_name", &[]))
+        .mut_args(|arg| {
+            let id = arg.get_id().as_str();
+            let key = match id {
+                "help" => "cli.help.help".into(),
+                "version" => "cli.help.version".into(),
+                _ => format!("cli.arg.{id}"),
+            };
+            let mut help = i18n::message(locale, &key, &[]);
+            if !arg.get_default_values().is_empty() {
+                let value = arg
+                    .get_default_values()
+                    .iter()
+                    .map(|value| value.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                help.push_str(&format!(
+                    " [{}]",
+                    i18n::message(locale, "cli.help.default", &[("value", value)])
+                ));
+            }
+            if let Some(values) = arg.get_value_parser().possible_values() {
+                let values = values
+                    .filter(|value| !value.is_hide_set())
+                    .map(|value| value.get_name().to_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !values.is_empty() {
+                    help.push_str(&format!(
+                        " [{}]",
+                        i18n::message(locale, "cli.help.values", &[("values", values)])
+                    ));
+                }
+            }
+            let heading = if arg.get_long().is_none() && arg.get_short().is_none() {
+                "cli.help.arguments"
+            } else {
+                "cli.help.options"
+            };
+            arg.help(help)
+                .long_help(None::<&str>)
+                .help_heading(i18n::message(locale, heading, &[]))
+                .hide_default_value(true)
+                .hide_possible_values(true)
+        })
+        .mut_subcommands(|child| {
+            let name = child.get_name();
+            let path = if path.is_empty() {
+                name.into()
+            } else {
+                format!("{path}.{name}")
+            };
+            localize_command(child, locale, &path)
+        });
+    let usage = command.render_usage().to_string();
+    let usage = usage.strip_prefix("Usage: ").unwrap_or(&usage).replace(
+        "[OPTIONS]",
+        &format!("[{}]", i18n::message(locale, "cli.help.options_name", &[])),
+    );
+    command.override_usage(usage)
+}
+
+#[derive(Debug)]
+struct CliMessage {
+    key: &'static str,
+    args: Vec<(&'static str, String)>,
+}
+
+impl std::fmt::Display for CliMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&i18n::message(
+            &i18n::current_locale(),
+            self.key,
+            &self.args,
+        ))
+    }
+}
+
+impl Error for CliMessage {}
+
+fn cli_message(key: &'static str) -> CliMessage {
+    CliMessage { key, args: vec![] }
 }
 
 fn run(cli: Cli) -> CliResult<()> {
@@ -458,12 +623,15 @@ fn run_watch(command: WatchCommand, socket: &Path) -> CliResult<()> {
                 .into_iter()
                 .map(|directory| {
                     let canonical = fs::canonicalize(&directory).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "監控目錄不存在或無法解析")
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            cli_message("cli.error.directory_unavailable"),
+                        )
                     })?;
                     if !canonical.is_dir() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            "監控路徑必須是目錄",
+                            cli_message("cli.error.directory_required"),
                         ));
                     }
                     Ok(DirectoryImport {
@@ -482,7 +650,7 @@ fn run_watch(command: WatchCommand, socket: &Path) -> CliResult<()> {
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "移除不存在的目录时请提供此前配置的绝对路径",
+                    cli_message("cli.error.remove_absolute"),
                 )
                 .into());
             };
@@ -500,9 +668,12 @@ fn run_history(command: HistoryCommand, socket: Option<&Path>) -> CliResult<()> 
             claude_home,
             zcode_db,
         } => {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "找不到用户主目录"))?;
+            let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    cli_message("cli.error.home_unavailable"),
+                )
+            })?;
             let defaults = HistoryOptions::defaults(&home);
             let report = history::discover(&HistoryOptions {
                 codex_home: codex_home.or(defaults.codex_home),
@@ -548,15 +719,17 @@ fn run_history(command: HistoryCommand, socket: Option<&Path>) -> CliResult<()> 
             if all_available && !index.is_empty() || !all_available && index.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "必须且只能指定 --all-available 或一个以上 --index",
+                    cli_message("cli.error.import_selection"),
                 )
                 .into());
             }
             let metadata = fs::metadata(&preview)?;
             if metadata.len() > MAX_PREVIEW_BYTES {
-                return Err(
-                    io::Error::new(io::ErrorKind::InvalidData, "预览快照超过 16 MiB 上限").into(),
-                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    cli_message("cli.error.preview_oversized"),
+                )
+                .into());
             }
             let bytes = fs::read(preview)?;
             let saved: HistoryPreview = serde_json::from_slice(&bytes)?;
@@ -576,13 +749,19 @@ fn history_import_entries(
     all_available: bool,
 ) -> CliResult<Vec<DirectoryImport>> {
     if preview.format_version != HISTORY_PREVIEW_VERSION {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "预览快照版本不受支持").into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            cli_message("cli.error.preview_version"),
+        )
+        .into());
     }
     for (position, indexed) in preview.candidates.iter().enumerate() {
         if indexed.index != position {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "预览快照候选序号不连续").into(),
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                cli_message("cli.error.preview_indices"),
+            )
+            .into());
         }
     }
     let indices: BTreeSet<usize> = if all_available {
@@ -596,38 +775,45 @@ fn history_import_entries(
         requested_indices.iter().copied().collect()
     };
     if indices.is_empty() {
-        return Err(
-            io::Error::new(io::ErrorKind::InvalidInput, "快照中没有可导入的候选目录").into(),
-        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            cli_message("cli.error.preview_empty"),
+        )
+        .into());
     }
 
     let mut selected = BTreeMap::<PathBuf, BTreeSet<String>>::new();
     for index in indices {
         let indexed = preview.candidates.get(index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "候选序号超出预览快照范围")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                cli_message("cli.error.preview_index_invalid"),
+            )
         })?;
         let candidate = &indexed.candidate;
         if candidate.status != DirectoryStatus::Available {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "只能导入预览时标记为 available 的目录",
+                cli_message("cli.error.preview_available_only"),
             )
             .into());
         }
-        let path = candidate
-            .canonical_path
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "可用候选缺少规范路径"))?;
+        let path = candidate.canonical_path.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                cli_message("cli.error.preview_path_missing"),
+            )
+        })?;
         let current = fs::canonicalize(path).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "预览目录当前不可用；请重新生成预览",
+                cli_message("cli.error.preview_directory_unavailable"),
             )
         })?;
         if current.as_path() != path.as_path() || !current.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "预览目录已变化；请重新生成预览",
+                cli_message("cli.error.preview_directory_changed"),
             )
             .into());
         }
@@ -642,9 +828,11 @@ fn history_import_entries(
             candidate_sources.insert(source.into());
         }
         if candidate_sources.is_empty() {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "候选目录没有可导入的历史来源").into(),
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                cli_message("cli.error.preview_source_missing"),
+            )
+            .into());
         }
         selected
             .entry(current)
@@ -712,16 +900,23 @@ fn ensure_operation_succeeded(report: &OperationReport) -> CliResult<()> {
     if failed.is_empty() {
         return Ok(());
     }
-    Err(io::Error::other(format!("服务操作步骤失败：{}", failed.join(", "))).into())
+    Err(io::Error::other(CliMessage {
+        key: "cli.error.service_steps",
+        args: vec![("steps", failed.join(", "))],
+    })
+    .into())
 }
 
 fn host_socket(override_path: Option<PathBuf>) -> CliResult<PathBuf> {
     if let Some(path) = override_path {
         return Ok(path);
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "找不到用户主目录"))?;
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            cli_message("cli.error.home_unavailable"),
+        )
+    })?;
     Ok(home
         .join("Library/Application Support/CodePerimeter")
         .join("host.sock"))
@@ -730,9 +925,12 @@ fn host_socket(override_path: Option<PathBuf>) -> CliResult<PathBuf> {
 fn send_request(socket: &Path, request: ControlRequest) -> CliResult<()> {
     let response = runtime::request_control(socket, request)?;
     if !response.ok {
-        return Err(
-            io::Error::other(response.error.unwrap_or_else(|| "宿主拒绝了请求".into())).into(),
-        );
+        return Err(io::Error::other(
+            response
+                .error
+                .unwrap_or_else(|| cli_message("cli.error.host_rejected").to_string()),
+        )
+        .into());
     }
     print_json(&json!({
         "ok": true,
