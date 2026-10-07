@@ -9,10 +9,14 @@ The current release observes local macOS file activity. It records visible syste
 Run from the repository root:
 
 ~~~sh
-cargo build --release
+npm --prefix web ci --ignore-scripts --registry=https://registry.npmjs.org
+npm --prefix web run build
+cargo build --release --locked
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ~~~
+
+`web/dist/` is untracked generated output. Generate it after cloning the source, before building Rust. Rebuild both the web assets and Rust after changing the web source.
 
 The binary is at `target/release/codeperimeter`. Use `codeperimeter --help` or `codeperimeter <COMMAND> --help` for parameters. Query and directory-configuration commands use the ordinary-user host's Unix socket. Override it with the global `--host-socket PATH` option. Its default location is `~/Library/Application Support/CodePerimeter/host.sock` for the current user.
 

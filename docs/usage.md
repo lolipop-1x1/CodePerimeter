@@ -9,10 +9,14 @@
 在仓库根目录执行：
 
 ~~~sh
-cargo build --release
+npm --prefix web ci --ignore-scripts --registry=https://registry.npmjs.org
+npm --prefix web run build
+cargo build --release --locked
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ~~~
+
+`web/dist/` 是未跟踪的网页构建产物，源码克隆后需要先生成，再构建 Rust。网页源码变更后也要重新运行网页构建与 Rust 构建。
 
 二进制位于 target/release/codeperimeter。运行 codeperimeter --help 或 codeperimeter <命令> --help 查看参数。查询和目录配置命令通过普通用户宿主的 Unix socket 工作；可以在全局参数中指定 --host-socket PATH。默认位置为当前用户的 ~/Library/Application Support/CodePerimeter/host.sock。
 

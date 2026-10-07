@@ -30,11 +30,11 @@ jobs:
       - name: Build embedded web assets
         working-directory: web
         run: npm run build
-      - name: Verify tracked web assets match source
+      - name: Verify generated web assets stay untracked
         run: |
-          git ls-files --error-unmatch web/dist/index.html > /dev/null
-          git diff --exit-code --quiet -- web/dist
-          python3 -B -c "import subprocess; files=subprocess.check_output(['git','ls-files','--others','--exclude-standard','--','web/dist']).splitlines(); assert not files, '网页构建产生未跟踪资源，请更新构建产物'"
+          test -s web/dist/index.html
+          test -z "$(git ls-files -- web/dist)"
+          git check-ignore -q web/dist/index.html
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.88.0"

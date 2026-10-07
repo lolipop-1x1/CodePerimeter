@@ -77,7 +77,9 @@ cargo build --release --locked
 ./target/release/codeperimeter ui
 ```
 
-Build the web assets before Rust. The resulting binary embeds the console and native notification helper. Node.js, a Swift compiler, and a separate frontend server are not required at runtime. Dependency installation disables lifecycle scripts, including Carbon installation telemetry.
+`web/dist/` is generated output and is not tracked by Git. `npm --prefix web ci` installs the dependency versions from `web/package-lock.json`; `npm --prefix web run build` generates the web assets in `web/dist/`. Build these assets before Rust; a missing web build stops Rust compilation with instructions.
+
+After changing the web source, run `npm --prefix web run build` and `cargo build --release --locked` again. The resulting binary embeds the console and native notification helper. Node.js, a Swift compiler, and a separate frontend server are not required at runtime. Dependency installation uses `--ignore-scripts` to disable lifecycle scripts, including Carbon installation telemetry.
 
 `ui` opens the default browser on a private loopback entry. No account or cloud service is required. Run the command again if an old entry expires; do not share URLs containing an entry credential.
 

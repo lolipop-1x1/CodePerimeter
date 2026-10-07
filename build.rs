@@ -40,6 +40,10 @@ fn main() {
     .unwrap();
     println!("cargo:rerun-if-changed=web/dist");
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    assert!(
+        root.join("web/dist/index.html").is_file(),
+        "缺少网页构建产物；请先执行 npm --prefix web ci --ignore-scripts --registry=https://registry.npmjs.org，再执行 npm --prefix web run build"
+    );
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rerun-if-changed=native/notifications");
         println!("cargo:rerun-if-changed=scripts/build-notification-helper.sh");

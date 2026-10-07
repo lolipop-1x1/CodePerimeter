@@ -77,7 +77,9 @@ cargo build --release --locked
 ./target/release/codeperimeter ui
 ```
 
-先构建网页资源，再构建 Rust。最终程序内嵌网页控制台和原生通知助手，运行时不需要 Node.js、Swift 编译器或独立前端服务。依赖安装禁用生命周期脚本，包括 Carbon 的安装遥测。
+`web/dist/` 是生成目录，不纳入 Git 跟踪。`npm --prefix web ci` 按 `web/package-lock.json` 安装锁定版本的依赖；`npm --prefix web run build` 在 `web/dist/` 生成网页资源。必须先生成网页资源，再构建 Rust；缺少网页产物时，Rust 构建会停止并提示生成步骤。
+
+修改网页源码后，重新执行 `npm --prefix web run build` 和 `cargo build --release --locked`。最终程序内嵌网页控制台和原生通知助手，运行时不需要 Node.js、Swift 编译器或独立前端服务。依赖安装使用 `--ignore-scripts` 禁用生命周期脚本，包括 Carbon 的安装遥测。
 
 `ui` 会通过私有回环入口打开默认浏览器，无需账号或云服务。旧入口失效时重新运行命令；不要分享带入口凭证的地址。
 

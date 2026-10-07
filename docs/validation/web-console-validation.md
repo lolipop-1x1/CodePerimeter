@@ -15,7 +15,7 @@ cargo build --release --locked
 ./target/release/codeperimeter ui
 ```
 
-`npm ci --ignore-scripts` 不运行依赖生命周期脚本，包括 Carbon 安装遥测。Rust 构建嵌入 `web/dist`，交付二进制不要求用户另装 Node.js。修改网页源文件后必须重新构建网页和 Rust；CI 在编译 Rust 前检查网页类型、组件测试、资源构建和已跟踪产物一致性。
+`npm ci --ignore-scripts` 不运行依赖生命周期脚本，包括 Carbon 安装遥测。`web/dist` 不纳入 Git 跟踪，由网页构建生成后嵌入 Rust，交付二进制不要求用户另装 Node.js。修改网页源文件后必须重新构建网页和 Rust；CI 在编译 Rust 前检查网页类型、组件测试、资源构建成功，以及产物保持未跟踪并被忽略。
 
 `ui` 以普通用户运行，只监听本机回环地址，启动或复用控制台并打开默认浏览器。入口凭证由本机程序交给当前标签页，不写应用日志；凭证失效时重新运行 `ui`。关闭网页或启动终端不停止后台监控。控制台不提供局域网／互联网入口，也不允许任意 shell 命令或管理员密码输入。
 
