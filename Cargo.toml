@@ -3,6 +3,7 @@ name = "codeperimeter"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+license = "MIT"
 description = "macOS 项目文件活动与归档迹象监控"
 
 [dependencies]
