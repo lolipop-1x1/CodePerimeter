@@ -10,13 +10,19 @@ CodePerimeter is a local macOS monitor for project-file activity. Choose your pr
 
 [Quick start](#quick-start) · [Features](#features) · [Privacy](#privacy-by-design) · [Limits](#what-the-evidence-means) · [Documentation](#documentation)
 
+> **Experimental project:** CodePerimeter is under active development. Compatibility, performance, and long-running reliability are still being validated.
+>
+> **Platform support:** Currently, only macOS is supported.
+>
 > The current version observes and alerts. It does **not** block file access, compression, or network transmission.
 
 ## Why it matters
 
-Your repository can contain private implementation details, credentials, configuration, and unreleased work. Giving an AI coding tool access to a project does not make every background process visible in its chat window. Indexing, helper processes, bulk scans, and archive operations deserve their own audit trail.
+**Know what touches your code—beyond the chat window.**
 
-CodePerimeter gives you local evidence of who touched your projects and when activity became concentrated. It helps you investigate unexpected behavior without treating every search, build, or backup as a leak.
+AI coding tools can access projects through indexing, helper processes, and automated snapshots. A chat transcript alone may not reveal which files were accessed or whether background activity involved bulk access or packaging.
+
+CodePerimeter provides an independent, local audit trail for your selected projects. Identify the processes and files involved, receive alerts for concentrated access and archive indicators, and jump directly from a notification to the evidence. **All monitoring records, alerts, and settings stay on your Mac. No cloud analysis required.**
 
 ## Features
 
