@@ -1317,22 +1317,40 @@ fn normalize_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 }
 
 pub(crate) fn normalize_path(path: &Path) -> Option<PathBuf> {
+    normalize_path_with(path, |candidate| fs::canonicalize(candidate))
+}
+
+fn normalize_path_with(
+    path: &Path,
+    mut canonicalize: impl FnMut(&Path) -> io::Result<PathBuf>,
+) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }
     let lexical = lexical_normalize(path)?;
     let mut cursor = lexical.clone();
     let mut suffix = Vec::new();
+    let mut missing_only = true;
 
     loop {
-        match fs::canonicalize(&cursor) {
+        match canonicalize(&cursor) {
             Ok(mut resolved) => {
                 for component in suffix.iter().rev() {
                     resolved.push(component);
                 }
                 return lexical_normalize(&resolved);
             }
-            Err(_) => {
+            Err(error) => {
+                missing_only &= is_missing_path_error(&error);
+                // 先保留短缺失路径的逐层快速返回；连续五层无法解析时再二分查找祖先。
+                // 权限等其他错误仍沿用原有逐层逻辑，不假定路径前缀的可访问性。
+                if suffix.len() == 4
+                    && missing_only
+                    && let Some(resolved) =
+                        normalize_deep_missing_path(&lexical, suffix.len(), &mut canonicalize)
+                {
+                    return Some(resolved);
+                }
                 let name = cursor.file_name()?.to_os_string();
                 suffix.push(name);
                 if !cursor.pop() {
@@ -1341,6 +1359,39 @@ pub(crate) fn normalize_path(path: &Path) -> Option<PathBuf> {
             }
         }
     }
+}
+
+fn is_missing_path_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+fn normalize_deep_missing_path(
+    lexical: &Path,
+    mut missing: usize,
+    canonicalize: &mut impl FnMut(&Path) -> io::Result<PathBuf>,
+) -> Option<PathBuf> {
+    let ancestors: Vec<_> = lexical.ancestors().collect();
+    let mut existing = ancestors.len().checked_sub(1)?;
+    if missing >= existing {
+        return None;
+    }
+    let mut resolved = canonicalize(ancestors[existing]).ok()?;
+    while existing - missing > 1 {
+        let middle = missing + (existing - missing) / 2;
+        match canonicalize(ancestors[middle]) {
+            Ok(path) => {
+                existing = middle;
+                resolved = path;
+            }
+            Err(error) if is_missing_path_error(&error) => missing = middle,
+            Err(_) => return None,
+        }
+    }
+    resolved.push(lexical.strip_prefix(ancestors[existing]).ok()?);
+    lexical_normalize(&resolved)
 }
 
 fn lexical_normalize(path: &Path) -> Option<PathBuf> {
@@ -1492,5 +1543,85 @@ fn alert_rule_name(rule: AlertRule) -> &'static str {
         AlertRule::BulkFileAccess => "bulk_file_access",
         AlertRule::ArchiveCommand => "archive_command",
         AlertRule::ArchiveOutput => "archive_output",
+    }
+}
+
+#[cfg(test)]
+mod path_performance_tests {
+    use super::*;
+
+    #[test]
+    fn short_missing_path_preserves_the_linear_fast_path() {
+        let temp = tempfile::Builder::new()
+            .prefix("codeperimeter-path-test-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let path = temp.path().join("missing-directory/synthetic.txt");
+        let mut probes = 0;
+        let normalized = normalize_path_with(&path, |candidate| {
+            probes += 1;
+            fs::canonicalize(candidate)
+        });
+        assert_eq!(normalized, Some(path));
+        assert_eq!(probes, 3, "短缺失路径应在找到最近父目录后立即返回");
+    }
+
+    #[test]
+    fn deep_missing_path_bounds_filesystem_probes_and_keeps_symlink_resolution() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::Builder::new()
+            .prefix("codeperimeter-path-test-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let target = temp.path().join("synthetic-project");
+        fs::create_dir(&target).unwrap();
+        let alias = temp.path().join("synthetic-alias");
+        symlink(&target, &alias).unwrap();
+        let suffix: PathBuf = (0..24).map(|_| "missing-directory").collect();
+        let path = alias.join(&suffix).join("synthetic.txt");
+        let mut probes = 0;
+        let normalized = normalize_path_with(&path, |candidate| {
+            probes += 1;
+            fs::canonicalize(candidate)
+        });
+        assert_eq!(normalized, Some(target.join(suffix).join("synthetic.txt")));
+        assert!(probes <= 12, "深层缺失路径不应逐层查询文件系统：{probes}");
+    }
+
+    #[test]
+    fn non_directory_prefix_keeps_the_original_path_result() {
+        let temp = tempfile::Builder::new()
+            .prefix("codeperimeter-path-test-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let file = temp.path().join("synthetic-file");
+        fs::write(&file, b"synthetic bytes").unwrap();
+        let path = file.join("missing-directory/synthetic.txt");
+        assert_eq!(normalize_path(&path), Some(path));
+    }
+
+    #[test]
+    fn permission_error_falls_back_to_the_original_nearest_ancestor() {
+        let suffix = "restricted/missing-0/missing-1/missing-2/missing-3/missing-4/synthetic.txt";
+        let path = Path::new("/synthetic-project").join(suffix);
+        let mut permission_probes = 0;
+        let normalized = normalize_path_with(&path, |candidate| {
+            if candidate == Path::new("/synthetic-project/restricted") {
+                permission_probes += 1;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else if candidate == Path::new("/synthetic-project") {
+                Ok(PathBuf::from("/resolved-project"))
+            } else if candidate == Path::new("/") {
+                Ok(PathBuf::from("/"))
+            } else {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            }
+        });
+        assert_eq!(
+            normalized,
+            Some(Path::new("/resolved-project").join(suffix))
+        );
+        assert_eq!(permission_probes, 2, "二分遇到权限错误后应恢复逐层查找");
     }
 }

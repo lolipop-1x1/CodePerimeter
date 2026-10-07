@@ -2105,7 +2105,11 @@ fn benchmark_count(counts: &std::collections::BTreeMap<String, u64>, kind: &str)
     counts.get(kind).copied().unwrap_or(0)
 }
 
-fn host_benchmark_frames(project_file: &Path, received_ms: i64) -> Vec<CollectorFrame> {
+fn host_benchmark_frames(
+    project_file: &Path,
+    received_ms: i64,
+    missing_root: Option<&Path>,
+) -> Vec<CollectorFrame> {
     let templates: Vec<Value> = include_str!("fixtures/eslogger/events.jsonl")
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -2137,6 +2141,8 @@ fn host_benchmark_frames(project_file: &Path, received_ms: i64) -> Vec<Collector
                     33 => event["event"]["write"]["target"]["path"] = json!(project_file),
                     _ => unreachable!(),
                 }
+            } else if let Some(root) = missing_root {
+                replace_benchmark_paths(&mut event["event"], root);
             }
             event["padding"] = json!("");
             event["padding"] = json!("x".repeat(2_048 - event.to_string().len()));
@@ -2153,7 +2159,31 @@ fn host_benchmark_frames(project_file: &Path, received_ms: i64) -> Vec<Collector
     frames
 }
 
-fn run_host_throughput_sample(mode: &str, poll_interval: Duration) {
+fn replace_benchmark_paths(value: &mut Value, missing_root: &Path) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key == "path"
+                    && let Some(path) = value.as_str()
+                    && let Ok(suffix) =
+                        Path::new(path).strip_prefix("/private/tmp/synthetic-project")
+                {
+                    *value = json!(missing_root.join(suffix));
+                } else {
+                    replace_benchmark_paths(value, missing_root);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                replace_benchmark_paths(value, missing_root);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn run_host_throughput_sample(mode: &str, poll_interval: Duration, deep_missing: bool) {
     let temp = fixture();
     let project = temp.path().join("selected-project");
     fs::create_dir(&project).unwrap();
@@ -2177,7 +2207,11 @@ fn run_host_throughput_sample(mode: &str, poll_interval: Duration) {
         },
     );
     let received_ms = now_ms();
-    let frames = host_benchmark_frames(&project_file, received_ms);
+    let missing_root = deep_missing.then(|| {
+        let suffix: PathBuf = (0..24).map(|_| "missing").collect();
+        temp.path().join("unselected-project").join(suffix)
+    });
+    let frames = host_benchmark_frames(&project_file, received_ms, missing_root.as_deref());
     let started = Instant::now();
     for frame in frames {
         source.send(frame);
@@ -2249,6 +2283,15 @@ fn four_stream_ten_thousand_frame_host_throughput_with_status_polling() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
-    run_host_throughput_sample("base_4hz_fence", Duration::from_millis(250));
-    run_host_throughput_sample("status_30hz", Duration::from_millis(33));
+    run_host_throughput_sample("base_4hz_fence", Duration::from_millis(250), false);
+    run_host_throughput_sample("status_30hz", Duration::from_millis(33), false);
+}
+
+#[test]
+fn four_stream_deep_missing_paths_host_throughput() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    run_host_throughput_sample("deep_missing_4hz_fence", Duration::from_millis(250), true);
+    run_host_throughput_sample("deep_missing_30hz", Duration::from_millis(33), true);
 }
