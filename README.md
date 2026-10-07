@@ -189,5 +189,3 @@ For local development checks, run `npm --prefix web test`, `npm --prefix web run
 ## License
 
 [MIT](LICENSE) · Copyright (c) 2026 CodePerimeter contributors. Third-party components retain their own licenses.
-
-Last reviewed: **2026-10-07**.

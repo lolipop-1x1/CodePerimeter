@@ -189,5 +189,3 @@ sudo ./target/release/codeperimeter service start --user "$(id -un)"
 ## 开源协议
 
 [MIT](LICENSE) · Copyright (c) 2026 CodePerimeter contributors。第三方组件保留各自的许可证。
-
-最后复核：**2026-10-07**。
